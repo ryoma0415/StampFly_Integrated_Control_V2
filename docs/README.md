@@ -5,8 +5,10 @@
 
 | 文書 | 内容 |
 |---|---|
-| [../README.md](../README.md) | システム概要、必要機材、セットアップ(venv / pio / Motive)、pc_server 起動と UI の使い方、トラブルシューティング |
-| [OPERATION_GUIDE.md](OPERATION_GUIDE.md) | 段階的な安全飛行手順(機体電源 OFF での通信確認 → 短時間ホバー → 本飛行)、緊急時エスカレーション、フェイルセーフ一覧、機体プロファイル較正 |
-| [PROTOCOL.md](PROTOCOL.md) | 通信ワイヤ仕様の正典(COBS+CRC16 フレーム、メッセージ型、フェイルセーフ規範、レート) |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | モジュール構成・API 契約・コーディング規約の正典 |
-| [LOG_STRUCTURE.md](LOG_STRUCTURE.md) | CSV フライトログの列定義(`pc_server/core/logger.py` の `COLUMNS` と1対1) |
+| [../README.md](../README.md) | システム概要、必要機材、セットアップ(venv ×3 / pio / Motive)、pc_server 起動と UI の使い方(3タブ・ヨー制御・円軌道・Experiment)、検証コマンド、トラブルシューティング |
+| [OPERATION_GUIDE.md](OPERATION_GUIDE.md) | 段階的な安全飛行手順(機体電源 OFF での通信確認 → 短時間ホバー → 本飛行)、緊急時エスカレーション、フェイルセーフ一覧、機体プロファイル較正、v2 運用手順(モーター実験モード §11 / ヨー較正・FF パイプライン §12 / ヨー角制御飛行 §13 / 円軌道モード §14 / 飛行後解析 §15) |
+| [PROTOCOL.md](PROTOCOL.md) | 通信ワイヤ仕様の正典 v2(COBS+CRC16 フレーム、メッセージ型 0x10–0x54、TLM_STATE 135B / TLM_EXP / TLM_CAL_DATA、フェイルセーフ規範、レート) |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | モジュール構成・API 契約・コーディング規約の正典 v2(実験モードの状態遷移、安全クランプ多層表、NVS 永続化一覧、I2C スケジューリングを含む) |
+| [LOG_STRUCTURE.md](LOG_STRUCTURE.md) | CSV フライトログの列定義 v2・94列(`pc_server/core/logger.py` の `COLUMNS` と1対1) |
+| [FF_PIPELINE.md](FF_PIPELINE.md) | 電流FF較正パイプラインの契約(スイープ → `data_analysis` 抽出 → FFプロファイル JSON → CMD_FF_* 分割転送 → EKF 実行。数式・受入基準は yaw側設計書の原文維持) |
+| [../flight_log_viewer/README.md](../flight_log_viewer/README.md) | 飛行ログビューア(静止画グラフ・ヨー4系統比較・EKF 診断・同期アニメーション)の使い方 |

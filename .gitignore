@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# PlatformIO
+.pio/
+
+# macOS
+.DS_Store
+
+# 実験・飛行で生成されるデータ(コードのみを管理する)
+logs/*
+!logs/.gitkeep
+pc_server/data/sweep_results/*
+!pc_server/data/sweep_results/.gitkeep
+pc_server/data/yaw_eval_results/*
+!pc_server/data/yaw_eval_results/.gitkeep
+flight_log_viewer/output/*
+
+# エディタ
+.vscode/
+.idea/

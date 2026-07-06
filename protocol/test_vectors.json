@@ -1,0 +1,356 @@
+{
+  "protocol_version": 1,
+  "generator": "protocol/tests/generate_vectors.py (stampfly_protocol.py)",
+  "crc16": {
+    "input_ascii": "123456789",
+    "expected": 10673
+  },
+  "frames": [
+    {
+      "name": "cmd_setpoint_seq_0x41424344",
+      "payload_kind": "CMD_SETPOINT",
+      "type": 18,
+      "seq": 1094861636,
+      "fields": {
+        "roll_ref": 0.0524,
+        "pitch_ref": -0.0349,
+        "alt_ref": 0.3,
+        "flags": 1
+      },
+      "payload_hex": "62a1563d4df30ebd9a99993e01",
+      "logical_hex": "0112444342410d62a1563d4df30ebd9a99993e015441",
+      "wire_hex": "170112444342410d62a1563d4df30ebd9a99993e01544100"
+    },
+    {
+      "name": "cmd_setpoint_all_zero_payload",
+      "payload_kind": "CMD_SETPOINT",
+      "type": 18,
+      "seq": 1,
+      "fields": {
+        "roll_ref": 0.0,
+        "pitch_ref": 0.0,
+        "alt_ref": 0.0,
+        "flags": 0
+      },
+      "payload_hex": "00000000000000000000000000",
+      "logical_hex": "0112010000000d00000000000000000000000000d7c2",
+      "wire_hex": "040112010101020d01010101010101010101010103d7c200"
+    },
+    {
+      "name": "tlm_state_full",
+      "payload_kind": "TLM_STATE",
+      "type": 48,
+      "seq": 1000,
+      "fields": {
+        "seq_echo": 16909060,
+        "elapsed_ms": 123456,
+        "state": 4,
+        "flags": 6,
+        "reason": 1,
+        "roll": 0.0123,
+        "pitch": -0.0456,
+        "yaw": 1.5708,
+        "p": 0.25,
+        "q": -0.5,
+        "r": 0.75,
+        "roll_ref": 0.0524,
+        "pitch_ref": -0.0349,
+        "alt_ref": 0.5,
+        "altitude_tof": 0.48,
+        "altitude_est": 0.51,
+        "alt_velocity": -0.05,
+        "z_dot_ref": 0.1,
+        "voltage": 3.72,
+        "duty_fr": 0.41,
+        "duty_fl": 0.42,
+        "duty_rr": 0.43,
+        "duty_rl": 0.44,
+        "ax": 0.01,
+        "ay": -0.02,
+        "az": 0.98,
+        "loop_dt_us": 2500
+      },
+      "payload_hex": "0403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc409",
+      "logical_hex": "0130e8030000610403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc409b6a3",
+      "wire_hex": "050130e8030109610403020140e20110040601f085493c11c73abdf90fc93f0103803e010102bf010b403f62a1563d4df30ebd0101363f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc409b6a300"
+    },
+    {
+      "name": "tlm_event_link_loss",
+      "payload_kind": "TLM_EVENT",
+      "type": 49,
+      "seq": 42,
+      "fields": {
+        "state": 5,
+        "prev_state": 4,
+        "reason": 8,
+        "flags": 1,
+        "voltage": 3.41
+      },
+      "payload_hex": "05040801713d5a40",
+      "logical_hex": "01312a0000000805040801713d5a408371",
+      "wire_hex": "0401312a01010c0805040801713d5a40837100"
+    },
+    {
+      "name": "log_text_relay",
+      "payload_kind": "LOG_TEXT",
+      "type": 64,
+      "seq": 7,
+      "fields": {
+        "origin": 0,
+        "text": "relay: peer set ch=6"
+      },
+      "payload_hex": "0072656c61793a2070656572207365742063683d36",
+      "logical_hex": "014007000000150072656c61793a2070656572207365742063683d367dc1",
+      "wire_hex": "04014007010102151772656c61793a2070656572207365742063683d367dc100"
+    },
+    {
+      "name": "log_text_drone_utf8",
+      "payload_kind": "LOG_TEXT",
+      "type": 64,
+      "seq": 8,
+      "fields": {
+        "origin": 1,
+        "text": "\u6a5f\u4f53\ud83d\udef8: \u9ad8\u5ea60.50m\u306b\u5230\u9054"
+      },
+      "payload_hex": "01e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194",
+      "logical_hex": "0140080000002101e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194850a",
+      "wire_hex": "040140080101252101e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194850a00"
+    },
+    {
+      "name": "rly_set_target",
+      "payload_kind": "RLY_SET_TARGET",
+      "type": 80,
+      "seq": 2,
+      "fields": {
+        "mac": [
+          36,
+          111,
+          40,
+          170,
+          187,
+          204
+        ],
+        "wifi_channel": 6
+      },
+      "payload_hex": "246f28aabbcc06",
+      "logical_hex": "01500200000007246f28aabbcc0603df",
+      "wire_hex": "0401500201010b07246f28aabbcc0603df00"
+    },
+    {
+      "name": "rly_target_ack_ok",
+      "payload_kind": "RLY_TARGET_ACK",
+      "type": 81,
+      "seq": 3,
+      "fields": {
+        "status": 0,
+        "mac": [
+          36,
+          111,
+          40,
+          170,
+          187,
+          204
+        ],
+        "channel": 6
+      },
+      "payload_hex": "00246f28aabbcc06",
+      "logical_hex": "0151030000000800246f28aabbcc06d210",
+      "wire_hex": "04015103010102080a246f28aabbcc06d21000"
+    },
+    {
+      "name": "rly_stats",
+      "payload_kind": "RLY_STATS",
+      "type": 82,
+      "seq": 11,
+      "fields": {
+        "up_frames": 1000,
+        "down_frames": 2500,
+        "crc_errors": 3,
+        "cobs_errors": 1,
+        "espnow_send_fail": 2,
+        "overflow_drops": 0
+      },
+      "payload_hex": "e8030000c409000003000000010000000200000000000000",
+      "logical_hex": "01520b00000018e8030000c40900000300000001000000020000000000000067d5",
+      "wire_hex": "0401520b01010418e8030103c40901020301010201010102020101010101010367d500"
+    },
+    {
+      "name": "rly_pong",
+      "payload_kind": "RLY_PONG",
+      "type": 84,
+      "seq": 12,
+      "fields": {
+        "echo_seq": 77
+      },
+      "payload_hex": "4d000000",
+      "logical_hex": "01540c000000044d000000f32c",
+      "wire_hex": "0401540c010103044d010103f32c00"
+    },
+    {
+      "name": "cmd_start_empty_payload",
+      "payload_kind": "NONE",
+      "type": 16,
+      "seq": 5,
+      "fields": {},
+      "payload_hex": "",
+      "logical_hex": "011005000000007c70",
+      "wire_hex": "04011005010101037c7000"
+    }
+  ],
+  "corruption": [
+    {
+      "name": "crc_single_bit_flip",
+      "construct": {
+        "kind": "crc_bit_flip",
+        "base_frame": "cmd_setpoint_seq_0x41424344",
+        "xor_last_byte": 1
+      },
+      "wire_hex": "170112444342410d62a1563d4df30ebd9a99993e01544000",
+      "expect_frames": 0,
+      "expect_counters": {
+        "crc_errors": 1
+      }
+    },
+    {
+      "name": "missing_delimiter_concatenation",
+      "construct": {
+        "kind": "concat_no_delimiter",
+        "frames": [
+          "cmd_setpoint_seq_0x41424344",
+          "cmd_setpoint_all_zero_payload"
+        ]
+      },
+      "wire_hex": "170112444342410d62a1563d4df30ebd9a99993e015441040112010101020d01010101010101010101010103d7c200",
+      "expect_frames": 0,
+      "expect_counters": {
+        "len_errors": 1
+      }
+    },
+    {
+      "name": "oversize_drop_then_valid_frame",
+      "construct": {
+        "kind": "oversize_junk_then_frame",
+        "junk_byte": 170,
+        "junk_len": 300,
+        "base_frame": "cmd_setpoint_seq_0x41424344"
+      },
+      "wire_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00170112444342410d62a1563d4df30ebd9a99993e01544100",
+      "expect_frames": 1,
+      "expect_counters": {
+        "overflow_drops": 1
+      },
+      "expect_frame_logical_hex": [
+        "0112444342410d62a1563d4df30ebd9a99993e015441"
+      ]
+    }
+  ],
+  "utf8_truncate": {
+    "text_hex": "6c6f673a20e9ab98e5baa6302e356df09f9bb8e588b0e98194",
+    "cases": [
+      {
+        "max_len": 0,
+        "expect_len": 0
+      },
+      {
+        "max_len": 1,
+        "expect_len": 1
+      },
+      {
+        "max_len": 2,
+        "expect_len": 2
+      },
+      {
+        "max_len": 3,
+        "expect_len": 3
+      },
+      {
+        "max_len": 4,
+        "expect_len": 4
+      },
+      {
+        "max_len": 5,
+        "expect_len": 5
+      },
+      {
+        "max_len": 6,
+        "expect_len": 5
+      },
+      {
+        "max_len": 7,
+        "expect_len": 5
+      },
+      {
+        "max_len": 8,
+        "expect_len": 8
+      },
+      {
+        "max_len": 9,
+        "expect_len": 8
+      },
+      {
+        "max_len": 10,
+        "expect_len": 8
+      },
+      {
+        "max_len": 11,
+        "expect_len": 11
+      },
+      {
+        "max_len": 12,
+        "expect_len": 12
+      },
+      {
+        "max_len": 13,
+        "expect_len": 13
+      },
+      {
+        "max_len": 14,
+        "expect_len": 14
+      },
+      {
+        "max_len": 15,
+        "expect_len": 15
+      },
+      {
+        "max_len": 16,
+        "expect_len": 15
+      },
+      {
+        "max_len": 17,
+        "expect_len": 15
+      },
+      {
+        "max_len": 18,
+        "expect_len": 15
+      },
+      {
+        "max_len": 19,
+        "expect_len": 19
+      },
+      {
+        "max_len": 20,
+        "expect_len": 19
+      },
+      {
+        "max_len": 21,
+        "expect_len": 19
+      },
+      {
+        "max_len": 22,
+        "expect_len": 22
+      },
+      {
+        "max_len": 23,
+        "expect_len": 22
+      },
+      {
+        "max_len": 24,
+        "expect_len": 22
+      },
+      {
+        "max_len": 25,
+        "expect_len": 25
+      }
+    ]
+  }
+}

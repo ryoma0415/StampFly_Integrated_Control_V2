@@ -1,0 +1,87 @@
+"""設定ファイル(config/*.json)のローダ。
+
+ARCHITECTURE.md「マジックナンバー禁止: PCは config/*.json」に従い、
+数値定数はすべて server.json / control.json / airframes.json から供給する。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+from . import PC_SERVER_DIR, REPO_DIR
+
+CONFIG_DIR = PC_SERVER_DIR / "config"
+LOGS_DIR = REPO_DIR / "logs"
+
+SERVER_CONFIG_PATH = CONFIG_DIR / "server.json"
+CONTROL_CONFIG_PATH = CONFIG_DIR / "control.json"
+AIRFRAMES_CONFIG_PATH = CONFIG_DIR / "airframes.json"
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+def load_server_config() -> dict[str, Any]:
+    return _load_json(SERVER_CONFIG_PATH)
+
+
+def load_control_config() -> dict[str, Any]:
+    return _load_json(CONTROL_CONFIG_PATH)
+
+
+def load_airframes() -> list[dict[str, Any]]:
+    """機体プロファイル配列を返す(airframes.json の "airframes" キー)。"""
+    return _load_json(AIRFRAMES_CONFIG_PATH)["airframes"]
+
+
+def save_airframes(airframes: list[dict[str, Any]]) -> None:
+    """機体プロファイル配列を airframes.json へ原子的に書き込む。
+
+    同一ディレクトリの一時ファイルへ全文を書いてから os.replace で置換する
+    (書き込み途中のクラッシュで設定ファイルが壊れることを防ぐ)。
+    キー順は呼び出し側の dict 挿入順をそのまま保持する。
+    """
+    path = AIRFRAMES_CONFIG_PATH
+    tmp_path = path.with_name(path.name + ".tmp")
+    text = json.dumps({"airframes": airframes}, ensure_ascii=False, indent=2) + "\n"
+    with open(tmp_path, "w", encoding="utf-8") as fp:
+        fp.write(text)
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(tmp_path, path)
+
+
+# MAC 未設定の正準表現は「空文字列」(airframes.json / UI / API で共通)
+MAC_UNSET = ""
+
+
+def mac_is_set(mac_text: Any) -> bool:
+    """プロファイルの MAC が設定済みか(空文字列・空白のみ = 未設定)。"""
+    return bool(str(mac_text or "").strip())
+
+
+# MAC の受理形式: 2桁16進オクテット6個を ":" または "-" で区切った文字列のみ。
+# オクテットごとの int(p, 16) は "0x1"・" 1"・1桁などの非正準表記も受理して
+# しまうため、事前に正規表現で形式を固定する。
+_MAC_PATTERN = re.compile(r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}")
+
+
+def parse_mac(mac_text: str) -> bytes:
+    """"48:CA:43:38:9C:88" 形式の MAC 文字列を 6 バイトに変換する。
+
+    2桁16進オクテット x6(区切りは ":" / "-"、大文字小文字不問)のみ受理し、
+    "0x" 接頭辞・空白混入・桁不足などの非正準表記は ValueError とする。
+    """
+    if not isinstance(mac_text, str) or _MAC_PATTERN.fullmatch(mac_text) is None:
+        raise ValueError(f"invalid MAC address: {mac_text!r}")
+    return bytes(int(p, 16) for p in mac_text.replace("-", ":").split(":"))
+
+
+def format_mac(mac: bytes) -> str:
+    return ":".join(f"{b:02X}" for b in mac)

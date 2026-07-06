@@ -1,0 +1,49 @@
+{
+  "airframes": [
+    {
+      "name": "drone X",
+      "mac": "48:CA:43:38:9C:88",
+      "wifi_channel": 1,
+      "roll_bias_deg": 0.0,
+      "pitch_bias_deg": 0.0,
+      "default_alt_m": 0.3,
+      "notes": "MAC確定(2026-06-11 手書き記録、STAモード)。旧OptiTrackプロジェクト config.json の target_mac と同一機体。バイアスは旧フォークの実測値(rad→deg換算)"
+    },
+    {
+      "name": "drone test",
+      "mac": "34:B7:DA:5D:27:68",
+      "wifi_channel": 1,
+      "roll_bias_deg": -0.286,
+      "pitch_bias_deg": -1.719,
+      "default_alt_m": 0.3,
+      "notes": "MAC確定(2026-06-11 手書き記録、STAモード)。旧Posture_Control_PySerialリレーにハードコードされていた機体と同一。バイアスは旧フォークの実測値(rad→deg換算)"
+    },
+    {
+      "name": "drone 1",
+      "mac": "48:CA:43:3A:51:30",
+      "wifi_channel": 1,
+      "roll_bias_deg": -0.573,
+      "pitch_bias_deg": -0.573,
+      "default_alt_m": 0.3,
+      "notes": "MAC確定(2026-06-11 手書き記録、STAモード)。バイアスは旧フォークの実測値(rad→deg換算)"
+    },
+    {
+      "name": "drone 2",
+      "mac": "48:CA:43:38:A1:CC",
+      "wifi_channel": 1,
+      "roll_bias_deg": -0.573,
+      "pitch_bias_deg": -0.573,
+      "default_alt_m": 0.3,
+      "notes": "MAC確定(2026-06-11 手書き記録、STAモード)。バイアスは旧フォークの実測値(rad→deg換算)"
+    },
+    {
+      "name": "drone 3",
+      "mac": "48:CA:43:38:F0:60",
+      "wifi_channel": 1,
+      "roll_bias_deg": 0.0,
+      "pitch_bias_deg": 0.0,
+      "default_alt_m": 0.3,
+      "notes": "MAC確定(2026-06-11 手書き記録、STAモード)。バイアスは旧フォークの実測値(rad→deg換算)"
+    }
+  ]
+}

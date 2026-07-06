@@ -1,0 +1,34 @@
+{
+  "pid": {
+    "x": { "kp": 0.139, "ki": 0.020, "kd": 0.204 },
+    "y": { "kp": 0.139, "ki": 0.020, "kd": 0.204 },
+    "output_limit": [-0.087, 0.087],
+    "d_filter_alpha": 0.6,
+    "i_decay_rate": 0.98,
+    "i_update_threshold": 0.3,
+    "enable_i_control": true
+  },
+  "filter": {
+    "window_size": 5,
+    "outlier_threshold": 0.1,
+    "velocity_window": 3,
+    "enable_prediction": true,
+    "max_outlier_threshold": 0.4
+  },
+  "coordinate_transform": {
+    "x": { "axis": "z", "sign": 1 },
+    "y": { "axis": "x", "sign": -1 },
+    "z": { "axis": "y", "sign": 1 }
+  },
+  "natnet": {
+    "server_address": "127.0.0.1",
+    "client_address": "127.0.0.1",
+    "use_multicast": true,
+    "rigid_body_id": 1
+  },
+  "control": {
+    "confidence_zero_threshold": 0.2,
+    "frame_hold_ms": 300
+  },
+  "target_default": { "x": 0.0, "y": 0.0, "z": 0.3 }
+}

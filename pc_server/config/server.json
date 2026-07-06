@@ -1,0 +1,52 @@
+{
+  "host": "127.0.0.1",
+  "port": 8000,
+  "serial": {
+    "baudrate": 115200,
+    "read_timeout_s": 0.05,
+    "write_timeout_s": 0.2,
+    "read_chunk_bytes": 512
+  },
+  "rates": {
+    "setpoint_hz": 50,
+    "ws_state_hz": 20,
+    "supervisor_hz": 20
+  },
+  "websocket": {
+    "send_timeout_s": 1.0
+  },
+  "clamps": {
+    "max_roll_pitch_deg": 10.0,
+    "slew_rate_deg_per_s": 30.0,
+    "alt_min_m": 0.1,
+    "alt_max_m": 1.2,
+    "alt_rate_m_per_s": 0.3
+  },
+  "airframe_limits": {
+    "wifi_channel_min": 1,
+    "wifi_channel_max": 13,
+    "default_alt_min_m": 0.05,
+    "default_alt_max_m": 1.5,
+    "max_profiles": 50,
+    "name_max_chars": 60,
+    "notes_max_chars": 500
+  },
+  "failsafe": {
+    "mocap_dropout_level_s": 0.3,
+    "mocap_dropout_stop_s": 2.0,
+    "stop_ack_timeout_s": 0.6,
+    "stop_max_retries": 3,
+    "start_grace_s": 1.5,
+    "target_ack_timeout_s": 1.0,
+    "target_ack_max_retries": 3
+  },
+  "freshness": {
+    "telemetry_fresh_s": 0.3,
+    "mocap_fresh_s": 0.3,
+    "relay_stats_fresh_s": 3.5,
+    "latency_pending_max_age_s": 2.0
+  },
+  "logging": {
+    "flush_every_rows": 50
+  }
+}

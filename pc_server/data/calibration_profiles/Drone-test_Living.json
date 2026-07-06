@@ -1,0 +1,61 @@
+{
+  "schema": "stampfly_calibration_profile",
+  "version": 1,
+  "name": "Drone-test_Living",
+  "saved_at": 1782710736.584235,
+  "mag3d": {
+    "valid": true,
+    "offset": [
+      -87.632866,
+      169.802841,
+      142.50145
+    ],
+    "matrix": [
+      [
+        0.982826,
+        -0.011784,
+        -0.012436
+      ],
+      [
+        -0.011784,
+        0.996501,
+        -0.002153
+      ],
+      [
+        -0.012436,
+        -0.002153,
+        1.022067
+      ]
+    ]
+  },
+  "accel6": {
+    "valid": true,
+    "offset": [
+      -0.012069,
+      0.010801,
+      0.015729
+    ],
+    "scale": [
+      1.000537,
+      0.99802,
+      0.997342
+    ]
+  },
+  "attitude_mount": {
+    "valid": true,
+    "roll_rad": -0.006511,
+    "pitch_rad": -0.020946
+  },
+  "yaw_zero": {
+    "valid": true,
+    "offset_rad": -1.469254
+  },
+  "geomag": {
+    "valid": true,
+    "declination_east_deg": -7.884827,
+    "inclination_deg": 49.331328,
+    "horizontal_uT": 30.879,
+    "vertical_uT": 35.927,
+    "total_uT": 47.368
+  }
+}

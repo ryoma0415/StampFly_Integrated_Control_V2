@@ -1,0 +1,7 @@
+# pc_server 依存パッケージ(バージョン固定)
+# core/ は fastapi/uvicorn なしでも import 可能(app.py のみが Web フレームワークに依存)
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pyserial==3.5
+numpy==2.3.5
+pytest==9.0.3

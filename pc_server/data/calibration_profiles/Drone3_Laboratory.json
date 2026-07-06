@@ -1,0 +1,61 @@
+{
+  "schema": "stampfly_calibration_profile",
+  "version": 1,
+  "name": "Drone3_Laboratory",
+  "saved_at": 1781256698.697821,
+  "mag3d": {
+    "valid": true,
+    "offset": [
+      111.042458,
+      -21.699501,
+      -19.172194
+    ],
+    "matrix": [
+      [
+        0.993801,
+        -0.03086,
+        0.008316
+      ],
+      [
+        -0.03086,
+        0.976468,
+        0.019466
+      ],
+      [
+        0.008316,
+        0.019466,
+        1.034386
+      ]
+    ]
+  },
+  "accel6": {
+    "valid": true,
+    "offset": [
+      -0.004117,
+      0.004725,
+      0.003389
+    ],
+    "scale": [
+      0.999228,
+      1.000548,
+      1.000023
+    ]
+  },
+  "attitude_mount": {
+    "valid": true,
+    "roll_rad": 0.001237,
+    "pitch_rad": -0.013158
+  },
+  "yaw_zero": {
+    "valid": true,
+    "offset_rad": 1.290717
+  },
+  "geomag": {
+    "valid": true,
+    "declination_east_deg": -7.884827,
+    "inclination_deg": 49.331328,
+    "horizontal_uT": 30.879,
+    "vertical_uT": 35.927,
+    "total_uT": 47.368
+  }
+}

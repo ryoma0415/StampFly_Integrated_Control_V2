@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StampFly 統合管制</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======== ヘッダ: 接続・プロファイル・リンク状態・電圧 ======== -->
+<header id="header">
+  <div class="brand">StampFly<span class="brand-sub">統合管制</span></div>
+
+  <div class="hgroup">
+    <label class="hlabel" for="portSelect">ポート</label>
+    <select id="portSelect" title="シリアルポート"></select>
+    <button id="btnRefreshPorts" class="btn btn-icon" title="ポート一覧を再取得">&#x21bb;</button>
+    <button id="btnConnect" class="btn btn-primary">接続</button>
+  </div>
+
+  <div class="hgroup">
+    <label class="hlabel" for="airframeSelect">機体</label>
+    <select id="airframeSelect" title="機体プロファイル"></select>
+    <button id="btnEditAirframes" class="btn btn-small" title="機体プロファイルを編集">編集</button>
+  </div>
+
+  <div class="hgroup links">
+    <span class="link-ind" id="linkSerial"><span class="dot"></span>シリアル</span>
+    <span class="link-ind" id="linkRelay"><span class="dot"></span>リレー</span>
+    <span class="link-ind" id="linkDrone"><span class="dot"></span>機体</span>
+  </div>
+
+  <div class="hgroup voltage-group">
+    <span class="hlabel">電圧</span>
+    <span id="voltage" class="voltage v-na">--.- V</span>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ======== 左カラム: モードタブ ======== -->
+  <section id="control-col">
+    <nav id="tabbar">
+      <button id="tabPosture" class="tab active" data-mode="posture">Posture<span class="tab-jp">姿勢制御</span></button>
+      <button id="tabPosition" class="tab" data-mode="position">Position<span class="tab-jp">位置制御</span></button>
+    </nav>
+
+    <!-- ---- Posture タブ ---- -->
+    <div id="panelPosture" class="panel active">
+      <div class="startstop">
+        <button class="btn btn-start" data-action="start">START<span class="btn-jp">離陸</span></button>
+        <button class="btn btn-stop" data-action="stop">STOP<span class="btn-jp">着陸</span></button>
+      </div>
+
+      <div class="slider-block">
+        <div class="slider-row">
+          <span class="slider-name">Roll</span>
+          <input type="range" id="rollSlider" min="-5" max="5" step="0.1" value="0" disabled>
+          <span class="slider-val mono" id="rollValue">+0.0&deg;</span>
+        </div>
+        <div class="slider-row">
+          <span class="slider-name">Pitch</span>
+          <input type="range" id="pitchSlider" min="-5" max="5" step="0.1" value="0" disabled>
+          <span class="slider-val mono" id="pitchValue">+0.0&deg;</span>
+        </div>
+        <div class="slider-center-row">
+          <button id="btnCenter" class="btn btn-small" disabled>中央に戻す</button>
+        </div>
+        <div class="slider-row">
+          <span class="slider-name">高度</span>
+          <input type="range" id="altSlider" min="0.1" max="1.0" step="0.01" value="0.3" disabled>
+          <span class="slider-val mono" id="altValue">0.30 m</span>
+        </div>
+        <p class="note" id="postureNote">スライダはシリアル接続後に操作できます</p>
+      </div>
+    </div>
+
+    <!-- ---- Position タブ ---- -->
+    <div id="panelPosition" class="panel">
+      <div class="startstop">
+        <button class="btn btn-start" data-action="start">START<span class="btn-jp">離陸</span></button>
+        <button class="btn btn-stop" data-action="stop">STOP<span class="btn-jp">着陸</span></button>
+      </div>
+
+      <div class="target-block">
+        <div class="target-row">
+          <label>目標 X<input type="number" id="targetX" step="0.05" value="0.00"><span class="unit">m</span></label>
+          <label>目標 Y<input type="number" id="targetY" step="0.05" value="0.00"><span class="unit">m</span></label>
+          <label>目標 Z<input type="number" id="targetZ" step="0.05" min="0.1" max="1.0" value="0.30"><span class="unit">m</span></label>
+        </div>
+        <div class="preset-row">
+          <button id="btnPresetHere" class="btn btn-small">この場で</button>
+          <button id="btnPresetOrigin" class="btn btn-small">原点</button>
+        </div>
+      </div>
+
+      <div class="mocap-block">
+        <span class="mlabel">MoCap</span>
+        <span class="link-ind" id="mocapStatus"><span class="dot"></span><span id="mocapStatusText">未受信</span></span>
+        <span class="mono" id="mocapCoords">x: --.-- y: --.-- z: --.--</span>
+      </div>
+
+      <canvas id="xyCanvas" width="360" height="360"></canvas>
+
+      <div class="cmd-block">
+        <span class="mlabel">指令角</span>
+        <span class="mono">Roll <span id="cmdRoll">+0.0&deg;</span></span>
+        <span class="mono">Pitch <span id="cmdPitch">+0.0&deg;</span></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======== 右カラム: 共通モニタ ======== -->
+  <section id="monitor-col">
+
+    <div class="mon-row state-row">
+      <span id="stateBadge" class="state-badge" data-state="-1">---</span>
+      <span class="phase mono" id="phaseLabel">phase: -</span>
+      <button id="btnRearm" class="btn btn-rearm hidden" data-action="reset">Re-arm (RESET)</button>
+    </div>
+
+    <div class="mon-group">
+      <h3>姿勢 <span class="unit-h">deg</span></h3>
+      <div class="gauge-row">
+        <span class="gname">Roll</span>
+        <div class="bar bipolar"><div class="bar-fill" id="attRollBar"></div><div class="center-line"></div></div>
+        <span class="gval mono" id="attRollNum">--.-</span>
+      </div>
+      <div class="gauge-row">
+        <span class="gname">Pitch</span>
+        <div class="bar bipolar"><div class="bar-fill" id="attPitchBar"></div><div class="center-line"></div></div>
+        <span class="gval mono" id="attPitchNum">--.-</span>
+      </div>
+      <div class="gauge-row">
+        <span class="gname">Yaw</span>
+        <div class="bar bipolar"><div class="bar-fill yaw" id="attYawBar"></div><div class="center-line"></div></div>
+        <span class="gval mono" id="attYawNum">--.-</span>
+      </div>
+    </div>
+
+    <div class="mon-group">
+      <h3>高度 <span class="unit-h">m(現在 vs 目標)</span></h3>
+      <div class="gauge-row">
+        <span class="gname">Alt</span>
+        <div class="bar"><div class="bar-fill alt" id="altCurBar"></div><div class="ref-marker" id="altRefMarker"></div></div>
+        <span class="gval mono"><span id="altCurNum">--.--</span> / <span id="altRefNum">--.--</span></span>
+      </div>
+    </div>
+
+    <div class="mon-group">
+      <h3>モータデューティ</h3>
+      <div class="gauge-row"><span class="gname">FR</span><div class="bar"><div class="bar-fill duty" id="dutyFR"></div></div><span class="gval mono" id="dutyFRNum">--%</span></div>
+      <div class="gauge-row"><span class="gname">FL</span><div class="bar"><div class="bar-fill duty" id="dutyFL"></div></div><span class="gval mono" id="dutyFLNum">--%</span></div>
+      <div class="gauge-row"><span class="gname">RR</span><div class="bar"><div class="bar-fill duty" id="dutyRR"></div></div><span class="gval mono" id="dutyRRNum">--%</span></div>
+      <div class="gauge-row"><span class="gname">RL</span><div class="bar"><div class="bar-fill duty" id="dutyRL"></div></div><span class="gval mono" id="dutyRLNum">--%</span></div>
+    </div>
+
+    <div class="mon-group stats-line">
+      <span>レイテンシ <span class="mono" id="latency">-- ms</span></span>
+      <span class="relay-stats mono" id="relayStats"></span>
+    </div>
+
+    <div class="mon-group logging-row">
+      <label class="switch-label">
+        <input type="checkbox" id="logToggle">ログ保存
+      </label>
+      <span class="mono logfile" id="logFile">-</span>
+    </div>
+
+    <div class="mon-group console-group">
+      <h3>イベント / ログ</h3>
+      <div id="consoleEl" class="console" aria-live="polite"></div>
+    </div>
+
+  </section>
+</main>
+
+<!-- ======== フッタ: 緊急停止ヒント ======== -->
+<footer id="footer">
+  <span id="spaceHint"><kbd>SPACE</kbd> どこからでも緊急停止(STOP)</span>
+</footer>
+
+<!-- ======== 機体プロファイル編集モーダル ======== -->
+<div id="afEditor" class="overlay editor-overlay">
+  <div class="editor-box">
+    <div class="editor-title">機体プロファイル編集</div>
+    <p class="editor-hint">
+      機体の MAC は USB 接続時の起動ログ
+      「<span class="mono">ESP-NOW ready: MAC=...</span>」で確認できます。
+      MAC 未設定(空欄)のプロファイルは選択できません。
+      既知の候補 MAC: <span id="afKnownMacs" class="mono">-</span>
+    </p>
+    <div class="editor-table-wrap">
+      <table id="afTable">
+        <thead>
+          <tr>
+            <th>機体名</th>
+            <th>MAC(空欄=未設定)</th>
+            <th>ch</th>
+            <th>Roll bias [deg]</th>
+            <th>Pitch bias [deg]</th>
+            <th>初期高度 [m]</th>
+            <th>メモ</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="afTbody"></tbody>
+      </table>
+    </div>
+    <div class="editor-actions">
+      <button id="btnAfAddRow" class="btn btn-small">行追加</button>
+      <span id="afEditorMsg" class="editor-msg" aria-live="polite"></span>
+      <button id="btnAfCancel" class="btn">キャンセル</button>
+      <button id="btnAfSave" class="btn btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ======== WebSocket切断オーバーレイ ======== -->
+<div id="overlay" class="overlay">
+  <div class="overlay-box">
+    <div class="overlay-title">サーバー未接続</div>
+    <div class="overlay-msg">WebSocket が切断されました。1秒間隔で再接続しています…</div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

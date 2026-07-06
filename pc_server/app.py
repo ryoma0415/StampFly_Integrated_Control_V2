@@ -368,6 +368,25 @@ async def _handle_command(message: dict) -> None:
         session.warn(f"不明なコマンド: {action}")
 
 
+# SPACE 緊急停止系のコマンド。受信ループが先行コマンド(select_airframe の
+# ACK 待ち最大約4秒など)の完了を待たされないよう、順序キューを迂回して
+# 即時に優先経路(session.emergency_stop / motor_stop: _command_lock 非経由)
+# を実行する。正規の停止処理(STOP 再送監視など)は順序キュー側でも実行される。
+_EMERGENCY_ACTIONS = frozenset({"stop", "motor_stop"})
+
+
+def _is_emergency(message: dict) -> bool:
+    return (message.get("type") == "command"
+            and message.get("action") in _EMERGENCY_ACTIONS)
+
+
+async def _handle_emergency(message: dict) -> None:
+    if message.get("action") == "stop":
+        await asyncio.to_thread(session.emergency_stop)
+    else:   # motor_stop(_command_lock 非経由の即時停止)
+        await asyncio.to_thread(session.motor_stop)
+
+
 async def _handle_message(message: dict) -> None:
     msg_type = message.get("type")
     try:
@@ -395,6 +414,23 @@ async def _handle_message(message: dict) -> None:
         session.warn(f"不正なメッセージ ({msg_type}): {exc}")
 
 
+async def _client_message_worker(pending: "asyncio.Queue[dict]") -> None:
+    """1クライアントぶんの通常メッセージを受信順に処理するワーカー。
+
+    受信ループ本体から処理を切り離すことで、低速コマンド(connect /
+    select_airframe の ACK 待ちなど)の実行中も受信ループがブロックせず、
+    後着の SPACE 緊急停止を即時に拾えるようにする(通常コマンドの
+    クライアント内順序はこのキューが保存する)。
+    """
+    while True:
+        message = await pending.get()
+        try:
+            await _handle_message(message)
+        except Exception:
+            # ワーカーを死なせると以降のコマンドが全て無視されるため継続
+            _log.exception("client message handling failed")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -402,14 +438,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # 接続直後に現在状態を1回送る(UI 初期表示用)
     await _send_safely(websocket,
                        await asyncio.to_thread(session.get_state_snapshot))
+    pending: asyncio.Queue = asyncio.Queue()
+    worker = asyncio.create_task(_client_message_worker(pending))
     try:
         while True:
             message = await websocket.receive_json()
-            if isinstance(message, dict):
-                await _handle_message(message)
+            if not isinstance(message, dict):
+                continue
+            if _is_emergency(message):
+                # 緊急停止: 先行コマンドの完了を待たず優先経路を即時実行。
+                # 正規の停止処理も順序キューへ積む(冪等)。
+                await _handle_emergency(message)
+            pending.put_nowait(message)
     except WebSocketDisconnect:
         pass
     finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
         _clients.discard(websocket)
 
 

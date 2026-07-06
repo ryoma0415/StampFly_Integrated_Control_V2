@@ -122,18 +122,27 @@ class FlightLog:
 # ---------------------------------------------------------------------------
 
 def _read_csv_with_recovery(csv_path: Path) -> pd.DataFrame:
-    """UTF-8 として壊れた末尾があれば切り捨てて読む(旧実装踏襲)。"""
+    """UTF-8 として壊れたバイトを含む行を除いて読む(電源断ログの救済)。
+
+    注意: pandas の C パーサは 256KiB チャンク単位でデコードするため、
+    UnicodeDecodeError.start は**チャンク内**オフセットでありファイル先頭
+    からのオフセットではない(旧 Drone_Log_Viewer はこれを切断位置に誤用し、
+    破損位置が 256KiB を超えるログで有効行の大半を無警告で失っていた)。
+    ここでは e.start を使わず、ファイル全体を errors="ignore" でデコードして
+    最後の改行までを読む。不正バイトの除去で列が崩れた行(通常は破損点の
+    1 行のみ)は on_bad_lines="skip" で読み飛ばす。
+    """
     try:
         return pd.read_csv(csv_path)
     except UnicodeDecodeError as e:
-        print(f"警告: CSV 読み込みでエンコードエラー ({e})。破損した末尾を切り捨てます。")
+        print(f"警告: CSV 読み込みでエンコードエラー ({e})。"
+              "破損バイトを除去して再読み込みします。")
         raw_bytes = Path(csv_path).read_bytes()
-        cut_idx = e.start if getattr(e, "start", None) is not None else len(raw_bytes)
-        clean_text = raw_bytes[:cut_idx].decode("utf-8", errors="ignore")
+        clean_text = raw_bytes.decode("utf-8", errors="ignore")
         if "\n" not in clean_text:
             raise ValueError("CSV の先頭から破損しているため読み込めません。") from e
         clean_text = clean_text.rsplit("\n", 1)[0] + "\n"
-        return pd.read_csv(io.StringIO(clean_text))
+        return pd.read_csv(io.StringIO(clean_text), on_bad_lines="skip")
 
 
 def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:

@@ -282,6 +282,39 @@ class TestSweepRunner:
         assert session.experiment.sweep.status()["phase"] == "aborted"
         assert transport.frames_of_type(proto.MsgType.CMD_MOTOR_STOP)
 
+    def test_manual_motor_rejected_while_running(self, exp_session,
+                                                 short_sweep, monkeypatch):
+        """スイープ実行中の motor_start / motor_set はサーバ側で拒否する。
+
+        UI の busy ゲートだけに頼ると、別クライアントからの操作が measure 中の
+        duty/mask を上書きし CSV の duty_cmd と実回転が食い違う。
+        """
+        session, transport, clock, responder = exp_session
+        monkeypatch.setattr(experiment, "SWEEP_MEASURE_S", 5.0)
+        session.experiment.sweep.result_dir = short_sweep
+        feeder = start_exp_feeder(session, transport)
+        try:
+            assert session.sweep_start(0x01, "up", None)["ok"]
+            assert wait_until(
+                lambda: session.experiment.sweep.status()["phase"]
+                in ("settle", "measure"), timeout=5.0)
+            result = session.motor_start(0.9, 0x0F)
+            assert result["ok"] is False
+            assert "実行中" in result["message"]
+            result = session.motor_apply(0.9)
+            assert result["ok"] is False
+            assert "実行中" in result["message"]
+            # hub の duty/mask はスイープの値のまま(キープアライブが 0.9 を
+            # 送らない)
+            assert session.experiment.motor_status()["duty"] != 0.9
+            # motor_stop(緊急停止経路)は従来どおり無条件で受理される
+            assert session.motor_stop()["ok"] is True
+            session.experiment.sweep.abort()
+            assert wait_until(
+                lambda: not session.experiment.sweep.is_running(), timeout=5.0)
+        finally:
+            feeder.set()
+
     def test_undervolt_aborts(self, exp_session, short_sweep):
         session, transport, clock, responder = exp_session
         session.experiment.sweep.result_dir = short_sweep

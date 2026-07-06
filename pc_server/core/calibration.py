@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from . import config as cfg
+from .posture import wrap_pi
 from .serial_link import SerialLink, SerialLinkError
 
 MAG3D_CALIBRATION_SCHEMA = 2
@@ -526,13 +527,20 @@ class CalibrationManager:
                  notify: Callable[[str], None],
                  calprofile_dir: Path = cfg.CALPROFILES_DIR,
                  mag3d_path: Path = cfg.MAG3D_CALIBRATION_PATH,
-                 geomag_path: Path = cfg.GEOMAG_PROFILES_PATH) -> None:
+                 geomag_path: Path = cfg.GEOMAG_PROFILES_PATH,
+                 tlm_state_provider: Optional[Callable[
+                     [], tuple[Any, Optional[float]]]] = None) -> None:
         exp_cfg = server_config["experiment"]
         self._cal_get_timeout_s: float = exp_cfg["cal_get_timeout_s"]
         self._accel6_capture_s: float = exp_cfg["accel6_capture_s"]
+        self._telemetry_fresh_s: float = (
+            server_config["freshness"]["telemetry_fresh_s"])
         self.link = link
         self.hub = hub
         self.notify = notify
+        # 最新 TLM_STATE のスナップショット (tlm, age_s) を返すプロバイダ
+        # (session 層が配線する。yaw_zero の逆算が yaw_est_rad を使う)
+        self._tlm_state_provider = tlm_state_provider
         self.calprofile_dir = Path(calprofile_dir)
         self.mag3d_path = Path(mag3d_path)
         self.geomag_path = Path(geomag_path)
@@ -743,12 +751,43 @@ class CalibrationManager:
                                       else f"CMD_ATTMOUNT_SET 失敗: {detail}")}
 
     def yaw_zero(self) -> dict:
-        """現在ヨー(TLM_EXP の Madgwick yaw)をヨーゼロオフセットに設定。"""
-        sample, age = self.hub.latest_sample()
-        if sample is None or age is None or age > self.hub.exp_fresh_s:
+        """現在の推定ヨーが 0 になるヨーゼロオフセットを逆算して設定する。
+
+        CMD_YAWZERO_SET はレベル化磁気ヘディング座標系の mag_yaw_offset を
+        直接インストールする復元専用 API で、機体側の推定ヨーは
+        wrapPi(yaw_mag_raw − offset) になる。Madgwick ヨー(TLM_EXP)は
+        磁気を使わず基準も無関係なため、そのまま送っても推定ヨーは 0 に
+        ならない。そこで機体の現在オフセット(TLM_CAL_DATA の
+        yawzero_offset_rad = 現在の mag_yaw_offset。valid ビットに関わらず
+        現行値が返る)と現在の推定ヨー(TLM_STATE の yaw_est_rad)から
+        offset_new = wrap_pi(offset_cur + yaw_est) を逆算して送る
+        (ファーム実装の申し送り事項の解決)。
+
+        ff_mode≠0 のときは yaw_est_rad が補正系推定器(補正CF/EKF)の出力に
+        なり、リファレンスCFの磁気オフセット座標系と一致しないため拒否する。
+        """
+        if self._tlm_state_provider is None:
             return {"ok": False,
-                    "message": "実験テレメトリ(TLM_EXP)が新鮮ではありません"}
-        payload = proto.CmdYawzeroSet(valid=1, offset_rad=sample["yaw_rad"])
+                    "message": "TLM_STATE が参照できないためヨーゼロを設定できません"}
+        tlm, age = self._tlm_state_provider()
+        if tlm is None or age is None or age > self._telemetry_fresh_s:
+            return {"ok": False,
+                    "message": "テレメトリ(TLM_STATE)が新鮮ではありません"}
+        if not (tlm.ff_status & proto.TlmState.FF_STATUS_MAG_FRESH):
+            return {"ok": False,
+                    "message": "磁気サンプルが新鮮でないためヨーゼロを設定できません"
+                               "(磁気センサの状態を確認してください)"}
+        cal = self.fetch_cal_data()
+        if cal is None:
+            return {"ok": False,
+                    "message": "機体からキャリブレーションデータを取得できません"
+                               "でした(リンク/機体状態を確認)"}
+        if cal.ff_mode != 0:
+            return {"ok": False,
+                    "message": "FF 補正が有効なためヨーゼロを設定できません。"
+                               "先に FF モードを off にしてください"}
+        offset_new = wrap_pi(cal.yawzero_offset_rad + tlm.yaw_est_rad)
+        payload = proto.CmdYawzeroSet(valid=1, offset_rad=offset_new)
         ok, detail = self._send_ack(proto.MsgType.CMD_YAWZERO_SET,
                                     payload.to_payload())
         return {"ok": ok, "message": ("ヨーゼロを設定しました" if ok

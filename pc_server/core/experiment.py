@@ -355,24 +355,44 @@ class ExperimentHub:
         return {"ok": True, "running": True, "duty": duty, "mask": mask,
                 "motors": motors_label(mask)}
 
-    def motor_start(self, duty: Any, mask: Any = MOTOR_MASK_ALL) -> dict:
+    def _runner_busy(self) -> bool:
+        """スイープ/シーケンス実行中か(start_gate 保持中に呼ぶこと)。"""
+        return self.sweep.is_running() or self.sequence.is_running()
+
+    _RUNNER_BUSY_MESSAGE = "スイープ/シーケンス実行中は手動モーター操作できません"
+
+    def motor_start(self, duty: Any, mask: Any = MOTOR_MASK_ALL,
+                    _internal: bool = False) -> dict:
         if not self.active:
             return {"ok": False, "running": False,
                     "message": "実験モードが有効ではありません"}
         clamped = self._clamp_motor_duty(duty)
         mask_value = clamp_motor_mask(mask)
-        with self.lock:
-            self.motor_running = True
-            self.motor_duty = clamped
-            self.motor_mask = mask_value
+        # 手動操作はスイープ/シーケンス実行中は拒否する(UI の busy ゲート
+        # だけに頼らない — 別クライアント/エコー遅れの操作が measure 中の
+        # duty/mask を上書きし、CSV の duty_cmd 列と実回転が食い違うのを防ぐ)。
+        # 判定と状態セットは start_gate 下で原子化(sweep/sequence.start と
+        # 同じ no-TOCTOU パターン)。スイープ内部からの駆動(_internal)は対象外。
+        with self.start_gate:
+            if not _internal and self._runner_busy():
+                return {"ok": False, "running": False,
+                        "message": self._RUNNER_BUSY_MESSAGE}
+            with self.lock:
+                self.motor_running = True
+                self.motor_duty = clamped
+                self.motor_mask = mask_value
         return self._send_motor_run(clamped, mask_value)
 
-    def motor_apply(self, duty: Any) -> dict:
+    def motor_apply(self, duty: Any, _internal: bool = False) -> dict:
         clamped = self._clamp_motor_duty(duty)
-        with self.lock:
-            running = self.motor_running
-            self.motor_duty = clamped
-            mask_value = self.motor_mask
+        with self.start_gate:
+            if not _internal and self._runner_busy():
+                return {"ok": False, "duty": clamped,
+                        "message": self._RUNNER_BUSY_MESSAGE}
+            with self.lock:
+                running = self.motor_running
+                self.motor_duty = clamped
+                mask_value = self.motor_mask
         if not running:
             return {"ok": False, "running": False, "duty": clamped,
                     "message": "モーターが回転していません。先に Start してください"}
@@ -645,7 +665,7 @@ class SweepRunner:
                 leg_tag = "↓" if leg == "down" else "↑"
                 self._set_phase("settle", duty=duty, step_index=i + 1,
                                 message=f"duty {duty:.2f}{leg_tag} 整定中")
-                self.hub.motor_start(duty, self.motor_mask)
+                self.hub.motor_start(duty, self.motor_mask, _internal=True)
                 self._collect(client, SWEEP_SETTLE_S, "settle", duty,
                               samples_all, correction)
                 self._check_abort()

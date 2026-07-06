@@ -110,22 +110,38 @@ StampFly_Integrated_Control/
 - UI→サーバ:
   - `{"type":"command","action":"connect","port":...}` / `"disconnect"`
   - `{"type":"command","action":"select_airframe","name":...}`(接続時にRLY_SET_TARGET)
-  - `{"type":"command","action":"set_mode","mode":"posture"|"position"}`
+  - `{"type":"command","action":"set_mode","mode":"posture"|"position"|"experiment"}`(v2)
   - `{"type":"command","action":"start"}` / `"stop"` / `"reset"`
-  - `{"type":"setpoint","roll_deg":..,"pitch_deg":..,"alt_m":..}`(Posture時)
+  - `{"type":"setpoint","roll_deg":..,"pitch_deg":..,"alt_m":..,"yaw_deg":..}`(Posture時。v2: yaw_deg)
+  - `{"type":"yaw","yaw_deg":..}`(v2: 共通ヨースライダ)
   - `{"type":"target","x":..,"y":..,"z":..}`(Position時)
   - `{"type":"command","action":"set_logging","enabled":bool}`
+  - v2 追加コマンド: `"experiment_activate"` / `"set_yaw_control"` /
+    `"circle_start"`(center_x/center_y/radius_m/period_s/clockwise/alt_m/face_tangent)/
+    `"circle_stop"` / `"motor_start"`(duty/mask)/ `"motor_set"`(duty)/ `"motor_stop"`
+  - v2 REST(Experiment タブ): `/api/sweep` `/api/sequence` `/api/cal3d` `/api/accel6`
+    `/api/quickcal` `/api/geomag` `/api/calprofile` `/api/ffprofile`
+  - 緊急停止の優先経路(v2): `stop` / `motor_stop` は受信ループの順序キューを迂回して
+    即時実行される(先行する低速コマンドの ACK 待ちに巻き込まれない)。
 
 ### UI構成(static/)
 ヘッダ: ポート選択+接続、機体プロファイル選択(MAC未設定は「⚠ MAC未設定」表示)
 +「編集」ボタン(プロファイル編集モーダル: 行追加/行削除/保存=PUT/キャンセル)、
 リンク状態(serial/relay/drone)、電圧。
-タブ: **Posture**(Start/Stop、roll/pitchスライダ±5°(設定で±10°まで)=飛行中のみ操作可、
-高度スライダ0.1–1.0m=接続中なら離陸前から操作可(CMD_SETPOINT flags bit0 による
-離陸目標高度の事前設定)) / **Position**(Start/Stop、目標XYZ入力+プリセット、
-XY平面プロット(現在/目標)、指令roll/pitch表示)。共通モニタ: 姿勢数値+バー、高度(現在vs目標)、モータデューティ、
-飛行状態インジケータ、レイテンシ、イベント/ログコンソール、ログ保存トグル+ファイル名。
+タブ(v2 で 3 タブ): **Posture**(Start/Stop、roll/pitchスライダ±5°(設定で±10°まで)
+=飛行中のみ操作可、高度スライダ0.1–1.0m=接続中なら離陸前から操作可(CMD_SETPOINT
+flags bit0 による離陸目標高度の事前設定)、ヨー角スライダ±180°+ヨー角制御トグル+
+FF プロファイル欄) / **Position**(Start/Stop、目標XYZ入力+プリセット、XY平面
+プロット(現在/目標+目標軌道円の重畳)、指令roll/pitch表示、軌道セレクタ
+(ホバリング/円軌道)+円軌道パラメータ+開始/停止、ヨー系は Posture と共通+
+「進行方向を向く」オプション) / **Experiment**(v2: モーターテストバー(0.6 以上は
+高出力許可チェック)、スイープ、加算性シーケンス、3D磁気/Accel6/Attitude0/Yaw0/地磁気/
+キャリブプロファイル/FF 抽出・適用の各パネル。機体は CMD_MODE で MOTOR_TEST 状態)。
+共通モニタ: 姿勢数値+バー(EKF ヨー併記)、高度(現在vs目標)、モータデューティ、
+飛行状態インジケータ、EKF 健全性(ffg/ff_status)警告バッジ、レイテンシ、
+イベント/ログコンソール、ログ保存トグル+ファイル名。
 COMPLETE状態のときのみRe-arm(RESET)ボタン表示。
+**SPACE 緊急停止は全タブで有効**(stop に加え、Experiment 中は CMD_MOTOR_STOP も送出)。
 
 ## 安全クランプ(多層)
 

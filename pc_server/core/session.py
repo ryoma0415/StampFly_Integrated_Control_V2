@@ -146,8 +146,9 @@ class SessionManager:
         # v2: 実験モード(モーターテスト/スイープ)+キャリブ/FF プロファイル
         self.experiment = ExperimentHub(self.server_config, self.serial,
                                         notify=self.warn)
-        self.calibration = CalibrationManager(self.server_config, self.serial,
-                                              self.experiment, notify=self.info)
+        self.calibration = CalibrationManager(
+            self.server_config, self.serial, self.experiment, notify=self.info,
+            tlm_state_provider=self._tlm_state_snapshot)
         self.ffprofile = FfProfileManager(self.serial, self.experiment,
                                           self.calibration, notify=self.warn)
 
@@ -658,6 +659,28 @@ class SessionManager:
                 self._stop_pending = None
         return ok
 
+    def emergency_stop(self) -> None:
+        """SPACE 緊急停止の優先経路(_command_lock を**経由しない**)。
+
+        低速コマンド(select_airframe の RLY_SET_TARGET ACK 待ち最大約4秒、
+        connect 等)が _command_lock を保持していても、モーターキープアライブの
+        停止と CMD_STOP の送出を先行させる。放置するとキープアライブが
+        CMD_MOTOR_RUN を 0.4s 周期で送り続け、機体側 1.5s 途絶フェイルセーフも
+        発動しないまま緊急停止が最大約4秒遅れる。
+
+        ここで触るのは hub 内部ロック・serial の TX ロックのみで完結する
+        操作に限る(フェーズ遷移や STOP 再送監視などの状態管理は、続けて
+        呼ばれる通常の stop() が _command_lock 下で行う)。
+        """
+        self.position.set_control_active(False)
+        # スイープ/シーケンス中断+モーター停止+キープアライブ停止
+        # (CMD_MOTOR_STOP は飛行状態では機体側が bad_state で無害に破棄する)
+        self.experiment.sequence.abort_if_running()
+        self.experiment.sweep.abort_if_running()
+        self.experiment.motor_stop()
+        if self.serial.is_connected:
+            self._send_stop()
+
     @_ui_command
     def reset(self) -> bool:
         """CMD_RESET(COMPLETE からの復帰)。受理条件はファームが検証する。"""
@@ -761,7 +784,11 @@ class SessionManager:
         if reason is not None:
             self.warn(f"モーター開始不可: {reason}")
             return {"ok": False, "message": reason}
-        return self.experiment.motor_start(duty, mask)
+        result = self.experiment.motor_start(duty, mask)
+        if not result.get("ok") and result.get("message"):
+            # hub 側の拒否(スイープ/シーケンス実行中など)も UI へ通知する
+            self.warn(f"モーター開始不可: {result['message']}")
+        return result
 
     @_ui_command
     def motor_apply(self, duty: float) -> dict:
@@ -769,11 +796,16 @@ class SessionManager:
         if reason is not None:
             self.warn(f"duty 変更不可: {reason}")
             return {"ok": False, "message": reason}
-        return self.experiment.motor_apply(duty)
+        result = self.experiment.motor_apply(duty)
+        if not result.get("ok") and result.get("message"):
+            self.warn(f"duty 変更不可: {result['message']}")
+        return result
 
-    @_ui_command
     def motor_stop(self) -> dict:
-        # 停止は前提チェックなしで常に受け付ける(SPACE 緊急停止経路)
+        # 停止は前提チェックなしで常に受け付ける(SPACE 緊急停止経路)。
+        # 意図的に _ui_command(_command_lock)を経由しない: 低速コマンドの
+        # 背後で緊急停止が待たされないよう、hub 内部ロックのみで完結させる
+        # (キープアライブ停止 → CMD_MOTOR_STOP 冗長送出)。
         if not self.serial.is_connected:
             return {"ok": False, "message": "未接続です"}
         return self.experiment.motor_stop()
@@ -1017,6 +1049,15 @@ class SessionManager:
     # ==================================================================
     # 内部: 受信ハンドラ(RXスレッド上: 状態更新とキュー投入のみ)
     # ==================================================================
+
+    def _tlm_state_snapshot(self) -> tuple[Optional[proto.TlmState],
+                                           Optional[float]]:
+        """最新 TLM_STATE と受信からの経過秒(CalibrationManager が参照)。"""
+        with self._lock:
+            tlm = self._tlm_state
+            tlm_t = self._tlm_state_t
+        age = None if tlm_t is None else (self._clock() - tlm_t)
+        return tlm, age
 
     def _on_tlm_state(self, frame: proto.Frame) -> None:
         try:

@@ -73,6 +73,9 @@ struct SensorHubFfInputs {
     float pitch_rad = 0.0f;        // Madgwick ピッチ [rad]
     float dt_s = 0.0f;             // 実測tick周期 [s]
     bool tof_read_this_tick = false;  // 今tickでToF読みが発生(→磁気/電流を繰延べ)
+    bool in_flight = false;           // 飛行状態(TAKEOFF/HOVER/LANDING)。true の間は
+                                      // ブロッキングし得る BMM150 再初期化リトライを
+                                      // 保留する(400Hzループの 2.5ms 予算保護)
     bool motors_running = false;      // PWM実出力あり(ランプダウン中も true にすること)
     float duty[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // 実効duty。順序は FL,FR,RL,RR(FF係数の順)
     uint8_t motor_mask = 0x0F;        // bit0=FL,1=FR,2=RL,3=RR

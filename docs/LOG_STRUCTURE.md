@@ -1,19 +1,29 @@
-# StampFly Integrated Control — フライトログ形式
+# StampFly Integrated Control — フライトログ形式(v2・94列)
 
 本書は `pc_server/core/logger.py` が生成する CSV の列構成を定義する。
 列定義の実体は `logger.py` の `COLUMNS` であり、本書と1対1で対応させること。
 語彙は旧 `NatNet_PID_Controller/LOG_STRUCTURE.md`(57列)を継承し、機体テレメトリ
 (TLM_STATE)列で拡張している。
 
+v2 では v1(77列)の**末尾に 17 列を追加**した(既存 77 列の名前・順序は不変):
+ヨー指令 3 列(`cmd_yaw_ref_rad` / `cmd_yaw_ref_deg` / `yaw_ctrl_on`)、
+TLM_STATE 末尾拡張のスナップショット 11 列(`tlm_yaw_est_rad` 〜 `tlm_ff_status`)、
+MoCap ヨーと軌道状態 3 列(`mocap_yaw_deg` / `traj_mode` / `traj_phase_rad`)。
+詳細は「v2 追加列」節を参照。flight_log_viewer(`viewer/constants.py` の
+`V2_COLUMNS`)はこの 94 列契約を正として読み込む。
+
 ## 出力先・行レート
 
-- 出力先: リポジトリ直下 `logs/YYYYMMDD_HHMMSS_<mode>.csv`(`<mode>` = `posture` | `position`)
+- 出力先: リポジトリ直下 `logs/YYYYMMDD_HHMMSS_<mode>.csv`(`<mode>` = `posture` |
+  `position`。experiment モード中もログトグル ON ならファイルは開かれるが、
+  50Hz 送信が停止しているため行は記録されない)
 - ログ ON のとき、CMD_SETPOINT の送信(50Hz)ごとに1行を出力する。
 - 各行には「その送信時点での最新テレメトリ/mocap スナップショット」を結合する。
 
 ## 書式と書き込み挙動(`logger.py` 実装)
 
-- 列数は 77(1行目がヘッダ)。順序は `COLUMNS` の宣言順=本書の掲載順。
+- 列数は 94(1行目がヘッダ)。順序は `COLUMNS` の宣言順(v1 の 77 列 →
+  v2 追加 17 列の順。本書の「v2 追加列」節はファイル上の末尾 17 列に対応)。
 - float は小数 6 桁の固定表記(`FLOAT_DECIMALS = 6`)。bool は `"1"`/`"0"`、
   `None`(未取得)は空文字で出力される。
 - `timestamp` / `elapsed_time` は `log_row()` が自動付与する(呼び出し側が
@@ -128,6 +138,38 @@ PROTOCOL.md の TLM_STATE(97B)全フィールドに `tlm_` 接頭辞を付けて
 | `tlm_duty_fr`, `tlm_duty_fl`, `tlm_duty_rr`, `tlm_duty_rl` | float | 0–1 | モータデューティ。 |
 | `tlm_ax_g`, `tlm_ay_g`, `tlm_az_g` | float | g | フィルタ後加速度。 |
 | `tlm_loop_dt_us` | u16 | µs | 機体の直近制御周期実測値。 |
+
+## v2 追加列(ファイル上の末尾 17 列。順序は下表の掲載順)
+
+### ヨー指令(送信した CMD_SETPOINT のヨー目標)
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `cmd_yaw_ref_rad` | float | rad | 送信した CMD_SETPOINT のヨー角目標(整形済み)。ヨー制御 OFF 時は 0。 |
+| `cmd_yaw_ref_deg` | float | deg | 上記の度数表記。 |
+| `yaw_ctrl_on` | 0/1 | - | flags bit1(FLAG_YAW_REF_VALID)を立てて送信したか(=ヨー角制御 ON)。 |
+
+### 機体テレメトリ v2 拡張(TLM_STATE オフセット 97 以降のスナップショット。未受信時は空)
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `tlm_yaw_est_rad` | float | rad | アクティブ推定器ヨー(est_mode=1 なら EKF ψ、0 なら補正CF。ff/est 未設定時はリファレンスCF)。 |
+| `tlm_yaw_gyro_int_rad` | float | rad | Z軸角速度の単純積算(400Hz、ahrs_reset でゼロクリア)。 |
+| `tlm_yaw_ref_rad` | float | rad | 機体側で適用中のヨー目標(途絶ラッチ後含む。ヨー制御 off 時 0)。 |
+| `tlm_current_a` | float | A | 総電流(INA3221 CH2、20Hz 更新)。 |
+| `tlm_db_hat_x_ut`, `tlm_db_hat_y_ut` | float | µT | 適用中の FF 補正ベクトル ΔB̂ の x/y。 |
+| `tlm_bm_x_ut`, `tlm_bm_y_ut` | float | µT | EKF 磁気バイアス状態 b_m の x/y。 |
+| `tlm_nis` | float | - | 直近 EKF 更新の NIS。 |
+| `tlm_ffg` | u8 | - | EKF ゲート/健全性ビット(PROTOCOL.md の ffg 定義参照)。 |
+| `tlm_ff_status` | u8 | - | bit0-1 ff_mode, bit2 est_mode(EKF), bit3 anchor_valid, bit4 ffcal_loaded, bit5 yaw_ctrl_active, bit6 mag_fresh。 |
+
+### MoCap ヨー・軌道状態(Position モードのみ。Posture モードでは空)
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `mocap_yaw_deg` | float | deg | MoCap リジッドボディのヨー真値(mocap.py の yaw_rad を deg 換算。制御には未使用・比較用)。 |
+| `traj_mode` | int | - | 軌道モード: hover=0 / circle=1。 |
+| `traj_phase_rad` | float | rad | 円軌道の現在位相(±π)。**hover 時は空欄**。MoCap 途絶中は位相凍結のため直近値のまま。 |
 
 ## 旧形式からの主な変更点
 

@@ -68,6 +68,7 @@ struct FfAnchorWindow {
 
 FfAnchorWindow g_ff_anchor_window;
 TwoWire* g_wire = nullptr;          // sensorHubFfInit で渡された I2C バス
+bool g_in_flight = false;           // 今tickの飛行状態スナップショット(入力から転記)
 bool g_mag_cal_seen = false;        // fresh な b_cal を一度でも観測したか
 bool g_ff_boot_anchor_done = false; // ブート後の自動初回アンカー取得済みか
 // 直近 update で使ったレベル化入力姿勢(アンカー凍結時の B0 水平化に使う)
@@ -171,8 +172,13 @@ void updateMagnetometer() {
     last_mag_sample_ms = now_ms;
 
     if (!g_yaw_est.bmm_ready) {
+        // 再初期化リトライは非飛行時のみ: Bmm150Driver::begin() は delay(5)/
+        // delay(10) を含み得るため、TAKEOFF/HOVER/LANDING の 400Hz 制御ループを
+        // 5〜15ms ブロックして dt を乱す(半死チップは電源書込みに ACK した後
+        // chip_id/トリム読出しで失敗し delay まで到達する)。飛行中は保留し、
+        // WAIT/COMPLETE/MOTOR_TEST/CALIBRATION に戻ってから 1s 周期で再試行する。
         static uint32_t last_retry_ms = 0;
-        if (g_wire != nullptr && now_ms - last_retry_ms > 1000) {
+        if (!g_in_flight && g_wire != nullptr && now_ms - last_retry_ms > 1000) {
             last_retry_ms = now_ms;
             g_yaw_est.bmm_ready = g_yaw_est.bmm150.begin(*g_wire, BMM150_I2C_ADDRESS);
         }
@@ -297,6 +303,7 @@ void sensorHubFfUpdate(const SensorHubFfInputs& in) {
         g_yaw_est.duty[m] = in.duty[m];
     }
     g_yaw_est.motor_mask = in.motor_mask;
+    g_in_flight = in.in_flight;
     g_yaw_est.current_slot_fired = false;
 
     YawFfMagFrame& frame = g_yaw_est.frame;
@@ -411,7 +418,15 @@ void sensorHubFfOnMag3dChange() {
 }
 
 bool sensorHubFfEkfHealthy() {
-    return sensorHubFfCorrectionActive() && g_yaw_est.yaw_kf.anchorValid() &&
+    // アンカー判定は EKF 磁気更新ゲート(sensorHubFfUpdate 内の
+    // mag_sample_fresh && ff.anchor_valid)と同じ ff.anchor_valid を使う。
+    // yaw_kf.anchorValid() は reanchor() 後にクリアされる経路が無く、
+    // sensorHubFfOnMag3dChange() が ff.anchor_valid だけを落とした後に
+    // true のまま残る(→ predict-only の EKF を「健全」と誤判定し、契約
+    // §2.3 のレートダンピング縮退が働かない)。ff.anchor_valid=true の
+    // とき yaw_kf.anchorValid() は必ず true(凍結時に必ず reanchor する)
+    // なので、この置換で判定は狭くなる方向にのみ変わる。
+    return sensorHubFfCorrectionActive() && g_yaw_est.ff.anchor_valid &&
            (g_yaw_est.yaw_kf.gateBits() & FF_EKF_GATE_BM_FROZEN) == 0;
 }
 

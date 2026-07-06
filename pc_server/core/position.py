@@ -29,10 +29,10 @@ from math import atan2, cos, pi, sin
 from typing import Callable, Optional
 
 from .filter import PositionFilter
-from .mocap import RAD_TO_DEG
+from .mocap import DEG_TO_RAD, RAD_TO_DEG
 from .pid import XYPIDController
 from .posture import (
-    SENDER_JOIN_TIMEOUT_S, SetpointShaper, run_paced_loop, wrap_pi,
+    SENDER_JOIN_TIMEOUT_S, TWO_PI, SetpointShaper, run_paced_loop, wrap_pi,
 )
 
 # 異常解除に要する信頼度(legacy hovering_controller と同値)
@@ -59,6 +59,9 @@ class PositionController:
         self._period_s = 1.0 / server_config["rates"]["setpoint_hz"]
         self._dropout_level_s: float = server_config["failsafe"]["mocap_dropout_level_s"]
         self._mocap_fresh_s: float = server_config["freshness"]["mocap_fresh_s"]
+        # 接線ヨー追従の実現可能性判定に使う(start_circle のガード)
+        self._yaw_slew_rad_per_s: float = (
+            server_config["clamps"]["yaw_slew_rate_deg_per_s"] * DEG_TO_RAD)
         self._shaper = SetpointShaper(server_config["clamps"])
         self._emit = emit
         self._clock = clock
@@ -104,7 +107,8 @@ class PositionController:
 
         # v2: 円軌道状態(None = hover)。dict キー:
         # center(x,y) / radius / period_s / clockwise / alt / face_tangent /
-        # phase0(合流点の位相 rad) / t0(開始時刻)
+        # phase0(合流点の位相 rad) / t0(開始時刻) /
+        # frozen_at(MoCap 途絶による位相凍結の開始時刻。None = 凍結なし)
         self._traj: Optional[dict] = None
         self._traj_phase: Optional[float] = None
 
@@ -172,15 +176,33 @@ class PositionController:
                 or abs(center_y) > self._traj_center_abs_max):
             return False, (f"中心座標は ±{self._traj_center_abs_max} m 以内で"
                            "指定してください")
+        if face_tangent:
+            # 接線ヨー目標は 360°/period_s で回転する。整形スルーレート
+            # (yaw_slew_rate_deg_per_s)を超える周期を許すと、整形済み
+            # yaw_ref の遅れが 180° を超えた瞬間に wrap で符号反転し、
+            # 鋸歯状の逆回転・発振が起きるため開始を拒否する。
+            min_period_s = TWO_PI / self._yaw_slew_rad_per_s
+            if period_s < min_period_s:
+                return False, (
+                    "「進行方向を向く」有効時は、接線ヨーの角速度(360°/周期)が"
+                    "ヨースルーレート上限を超えないよう周期を "
+                    f"{min_period_s:.1f} s 以上にしてください")
 
         # 現在位置(フィルタ済み優先)→ 円周最近傍点の位相。位置が未取得の
         # 場合は開始を拒否する(合流点を決められないため)。
         with self._lock:
             filter_result = self._last_filter_result
             pose = self._last_pose
+            pose_t = self._last_pose_t
             alt_lo, alt_hi = self._shaper.alt_limits
         if not (alt_lo <= alt_m <= alt_hi):
             return False, f"高度は {alt_lo}–{alt_hi} m で指定してください"
+        # 鮮度ガード(session.start と同じ基準値): 途絶中の古い位置から
+        # 合流位相を決めると「現在位置から滑らかに合流」(契約 §3.3)が
+        # 成立せず、復帰時に目標が実位置から離れた点へジャンプするため拒否。
+        age = None if pose_t is None else (now - pose_t)
+        if age is None or age > self._dropout_level_s:
+            return False, "MoCap データが新鮮でないため円軌道を開始できません"
         if filter_result is not None:
             px, py, _ = filter_result["filtered_position"]
         elif pose is not None:
@@ -201,6 +223,8 @@ class PositionController:
                 "face_tangent": bool(face_tangent),
                 "phase0": phase0,
                 "t0": now,
+                # MoCap 途絶による位相凍結の開始時刻(None = 凍結なし)
+                "frozen_at": None,
             }
             self._traj_phase = wrap_pi(phase0)
         return True, None
@@ -386,12 +410,28 @@ class PositionController:
         traj_phase: Optional[float] = None
         yaw_tangent: Optional[float] = None
         with self._lock:
+            pose_t = self._last_pose_t
+            age = None if pose_t is None else (now - pose_t)
+            dropped = age is None or age > self._dropout_level_s
             traj = self._traj
             if traj is not None:
-                omega = 2.0 * pi / traj["period_s"]
+                # MoCap 途絶中は軌道位相の時間更新を凍結する(位置フィード
+                # バックを失ったまま目標と接線ヨーだけが進み、復帰時に XY
+                # 誤差が跳ねる・途絶中に盲目的な回頭指令を出すのを防ぐ)。
+                # 復帰時は t0 を凍結時間ぶん前送りして位相を連続に保つ。
+                if dropped:
+                    if traj["frozen_at"] is None:
+                        traj["frozen_at"] = now
+                    t_eff = traj["frozen_at"]
+                else:
+                    if traj["frozen_at"] is not None:
+                        traj["t0"] += now - traj["frozen_at"]
+                        traj["frozen_at"] = None
+                    t_eff = now
+                omega = TWO_PI / traj["period_s"]
                 # 回転方向: CCW = 位相増加(制御座標系の数学正方向)、CW = 減少
                 sign = -1.0 if traj["clockwise"] else 1.0
-                phase = traj["phase0"] + sign * omega * (now - traj["t0"])
+                phase = traj["phase0"] + sign * omega * (t_eff - traj["t0"])
                 cx, cy = traj["center"]
                 radius = traj["radius"]
                 self._target = (cx + radius * cos(phase),
@@ -402,7 +442,6 @@ class PositionController:
                 if traj["face_tangent"]:
                     # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°
                     yaw_tangent = wrap_pi(phase + sign * (pi / 2.0))
-            pose_t = self._last_pose_t
             roll_cmd, pitch_cmd = self._last_cmd
             error_x, error_y = self._last_errors
             data_valid = self._last_data_valid
@@ -414,8 +453,6 @@ class PositionController:
             yaw_target = self._target_yaw
             yaw_ctrl_on = self._yaw_ctrl_on
 
-        age = None if pose_t is None else (now - pose_t)
-        dropped = age is None or age > self._dropout_level_s
         if dropped:
             # MoCap 途絶 >300ms: roll/pitch を水平へ固定(alt_ref は維持)
             roll_cmd = 0.0
@@ -427,8 +464,10 @@ class PositionController:
 
         roll, pitch, alt = self._shaper.shape(roll_cmd, pitch_cmd, target[2], now)
         # ヨー: 「進行方向を向く」ON かつヨー角制御 ON のときのみ接線追従、
-        # それ以外は UI スライダ目標。MoCap 途絶中も現在の整形値を維持して
-        # 送り続ける(機体側は途絶時に推定ヨーをラッチする契約)。
+        # それ以外は UI スライダ目標。MoCap 途絶中は軌道位相が凍結される
+        # ため接線ヨー目標も直近値で止まり、整形済みヨーを保持したまま
+        # 送り続ける(CMD_SETPOINT 自体の途絶時は機体側が推定ヨーを
+        # ラッチする契約)。
         if yaw_tangent is not None and yaw_ctrl_on:
             yaw_target = yaw_tangent
         yaw = self._shaper.shape_yaw(yaw_target, now)

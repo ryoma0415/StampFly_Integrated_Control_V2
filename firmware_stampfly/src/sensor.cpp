@@ -336,6 +336,11 @@ float sensor_read(void) {
         ff_in.pitch_rad = sensor_state.Pitch_angle;
         ff_in.dt_s = flight_control_state.timing.Interval_time;
         ff_in.tof_read_this_tick = tof_read_this_tick;
+        // 飛行中はブロッキングし得る BMM150 再初期化リトライを保留する
+        // (begin() の delay(5)/delay(10) が 400Hz ループの dt を乱すため)
+        const bool in_flight =
+            (ast == AUTO_TAKEOFF || ast == AUTO_HOVER || ast == AUTO_LANDING);
+        ff_in.in_flight = in_flight;
         if (ast == AUTO_MOTOR_TEST) {
             // MOTOR_TEST 中: テスト duty×mask を FF へ配線(V2契約 §2.3)。
             // ランプダウン中の実出力>0 も「回転中」として扱う(アンカー窓の汚染防止)。
@@ -349,7 +354,7 @@ float sensor_read(void) {
         } else {
             // 「回転中」= 飛行状態、またはPWM実出力あり(アンカー窓の汚染防止)。
             ff_in.motors_running =
-                (ast == AUTO_TAKEOFF || ast == AUTO_HOVER || ast == AUTO_LANDING) ||
+                in_flight ||
                 fout.FrontLeft_motor_duty > 0.0f || fout.FrontRight_motor_duty > 0.0f ||
                 fout.RearLeft_motor_duty > 0.0f || fout.RearRight_motor_duty > 0.0f;
             // FF差動項へのduty配線は FL,FR,RL,RR の順(ベース変数は FR,FL,RR,RL 順

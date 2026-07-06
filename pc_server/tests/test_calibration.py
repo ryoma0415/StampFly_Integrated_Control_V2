@@ -183,14 +183,57 @@ class TestQuickCal:
         assert sent.roll_rad == pytest.approx(0.02)
         assert sent.pitch_rad == pytest.approx(-0.03)
 
+        # Yaw 0: CMD_YAWZERO_SET は磁気ヘディング座標系の mag_yaw_offset を
+        # インストールする API のため、Madgwick ヨーではなく
+        # 「機体の現在オフセット + 現在の推定ヨー」の逆算値を送る
+        responder.cal_data.yawzero_offset_rad = 0.25
+        responder.cal_data.valid_flags |= proto.TlmCalData.VALID_YAWZERO
+        tlm = proto.TlmState(yaw_est_rad=0.5,
+                             ff_status=proto.TlmState.FF_STATUS_MAG_FRESH)
+        transport.push(proto.MsgType.TLM_STATE, tlm.to_payload())
+        assert wait_until(
+            lambda: session._tlm_state_snapshot()[0] is not None)
         assert session.calibration.yaw_zero()["ok"]
         sent = proto.CmdYawzeroSet.from_payload(
             transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)[0].payload)
-        assert sent.offset_rad == pytest.approx(0.5)
+        assert sent.valid == 1
+        assert sent.offset_rad == pytest.approx(0.25 + 0.5)
 
         assert session.calibration.yaw_zero_clear()["ok"]
         assert not (responder.cal_data.valid_flags
                     & proto.TlmCalData.VALID_YAWZERO)
+
+    def test_yaw_zero_guards(self, cal_session):
+        """Yaw 0 の前提: TLM_STATE 鮮度・磁気鮮度・ff_mode=0 を検証する。"""
+        session, transport, clock, responder, tmp_path = cal_session
+        # TLM_STATE 未受信 → 拒否
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "TLM_STATE" in result["message"]
+        # 磁気サンプルが新鮮でない(ff_status bit6 なし)→ 拒否
+        transport.push(proto.MsgType.TLM_STATE,
+                       proto.TlmState(yaw_est_rad=0.1).to_payload())
+        assert wait_until(
+            lambda: session._tlm_state_snapshot()[0] is not None)
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "磁気" in result["message"]
+        # ff_mode≠0(アクティブ推定器が補正系)→ 拒否
+        transport.push(proto.MsgType.TLM_STATE, proto.TlmState(
+            yaw_est_rad=0.1,
+            ff_status=proto.TlmState.FF_STATUS_MAG_FRESH | 0x01).to_payload())
+        responder.cal_data.ff_mode = 1
+        assert wait_until(lambda: (session._tlm_state_snapshot()[0] or
+                                   proto.TlmState()).ff_status != 0)
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "FF" in result["message"]
+        # TLM_STATE が古い(> telemetry_fresh_s)→ 拒否
+        responder.cal_data.ff_mode = 0
+        clock.advance(1.0)
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "新鮮" in result["message"]
 
 
 class TestGeomag:

@@ -11,4 +11,5 @@
 | [ARCHITECTURE.md](ARCHITECTURE.md) | モジュール構成・API 契約・コーディング規約の正典 v2(実験モードの状態遷移、安全クランプ多層表、NVS 永続化一覧、I2C スケジューリングを含む) |
 | [LOG_STRUCTURE.md](LOG_STRUCTURE.md) | CSV フライトログの列定義 v2・94列(`pc_server/core/logger.py` の `COLUMNS` と1対1) |
 | [FF_PIPELINE.md](FF_PIPELINE.md) | 電流FF較正パイプラインの契約(スイープ → `data_analysis` 抽出 → FFプロファイル JSON → CMD_FF_* 分割転送 → EKF 実行。数式・受入基準は yaw側設計書の原文維持) |
+| [OPTICAL_FLOW_STUDY.md](OPTICAL_FLOW_STUDY.md) | オプティカルフロー(PMW3901)活用の調査・検討書(将来検討。実装仕様ではない) |
 | [../flight_log_viewer/README.md](../flight_log_viewer/README.md) | 飛行ログビューア(静止画グラフ・ヨー4系統比較・EKF 診断・同期アニメーション)の使い方 |

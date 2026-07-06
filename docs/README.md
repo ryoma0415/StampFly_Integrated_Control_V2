@@ -12,4 +12,5 @@
 | [LOG_STRUCTURE.md](LOG_STRUCTURE.md) | CSV フライトログの列定義 v2・94列(`pc_server/core/logger.py` の `COLUMNS` と1対1) |
 | [FF_PIPELINE.md](FF_PIPELINE.md) | 電流FF較正パイプラインの契約(スイープ → `data_analysis` 抽出 → FFプロファイル JSON → CMD_FF_* 分割転送 → EKF 実行。数式・受入基準は yaw側設計書の原文維持) |
 | [OPTICAL_FLOW_STUDY.md](OPTICAL_FLOW_STUDY.md) | オプティカルフロー(PMW3901)活用の調査・検討書(将来検討。実装仕様ではない) |
+| [RESEARCH_THEMES_2026.md](RESEARCH_THEMES_2026.md) | 研究テーマ検討書(2023-2026 動向調査+本プラットフォームでの実機検証適性。参考文献50本) |
 | [../flight_log_viewer/README.md](../flight_log_viewer/README.md) | 飛行ログビューア(静止画グラフ・ヨー4系統比較・EKF 診断・同期アニメーション)の使い方 |

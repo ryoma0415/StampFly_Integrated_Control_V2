@@ -9,17 +9,23 @@
 
 #include <Arduino.h>
 
+#include <cstring>
+
 #include "comm.hpp"
 #include "indicators.hpp"
 #include "pid.hpp"
 #include "sensor.hpp"
 #include "telemetry.hpp"
+#include "yaw_estimation/angle_utils.hpp"
+#include "yaw_estimation/persistence.hpp"
+#include "yaw_estimation/sensor_hub_ff.hpp"
 
 FlightControlState flight_control_state;
 
 namespace {
 
 using stampfly::Reason;
+using stampfly::TlmAck;
 
 // --- PID制御器・フィルタ(OptiTrack版と同構成) ---
 PID p_pid;      // ロール角速度
@@ -27,6 +33,7 @@ PID q_pid;      // ピッチ角速度
 PID r_pid;      // ヨー角速度
 PID phi_pid;    // ロール角
 PID theta_pid;  // ピッチ角
+PID psi_pid;    // ヨー角(v2: 角度誤差 wrapPi → ヨーレート目標)
 PID alt_pid;    // 高度 → 上下速度目標
 PID z_dot_pid;  // 上下速度 → スラスト補正
 Filter thrust_filtered;
@@ -41,6 +48,19 @@ uint16_t auto_takeoff_counter = 0; // 離陸スラストランプの進捗
 uint8_t landing_state = 0;         // 着陸シーケンス初期化済みフラグ
 uint8_t prev_range0_flag = 0;      // 高度センサ喪失の前回値
 bool wait_ready = false;           // WAITでの静定+AHRSリセット完了
+
+// --- v2: ヨー角制御の途絶ラッチ(契約 §1.1: 途絶>200msで現在推定ヨーを保持) ---
+bool yaw_latch_active = false;     // ラッチ保持中か
+float yaw_latched_ref = 0.0f;      // ラッチしたヨー角目標 [rad]
+
+// --- v2: モーターテストサービス内部状態(yaw側 motor.cpp のソフトスタート/
+//     フェイルセーフを移植。PWM の書き手は MOTOR_TEST 状態の本サービスのみ) ---
+float mt_target_duty = 0.0f;    // 指令 duty(ソフトスタートランプの目標)
+float mt_applied_duty = 0.0f;   // ランプ後の実効 duty(PWM に出ている値)
+uint8_t mt_mask = 0;            // 駆動対象(bit0=FL,1=FR,2=RL,3=RR)
+bool mt_running = false;        // 指令上の駆動中(フェイルセーフ監視対象)
+uint32_t mt_last_cmd_ms = 0;    // 直近 CMD_MOTOR_RUN/STOP 受理時刻
+uint32_t mt_last_ramp_ms = 0;   // ランプ dt の基準時刻
 
 // 400Hzタイマ割り込み: フラグを立てるだけ(ISR内で他の処理はしない)
 hw_timer_t* loop_timer = nullptr;
@@ -73,6 +93,86 @@ void motor_stop(void) {
     set_duty_fl(0.0f);
     set_duty_rr(0.0f);
     set_duty_rl(0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// モーターテストサービス(v2 契約 §2.4)
+//
+// yaw側 motor.cpp のソフトスタート(2.0duty/s)・キープアライブ途絶停止(1.5s)を
+// 移植。PWM 出力は既存の set_duty_*(LEDC)経路を使い、書き手は MOTOR_TEST
+// 状態の本サービスのみ(飛行ミキサとは状態機械で排他)。ソフトスタートは
+// 1S バッテリの突入電流ブラウンアウト対策なので削除しないこと。
+// ---------------------------------------------------------------------------
+
+// 実効 duty×マスクを PWM へ出力し、TLM_STATE の duty 表示にもミラーする
+void motor_test_write_outputs(void) {
+    auto& out = flight_control_state.output;
+    const float d = mt_applied_duty;
+    const float fl = (mt_mask & stampfly::CmdMotorRun::MASK_FL) ? d : 0.0f;
+    const float fr = (mt_mask & stampfly::CmdMotorRun::MASK_FR) ? d : 0.0f;
+    const float rl = (mt_mask & stampfly::CmdMotorRun::MASK_RL) ? d : 0.0f;
+    const float rr = (mt_mask & stampfly::CmdMotorRun::MASK_RR) ? d : 0.0f;
+    set_duty_fl(fl);
+    set_duty_fr(fr);
+    set_duty_rl(rl);
+    set_duty_rr(rr);
+    out.FrontLeft_motor_duty = fl;
+    out.FrontRight_motor_duty = fr;
+    out.RearLeft_motor_duty = rl;
+    out.RearRight_motor_duty = rr;
+}
+
+// ソフトスタートランプを1step進める(millis 差分ベースでループ周波数非依存)
+void motor_test_ramp(void) {
+    const uint32_t now_ms = millis();
+    const float dt = (now_ms - mt_last_ramp_ms) * 1.0e-3f;
+    mt_last_ramp_ms = now_ms;
+    if (mt_applied_duty != mt_target_duty) {
+        const float step = FLIGHT_CONFIG.motor_test_slew_duty_per_s * dt;
+        if (mt_applied_duty < mt_target_duty) {
+            mt_applied_duty += step;
+            if (mt_applied_duty > mt_target_duty) mt_applied_duty = mt_target_duty;
+        } else {
+            mt_applied_duty -= step;
+            if (mt_applied_duty < mt_target_duty) mt_applied_duty = mt_target_duty;
+        }
+    }
+    motor_test_write_outputs();
+}
+
+// 即時無条件停止(yaw側 motorTestStop 踏襲: 停止は負荷が抜ける方向なので
+// ランプダウン不要)。MOTOR_TEST 進入時の初期化にも使う。
+void motor_test_stop_now(void) {
+    mt_target_duty = 0.0f;
+    mt_applied_duty = 0.0f;
+    mt_mask = 0;
+    mt_running = false;
+    mt_last_cmd_ms = millis();
+    mt_last_ramp_ms = mt_last_cmd_ms;
+    motor_test_write_outputs();  // 全ch 0 を強制
+}
+
+// CMD_MOTOR_RUN の適用(duty はクランプ、キープアライブタイマ更新)
+void motor_test_set(float duty, uint8_t mask) {
+    if (!isfinite(duty) || duty < 0.0f) duty = 0.0f;
+    if (duty > FLIGHT_CONFIG.motor_test_max_duty) duty = FLIGHT_CONFIG.motor_test_max_duty;
+    mask &= (stampfly::CmdMotorRun::MASK_FL | stampfly::CmdMotorRun::MASK_FR |
+             stampfly::CmdMotorRun::MASK_RL | stampfly::CmdMotorRun::MASK_RR);
+    mt_target_duty = duty;
+    mt_mask = mask;
+    mt_running = (duty > 0.0f) && (mask != 0);
+    mt_last_cmd_ms = millis();
+    motor_test_ramp();
+}
+
+// 毎tickサービス: キープアライブ途絶の自動停止+ランプ前進
+void motor_test_service(void) {
+    if (mt_running &&
+        (millis() - mt_last_cmd_ms) > FLIGHT_CONFIG.motor_test_failsafe_ms) {
+        motor_test_stop_now();
+        return;
+    }
+    motor_test_ramp();
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +246,7 @@ void control_init(void) {
     // 角度制御
     phi_pid.set_parameter(cfg.roll_angle.kp, cfg.roll_angle.ti, cfg.roll_angle.td, cfg.roll_angle.eta, h);
     theta_pid.set_parameter(cfg.pitch_angle.kp, cfg.pitch_angle.ti, cfg.pitch_angle.td, cfg.pitch_angle.eta, h);
+    psi_pid.set_parameter(cfg.yaw_angle.kp, cfg.yaw_angle.ti, cfg.yaw_angle.td, cfg.yaw_angle.eta, h);
 
     // 高度制御
     alt_pid.set_parameter(cfg.altitude.kp, cfg.altitude.ti, cfg.altitude.td, cfg.altitude.eta,
@@ -168,6 +269,16 @@ void reset_duty_filters(void) {
     duty_filter_rl.reset();
 }
 
+// ヨー角制御のリセット(psi_pid・途絶ラッチ・適用中目標)。
+// 既存の角度制御リセット群と同じ箇所(reset_rate/angle_control)から呼ぶ。
+void reset_yaw_angle_control(void) {
+    auto& out = flight_control_state.output;
+    psi_pid.reset();
+    yaw_latch_active = false;
+    out.Yaw_angle_command = 0.0f;
+    out.Yaw_ctrl_active = 0;
+}
+
 // ---------------------------------------------------------------------------
 // コマンド適用
 // ---------------------------------------------------------------------------
@@ -186,6 +297,9 @@ void apply_setpoint(const CommandSnapshot& cmd) {
     cs.applied_setpoint_seq = cmd.setpoint_seq;
     cs.target_roll_rad = cmd.setpoint.roll_ref;
     cs.target_pitch_rad = cmd.setpoint.pitch_ref;
+    // v2: ヨー角目標(flags bit1 有効時のみ制御に使う。無効時は V1 同一動作)
+    cs.target_yaw_rad = cmd.setpoint.yaw_ref;
+    cs.target_yaw_valid = (cmd.setpoint.flags & stampfly::CmdSetpoint::FLAG_YAW_REF_VALID) != 0;
 
     if ((cmd.setpoint.flags & stampfly::CmdSetpoint::FLAG_ALT_REF_VALID) != 0 &&
         (st == AUTO_WAIT || st == AUTO_TAKEOFF || st == AUTO_HOVER)) {
@@ -231,7 +345,9 @@ void update_thrust_and_attitude_command(void) {
     // 姿勢指令: setpointが新鮮なら適用、200ms超は水平保持(PROTOCOL.md フェイルセーフ)。
     // 機体差バイアスはPC側プロファイルで加算済み(ファームには置かない)。
     const uint32_t now_ms = millis();
-    if (cs.setpoint_received && (now_ms - cs.last_setpoint_ms) < cfg.link_level_hold_ms) {
+    const bool link_fresh =
+        cs.setpoint_received && (now_ms - cs.last_setpoint_ms) < cfg.link_level_hold_ms;
+    if (link_fresh) {
         out.Roll_angle_command = cs.target_roll_rad;
         out.Pitch_angle_command = cs.target_pitch_rad;
     } else {
@@ -239,8 +355,57 @@ void update_thrust_and_attitude_command(void) {
         out.Pitch_angle_command = 0.0f;
     }
 
-    // ヨーは常に0(無制御)
-    out.Yaw_rate_reference = 0.0f;
+    // --- ヨー角制御(v2 契約 §2.3。flags bit1 無効時は V1 と同一のレートダンピング) ---
+    // yaw_used: est_mode==1 かつ EKF 健全なら EKF ψ、est_mode==0 なら Madgwick。
+    // est_mode==1 で EKF が不健全(磁気更新凍結/アンカー無効/FF無効)な間は、
+    // 飛行中のヨーソース切替による指令段差を作らないため角度制御を止めて
+    // レートダンピングに縮退する(PC へは ffg / ff_status bit5 で通知される)。
+    bool yaw_source_ok = true;
+    float yaw_used = sensor_state.Yaw_angle;
+    if (sensor_state.Est_mode == 1) {
+        if (sensorHubFfEkfHealthy()) {
+            yaw_used = sensor_state.Yaw_ekf_rad;
+        } else {
+            yaw_source_ok = false;
+        }
+    }
+
+    bool yaw_cmd_valid = false;
+    float yaw_cmd = 0.0f;
+    if (link_fresh && cs.target_yaw_valid) {
+        yaw_cmd = wrapPi(cs.target_yaw_rad);
+        yaw_latch_active = false;
+        yaw_cmd_valid = true;
+    } else if (!link_fresh && cs.setpoint_received && cs.target_yaw_valid) {
+        // 途絶(>200ms): 途絶検出時点の推定ヨーをラッチして保持(契約 §1.1)。
+        // 0 指令へ落とすと「離陸方位への回頭」を意味するため角度保持が安全。
+        // >500ms は既存フェイルセーフで LANDING(auto_landing_step はヨー0)。
+        if (!yaw_latch_active) {
+            yaw_latch_active = true;
+            yaw_latched_ref = yaw_used;
+        }
+        yaw_cmd = yaw_latched_ref;
+        yaw_cmd_valid = true;
+    } else {
+        yaw_latch_active = false;
+    }
+
+    if (yaw_cmd_valid && yaw_source_ok) {
+        // 角度誤差は必ず ±π ラップしてから PID へ(最短経路で回頭する)
+        const float dt = flight_control_state.timing.Interval_time;
+        float yaw_rate_ref = psi_pid.update(wrapPi(yaw_cmd - yaw_used), dt);
+        if (yaw_rate_ref > cfg.yaw_rate_limit_rad_s) yaw_rate_ref = cfg.yaw_rate_limit_rad_s;
+        if (yaw_rate_ref < -cfg.yaw_rate_limit_rad_s) yaw_rate_ref = -cfg.yaw_rate_limit_rad_s;
+        out.Yaw_rate_reference = yaw_rate_ref;
+        out.Yaw_angle_command = yaw_cmd;
+        out.Yaw_ctrl_active = 1;
+    } else {
+        // V1 同一動作: レートダンピングのみ(角度制御 off)
+        out.Yaw_rate_reference = 0.0f;
+        out.Yaw_angle_command = 0.0f;
+        out.Yaw_ctrl_active = 0;
+        psi_pid.reset();  // 不使用中に積分を持ち越さない(再開時の段差防止)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +430,7 @@ void reset_rate_control(void) {
     out.Yaw_rate_reference = 0.0f;
     phi_pid.reset();
     theta_pid.reset();
+    reset_yaw_angle_control();
     phi_pid.set_error(out.Roll_angle_reference);
     theta_pid.set_error(out.Pitch_angle_reference);
     out.Roll_angle_offset = 0.0f;
@@ -277,6 +443,7 @@ void reset_angle_control(void) {
     out.Pitch_rate_reference = 0.0f;
     phi_pid.reset();
     theta_pid.reset();
+    reset_yaw_angle_control();
     phi_pid.set_error(out.Roll_angle_reference);
     theta_pid.set_error(out.Pitch_angle_reference);
     out.Roll_angle_offset = 0.0f;
@@ -422,10 +589,12 @@ uint8_t auto_landing_step(void) {
     }
     prev_alt = sensor_state.Altitude2;
 
-    // 姿勢は水平保持
+    // 姿勢は水平保持。ヨーは着陸中つねにレートダンピング(=0)を維持し、
+    // 角度制御の適用中フラグ/ラッチも落とす(契約 §2.3: auto_landing_step は 0 のまま)
     out.Roll_angle_command = 0.0f;
     out.Pitch_angle_command = 0.0f;
     out.Yaw_rate_reference = 0.0f;
+    reset_yaw_angle_control();
     return landed;
 }
 
@@ -498,12 +667,30 @@ void handle_wait(const CommandSnapshot& cmd) {
         out.Roll_rate_reference = 0.0f;
         out.Pitch_rate_reference = 0.0f;
         out.Yaw_rate_reference = 0.0f;
+        reset_yaw_angle_control();
         landing_state = 0;
         auto_takeoff_counter = 0;
         prev_range0_flag = 0;
         thrust_filtered.reset();
         reset_duty_filters();
     }
+}
+
+// MOTOR_TEST 状態(v2 契約 §2.4): 飛行制御 PID・ミキサは動かさず、PWM の
+// 書き手はモーターテストサービスのみ。CMD_STOP を最優先で脱出する。
+void handle_motor_test(const CommandSnapshot& cmd) {
+    // STOP(最優先): 即時モーター停止 → WAIT へ
+    if (cmd.stop_pending) {
+        motor_test_stop_now();
+        enter_wait(Reason::STOP_CMD);
+        return;
+    }
+    // MOTOR_TEST 中の CMD_START は拒否(reason=10)
+    if (!cmd.stop_pending && cmd.start_pending) {
+        reject_start(Reason::START_REJECTED_NOT_READY);
+    }
+    // キープアライブ途絶(1.5s)の自動停止+ソフトスタートランプ
+    motor_test_service();
 }
 
 void handle_flight(const CommandSnapshot& cmd) {
@@ -568,6 +755,7 @@ void handle_complete(const CommandSnapshot& cmd) {
     out.Roll_rate_reference = 0.0f;
     out.Pitch_rate_reference = 0.0f;
     out.Yaw_rate_reference = 0.0f;
+    reset_yaw_angle_control();
     landing_state = 0;
     auto_takeoff_counter = 0;
     thrust_filtered.reset();
@@ -577,6 +765,323 @@ void handle_complete(const CommandSnapshot& cmd) {
     // CMD_RESET: COMPLETE かつ altitude_est < 0.15m でのみ受理(STOP/STARTは無視)
     if (cmd.reset_pending && sensor_state.Altitude2 < cfg.reset_accept_alt_m) {
         enter_wait(Reason::RESET_CMD);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v2 コマンド処理(0x14-0x23。契約 §1.2 / §2.4 / §2.5)
+//
+// 全コマンドに TLM_ACK で応答する。キャリブ/FF系(0x17-0x23)は
+// WAIT / COMPLETE / MOTOR_TEST でのみ受理(飛行中の NVS 書込み禁止)。
+// 処理内容は yaw側 command.cpp の各ハンドラをバイナリプロトコルへ写像したもの。
+// ---------------------------------------------------------------------------
+
+// キャリブ/FF系コマンドを受理できる状態か(非飛行=NVS書込み可)
+bool in_cal_command_state(void) {
+    const AutoFlightState st = flight_control_state.mode.auto_state;
+    return st == AUTO_WAIT || st == AUTO_COMPLETE || st == AUTO_MOTOR_TEST;
+}
+
+// yaw側 resetYawEstimatorKeepingZero の移植: キャリブ変更後にリファレンスCFを
+// 現在ヨーで再シードする。reset() は捕捉済み磁気オフセットを消して次の有効
+// 磁気サンプルで再捕捉するため、ヨーゼロ有効時は遅延NVS保存を予約する
+// (捕捉後に service_pending_yaw_zero_save が永続化する)。
+void reset_yaw_estimator_keeping_zero(void) {
+    g_yaw_est.yaw_estimator.reset(g_yaw_est.yaw_estimator.yaw());
+    if (g_yaw_est.yaw_estimator.yawZeroValid()) {
+        g_yaw_est.yaw_zero_save_pending = true;
+    }
+}
+
+// yaw側 clearAttitudeMountZero の移植
+void clear_attitude_mount_zero(void) {
+    g_yaw_est.roll_mount_offset_rad = 0.0f;
+    g_yaw_est.pitch_mount_offset_rad = 0.0f;
+    g_yaw_est.attitude_mount_valid = false;
+    saveAttitudeMountZero(false, 0.0f, 0.0f);
+}
+
+// yaw_zero の遅延NVS保存(yaw側 commandService の移植): 磁気オフセットが
+// 実際に捕捉されてから、非飛行状態でのみ1回だけ書き込む。
+void service_pending_yaw_zero_save(void) {
+    if (!g_yaw_est.yaw_zero_save_pending) return;
+    if (!in_cal_command_state()) return;
+    if (!g_yaw_est.yaw_estimator.yawZeroOffsetValid()) return;
+    saveYawZero(true, g_yaw_est.yaw_estimator.magYawOffsetRad());
+    g_yaw_est.yaw_zero_save_pending = false;
+}
+
+// CMD_MODE: WAIT --mode=1--> MOTOR_TEST / MOTOR_TEST --mode=0--> WAIT。
+// 他状態では bad_state(契約 §1.2)。
+uint8_t handle_cmd_mode(const stampfly::CmdMode& m) {
+    if (m.mode > stampfly::CmdMode::MODE_MOTOR_TEST) return TlmAck::STATUS_INVALID_ARG;
+    const AutoFlightState st = flight_control_state.mode.auto_state;
+    if (m.mode == stampfly::CmdMode::MODE_MOTOR_TEST) {
+        if (st == AUTO_MOTOR_TEST) return TlmAck::STATUS_OK;  // 冪等(ACKロスト再送)
+        if (st != AUTO_WAIT) return TlmAck::STATUS_BAD_STATE;
+        motor_test_stop_now();  // duty/mask/キープアライブタイマを初期化
+        transition_to(AUTO_MOTOR_TEST, Reason::MODE_CHANGE);
+        return TlmAck::STATUS_OK;
+    }
+    // mode == MODE_FLIGHT
+    if (st == AUTO_WAIT) return TlmAck::STATUS_OK;  // 冪等(ACKロスト再送)
+    if (st != AUTO_MOTOR_TEST) return TlmAck::STATUS_BAD_STATE;
+    motor_test_stop_now();  // モーター停止後に WAIT へ(契約 §2.4)
+    enter_wait(Reason::MODE_CHANGE);
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_MAG3D_SET: 適用/クリア+NVS 永続化+FF自動無効+アンカー破棄+再シード
+uint8_t handle_cmd_mag3d_set(const stampfly::CmdMag3dSet& m) {
+    if (m.valid != 0) {
+        const MagVector offset{m.offset[0], m.offset[1], m.offset[2]};
+        if (!g_yaw_est.mag3d_calibration.set(offset, m.matrix)) {
+            return TlmAck::STATUS_INVALID_ARG;
+        }
+    } else {
+        g_yaw_est.mag3d_calibration.reset();
+    }
+    g_yaw_est.mag_filter.reset();
+    saveMag3DCalibration(g_yaw_est.mag3d_calibration);
+    reset_yaw_estimator_keeping_zero();
+    // b_cal 空間が変わる: アンカー破棄+補正系再シード+ff_mode=0 強制(NVS込み)
+    sensorHubFfOnMag3dChange();
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_ACCEL6_SET: 係数の NVS 復元系(yaw側 accel6_set/accel6_clear 相当)。
+// V2 では飛行AHRS(Madgwick)へは未適用(飛行挙動不変の分離設計)だが、
+// yaw側仕様どおり姿勢参照(マウントゼロ・AHRS・リファレンスCF)をリセットする。
+uint8_t handle_cmd_accel6_set(const stampfly::CmdAccel6Set& m) {
+    if (m.valid != 0) {
+        const AccelVector offset{m.offset[0], m.offset[1], m.offset[2]};
+        const AccelVector scale{m.scale[0], m.scale[1], m.scale[2]};
+        if (!g_yaw_est.accel_calibration.setCalibration(offset, scale)) {
+            return TlmAck::STATUS_INVALID_ARG;
+        }
+    } else {
+        g_yaw_est.accel_calibration.reset();
+    }
+    saveAccelCalibration(g_yaw_est.accel_calibration);
+    // yaw側 resetAttitudeReferencesAfterAccelChange の移植
+    clear_attitude_mount_zero();
+    ahrs_reset();  // 非飛行状態でのみ受理されるため安全(Yaw_gyro_integral も0へ)
+    reset_yaw_estimator_keeping_zero();
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_ATTMOUNT_SET: マウントオフセット設定/クリア(磁気レベル化入力にのみ適用)
+uint8_t handle_cmd_attmount_set(const stampfly::CmdAttmountSet& m) {
+    if (m.valid != 0) {
+        // rad かつ ±π 内のみ受理(yaw側 applyAttitudeMountSetCommand と同じ検査)
+        if (!isfinite(m.roll_rad) || !isfinite(m.pitch_rad) ||
+            fabsf(m.roll_rad) > PI || fabsf(m.pitch_rad) > PI) {
+            return TlmAck::STATUS_INVALID_ARG;
+        }
+        g_yaw_est.roll_mount_offset_rad = m.roll_rad;
+        g_yaw_est.pitch_mount_offset_rad = m.pitch_rad;
+        g_yaw_est.attitude_mount_valid = true;
+        saveAttitudeMountZero(true, m.roll_rad, m.pitch_rad);
+    } else {
+        clear_attitude_mount_zero();
+    }
+    reset_yaw_estimator_keeping_zero();
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_YAWZERO_SET: 保存済みヨーゼロ(磁気オフセット)の復元/クリア
+uint8_t handle_cmd_yawzero_set(const stampfly::CmdYawzeroSet& m) {
+    if (m.valid != 0) {
+        if (!isfinite(m.offset_rad) || fabsf(m.offset_rad) > PI) {
+            return TlmAck::STATUS_INVALID_ARG;
+        }
+        g_yaw_est.yaw_estimator.restoreYawZero(m.offset_rad);
+        // 推定器が実際に保持したラップ済み値を永続化(NVSとRAMの乖離防止)
+        saveYawZero(true, g_yaw_est.yaw_estimator.magYawOffsetRad());
+        g_yaw_est.yaw_zero_save_pending = false;
+    } else {
+        g_yaw_est.yaw_estimator.clearYawZero();
+        g_yaw_est.yaw_zero_save_pending = false;
+        saveYawZero(false, 0.0f);
+    }
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_GEOMAG_SET: 地磁気リファレンス設定(deg→rad 換算、許容値は既定値)
+uint8_t handle_cmd_geomag_set(const stampfly::CmdGeomagSet& m) {
+    GeomagneticReference reference;  // 許容値・z符号は yaw_config.hpp の既定値
+    reference.valid = true;
+    reference.declination_east_rad = m.declination_east_deg * DEG_TO_RAD;
+    reference.inclination_rad = m.inclination_deg * DEG_TO_RAD;
+    reference.horizontal_uT = m.horizontal_ut;
+    reference.vertical_uT = m.vertical_ut;
+    reference.total_uT = m.total_ut;
+    if (!g_yaw_est.yaw_estimator.setGeomagneticReference(reference)) {
+        return TlmAck::STATUS_INVALID_ARG;
+    }
+    saveGeomagneticReference(g_yaw_est.yaw_estimator.geomagneticReference());
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_FF_COMMIT: CRC 照合→NVS 永続化→補正系再シード。冪等(yaw側 C5)。
+// commit の失敗理由(静的文字列)を TLM_ACK status へ分類する。
+uint8_t handle_cmd_ff_commit(const stampfly::CmdFfCommit& m) {
+    const char* message = "";
+    if (!g_yaw_est.ff_calibration.commit(m.crc32, message)) {
+        if (std::strcmp(message, "crc mismatch") == 0) return TlmAck::STATUS_CRC_MISMATCH;
+        if (std::strstr(message, "missing") != nullptr ||
+            std::strstr(message, "no staging") != nullptr) {
+            return TlmAck::STATUS_INCOMPLETE;
+        }
+        return TlmAck::STATUS_INVALID_ARG;  // LUT非昇順・非有限値など
+    }
+    saveFfCalibration(g_yaw_est.ff_calibration, g_yaw_est.ff.ff_mode, g_yaw_est.ff.est_mode);
+    sensorHubFfReseed();  // 新係数で補正パスが変わるため再シード
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_FF_MODE: ff_mode / est_mode の実行時切替+NVS 永続化+再シード
+uint8_t handle_cmd_ff_mode(const stampfly::CmdFfMode& m) {
+    if (m.ff_mode > stampfly::CmdFfMode::FF_MODE_B ||
+        m.est_mode > stampfly::CmdFfMode::EST_MODE_EKF) {
+        return TlmAck::STATUS_INVALID_ARG;
+    }
+    g_yaw_est.ff.ff_mode = m.ff_mode;
+    g_yaw_est.ff.est_mode = m.est_mode;
+    saveFfModes(m.ff_mode, m.est_mode);
+    sensorHubFfReseed();
+    return TlmAck::STATUS_OK;
+}
+
+// 1件の v2 コマンドを処理して TLM_ACK の status を返す。
+// send_cal_data_after: ACK 送信後に TLM_CAL_DATA を送るべきか(CMD_CAL_GET)。
+uint8_t process_one_v2_command(const V2Command& c, bool& send_cal_data_after) {
+    using stampfly::MsgType;
+    const MsgType type = static_cast<MsgType>(c.type);
+
+    // キャリブ/FF系(0x17-0x23)は WAIT/COMPLETE/MOTOR_TEST のみ受理(契約 §1.2)
+    if (c.type >= static_cast<uint8_t>(MsgType::CMD_CAL_GET) &&
+        c.type <= static_cast<uint8_t>(MsgType::CMD_FF_ANCHOR) &&
+        !in_cal_command_state()) {
+        return TlmAck::STATUS_BAD_STATE;
+    }
+
+    switch (type) {
+        case MsgType::CMD_MODE: {
+            stampfly::CmdMode m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_mode(m);
+        }
+        case MsgType::CMD_MOTOR_RUN: {
+            // MOTOR_TEST 状態のみ。飛行状態では PWM に触れず bad_state で拒否
+            if (flight_control_state.mode.auto_state != AUTO_MOTOR_TEST) {
+                return TlmAck::STATUS_BAD_STATE;
+            }
+            stampfly::CmdMotorRun m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (!isfinite(m.duty) || m.duty < 0.0f || m.duty > 1.0f) {
+                return TlmAck::STATUS_INVALID_ARG;
+            }
+            motor_test_set(m.duty, m.mask);
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_MOTOR_STOP: {
+            if (flight_control_state.mode.auto_state != AUTO_MOTOR_TEST) {
+                return TlmAck::STATUS_BAD_STATE;
+            }
+            motor_test_stop_now();
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_CAL_GET:
+            send_cal_data_after = true;  // ACK(ok) の後に TLM_CAL_DATA を返す
+            return TlmAck::STATUS_OK;
+        case MsgType::CMD_MAG3D_SET: {
+            stampfly::CmdMag3dSet m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_mag3d_set(m);
+        }
+        case MsgType::CMD_ACCEL6_SET: {
+            stampfly::CmdAccel6Set m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_accel6_set(m);
+        }
+        case MsgType::CMD_ATTMOUNT_SET: {
+            stampfly::CmdAttmountSet m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_attmount_set(m);
+        }
+        case MsgType::CMD_YAWZERO_SET: {
+            stampfly::CmdYawzeroSet m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_yawzero_set(m);
+        }
+        case MsgType::CMD_GEOMAG_SET: {
+            stampfly::CmdGeomagSet m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_geomag_set(m);
+        }
+        case MsgType::CMD_FF_BEGIN: {
+            stampfly::CmdFfBegin m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (m.nlut < stampfly::CmdFfBegin::NLUT_MIN ||
+                m.nlut > stampfly::CmdFfBegin::NLUT_MAX ||
+                !g_yaw_est.ff_calibration.stageBegin(m.nlut)) {
+                return TlmAck::STATUS_INVALID_ARG;
+            }
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_FF_LUT: {
+            stampfly::CmdFfLut m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (!g_yaw_est.ff_calibration.stageLutPoint(m.idx, m.i_a, m.db_x, m.db_y, m.db_z)) {
+                return TlmAck::STATUS_INVALID_ARG;  // begin 未実行 / idx 範囲外 / 非有限値
+            }
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_FF_MOT: {
+            stampfly::CmdFfMot m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (!g_yaw_est.ff_calibration.stageMotor(
+                    m.idx, m.a_tilde[0], m.a_tilde[1], m.a_tilde[2], m.c2, m.c1, m.c0)) {
+                return TlmAck::STATUS_INVALID_ARG;
+            }
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_FF_AUX: {
+            stampfly::CmdFfAux m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (!g_yaw_est.ff_calibration.stageAux(m.iid_a)) return TlmAck::STATUS_INVALID_ARG;
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_FF_COMMIT: {
+            stampfly::CmdFfCommit m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_ff_commit(m);
+        }
+        case MsgType::CMD_FF_MODE: {
+            stampfly::CmdFfMode m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_ff_mode(m);
+        }
+        case MsgType::CMD_FF_ANCHOR:
+            // モーター回転中(実出力あり)/停止窓が未充填なら busy で拒否可(契約 §1.2)
+            return sensorHubFfAnchorNow() ? TlmAck::STATUS_OK : TlmAck::STATUS_BUSY;
+        default:
+            // comm 層のレンジ検査により到達しない(防御的に invalid_arg)
+            return TlmAck::STATUS_INVALID_ARG;
+    }
+}
+
+// 取り出した v2 コマンド群を受信順に処理し、全件へ TLM_ACK を返す
+void process_v2_commands(const CommandSnapshot& cmd) {
+    for (size_t i = 0; i < cmd.v2_count; i++) {
+        const V2Command& c = cmd.v2[i];
+        bool send_cal_data_after = false;
+        const uint8_t status = process_one_v2_command(c, send_cal_data_after);
+        telemetry_send_ack(c.type, c.seq, status);
+        if (send_cal_data_after && status == TlmAck::STATUS_OK) {
+            telemetry_send_cal_data();
+        }
     }
 }
 
@@ -633,6 +1138,13 @@ void loop_400Hz(void) {
     comm_consume_commands(&cmd);
     apply_setpoint(cmd);
 
+    // v2 コマンド(0x14-0x23)の処理+TLM_ACK 応答。CMD_MODE の遷移は
+    // この直後の状態スイッチで同tick内に反映される(STOP は各ハンドラが最優先)。
+    process_v2_commands(cmd);
+
+    // yaw_zero の遅延NVS保存(磁気オフセット捕捉後、非飛行状態のみ)
+    service_pending_yaw_zero_save();
+
     switch (flight_control_state.mode.auto_state) {
         case AUTO_INIT:
             handle_init();
@@ -653,8 +1165,26 @@ void loop_400Hz(void) {
         case AUTO_COMPLETE:
             handle_complete(cmd);
             break;
+        case AUTO_MOTOR_TEST:
+            handle_motor_test(cmd);
+            break;
     }
 
     telemetry_update();
     indicators_update();
+}
+
+// --- v2: モーターテスト実出力のアクセサ(sensor.cpp の FF duty 配線・telemetry 用) ---
+
+float motor_test_applied_duty(void) {
+    return mt_applied_duty;
+}
+
+uint8_t motor_test_active_mask(void) {
+    return mt_mask;
+}
+
+bool motor_test_output_active(void) {
+    // ランプダウン中の実出力>0 も「回転中」として扱う(アンカー窓の汚染防止)
+    return mt_applied_duty > 0.0f || mt_running;
 }

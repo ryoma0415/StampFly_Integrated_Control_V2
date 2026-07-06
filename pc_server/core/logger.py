@@ -53,6 +53,16 @@ COLUMNS: tuple[str, ...] = (
     "tlm_voltage_v",
     "tlm_duty_fr", "tlm_duty_fl", "tlm_duty_rr", "tlm_duty_rl",
     "tlm_ax_g", "tlm_ay_g", "tlm_az_g", "tlm_loop_dt_us",
+    # --- v2 追加 17 列(末尾追加のみ。順序は docs/LOG_STRUCTURE.md v2 契約) ---
+    # ヨー指令(送信した CMD_SETPOINT のヨー目標)
+    "cmd_yaw_ref_rad", "cmd_yaw_ref_deg", "yaw_ctrl_on",
+    # 機体テレメトリ(TLM_STATE v2 末尾拡張)
+    "tlm_yaw_est_rad", "tlm_yaw_gyro_int_rad", "tlm_yaw_ref_rad",
+    "tlm_current_a", "tlm_db_hat_x_ut", "tlm_db_hat_y_ut",
+    "tlm_bm_x_ut", "tlm_bm_y_ut",
+    "tlm_nis", "tlm_ffg", "tlm_ff_status",
+    # MoCap ヨー(Position モードのみ)と軌道状態
+    "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
 )
 
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数

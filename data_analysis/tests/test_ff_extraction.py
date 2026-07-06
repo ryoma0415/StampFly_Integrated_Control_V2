@@ -25,7 +25,7 @@ import numpy as np  # noqa: E402
 
 from ff_params import core  # noqa: E402
 
-RESULTS_DIR = DATA_ANALYSIS.parent / "pc_server" / "sweep_results"
+RESULTS_DIR = DATA_ANALYSIS.parent / "pc_server" / "data" / "sweep_results"
 FEAS_JSON = DATA_ANALYSIS / "graphs" / "feasibility_20260612" / "results.json"
 
 STEMS_0612 = [

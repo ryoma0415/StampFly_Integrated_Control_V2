@@ -12,8 +12,10 @@ import struct
 
 import stampfly_protocol as sp
 
-VALID_WIRE = sp.encode_wire(sp.MsgType.CMD_SETPOINT, 1,
-                            sp.CmdSetpoint(0.01, -0.02, 0.3, 1).to_payload())
+VALID_WIRE = sp.encode_wire(
+    sp.MsgType.CMD_SETPOINT, 1,
+    sp.CmdSetpoint(roll_ref=0.01, pitch_ref=-0.02, alt_ref=0.3,
+                   yaw_ref=0.5, flags=3).to_payload())
 
 
 def make_raw_frame(ver: int, msg_type: int, seq: int, len_field: int,
@@ -100,9 +102,10 @@ def test_crc_corruption_dropped():
 
 
 def test_bad_version_dropped_and_counted():
-    # ver=2 だが CRC は正しいフレーム → bad_ver に分類される
-    logical = make_raw_frame(2, int(sp.MsgType.CMD_SETPOINT), 1, 13,
-                             sp.CmdSetpoint(0.0, 0.0, 0.0, 0).to_payload())
+    # ver=1(旧 v1 機器の混在)だが CRC は正しいフレーム → bad_ver に分類される
+    logical = make_raw_frame(1, int(sp.MsgType.CMD_SETPOINT), 1,
+                             sp.CmdSetpoint.PAYLOAD_SIZE,
+                             sp.CmdSetpoint().to_payload())
     rx = sp.SerialFrameReceiver()
     assert rx.feed(to_wire(logical)) == []
     assert_counters(rx, ver_errors=1)

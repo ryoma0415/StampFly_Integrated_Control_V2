@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """2026-06-12 取得 8 スイープの横断解析: 電流ノイズ補正の実現可能性評価.
 
-入力 (pc_server/sweep_results/):
+入力 (pc_server/data/sweep_results/):
   全機 (FL+FR+RL+RR) x 4姿勢: 202215(Yaw=0), 203731(Yaw=90), 204405(Yaw=±180), 205956(Yaw=-90)
   単機 x Yaw=0: 211141(FL), 211628(FR), 212714(RL), 213135(RR)
 
@@ -38,7 +38,7 @@ for _jp in ("Hiragino Sans", "Hiragino Maru Gothic Pro", "YuGothic", "Yu Gothic"
 plt.rcParams["axes.unicode_minus"] = False
 
 HERE = Path(__file__).resolve().parent
-RESULTS_DIR = HERE.parent / "pc_server" / "sweep_results"
+RESULTS_DIR = HERE.parent / "pc_server" / "data" / "sweep_results"
 OUT_DIR = HERE / "graphs" / "feasibility_20260612"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 

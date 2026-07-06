@@ -1,0 +1,9 @@
+# flight_log_viewer 必須依存
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+
+# --- オプション ---
+# スマホ動画の同期合成・ROI 追跡を使う場合のみ必要(README.md 参照):
+#   pip install opencv-python>=4.8
+# アニメーション MP4 出力には ffmpeg 本体も必要(macOS: brew install ffmpeg)

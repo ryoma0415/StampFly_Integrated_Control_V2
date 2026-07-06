@@ -309,6 +309,17 @@ uint8_t ju8(const JVal& fields, const char* key) {
   return static_cast<uint8_t>(fields.at(key).num);
 }
 
+// "fields" の JSON 配列を float 配列へ読み出す(要素数を厳格検査)
+void jfarr(const JVal& fields, const char* key, float* dst, size_t n) {
+  const auto& arr = fields.at(key).arr;
+  if (arr.size() != n) {
+    std::fprintf(stderr, "field %s: expected %zu elements, got %zu\n",
+                 key, n, arr.size());
+    std::exit(2);
+  }
+  for (size_t i = 0; i < n; ++i) dst[i] = static_cast<float>(arr[i].num);
+}
+
 // "fields" から C++ シリアライザでペイロードを再導出する
 std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
   using namespace stampfly;
@@ -322,9 +333,147 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.roll_ref = jf(f, "roll_ref");
     m.pitch_ref = jf(f, "pitch_ref");
     m.alt_ref = jf(f, "alt_ref");
+    m.yaw_ref = jf(f, "yaw_ref");
     m.flags = ju8(f, "flags");
     ok = serialize(m, buf, sizeof(buf));
     n = CmdSetpoint::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MODE") {
+    CmdMode m;
+    m.mode = ju8(f, "mode");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdMode::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MOTOR_RUN") {
+    CmdMotorRun m;
+    m.duty = jf(f, "duty");
+    m.mask = ju8(f, "mask");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdMotorRun::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MAG3D_SET") {
+    CmdMag3dSet m;
+    m.valid = ju8(f, "valid");
+    jfarr(f, "offset", m.offset, 3);
+    jfarr(f, "matrix", m.matrix, 9);
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdMag3dSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_ACCEL6_SET") {
+    CmdAccel6Set m;
+    m.valid = ju8(f, "valid");
+    jfarr(f, "offset", m.offset, 3);
+    jfarr(f, "scale", m.scale, 3);
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdAccel6Set::PAYLOAD_SIZE;
+  } else if (kind == "CMD_ATTMOUNT_SET") {
+    CmdAttmountSet m;
+    m.valid = ju8(f, "valid");
+    m.roll_rad = jf(f, "roll_rad");
+    m.pitch_rad = jf(f, "pitch_rad");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdAttmountSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_YAWZERO_SET") {
+    CmdYawzeroSet m;
+    m.valid = ju8(f, "valid");
+    m.offset_rad = jf(f, "offset_rad");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdYawzeroSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_GEOMAG_SET") {
+    CmdGeomagSet m;
+    m.declination_east_deg = jf(f, "declination_east_deg");
+    m.inclination_deg = jf(f, "inclination_deg");
+    m.horizontal_ut = jf(f, "horizontal_ut");
+    m.vertical_ut = jf(f, "vertical_ut");
+    m.total_ut = jf(f, "total_ut");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdGeomagSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_BEGIN") {
+    CmdFfBegin m;
+    m.nlut = ju8(f, "nlut");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFfBegin::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_LUT") {
+    CmdFfLut m;
+    m.idx = ju8(f, "idx");
+    m.i_a = jf(f, "i_a");
+    m.db_x = jf(f, "db_x");
+    m.db_y = jf(f, "db_y");
+    m.db_z = jf(f, "db_z");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFfLut::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_MOT") {
+    CmdFfMot m;
+    m.idx = ju8(f, "idx");
+    jfarr(f, "a_tilde", m.a_tilde, 3);
+    m.c2 = jf(f, "c2");
+    m.c1 = jf(f, "c1");
+    m.c0 = jf(f, "c0");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFfMot::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_AUX") {
+    CmdFfAux m;
+    m.iid_a = jf(f, "iid_a");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFfAux::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_COMMIT") {
+    CmdFfCommit m;
+    m.crc32 = ju32(f, "crc32");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFfCommit::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_MODE") {
+    CmdFfMode m;
+    m.ff_mode = ju8(f, "ff_mode");
+    m.est_mode = ju8(f, "est_mode");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFfMode::PAYLOAD_SIZE;
+  } else if (kind == "TLM_ACK") {
+    TlmAck m;
+    m.acked_type = ju8(f, "acked_type");
+    m.acked_seq = ju32(f, "acked_seq");
+    m.status = ju8(f, "status");
+    ok = serialize(m, buf, sizeof(buf));
+    n = TlmAck::PAYLOAD_SIZE;
+  } else if (kind == "TLM_EXP") {
+    TlmExp m;
+    m.elapsed_ms = ju32(f, "elapsed_ms");
+    m.current_a = jf(f, "current_a");
+    m.vbat_v = jf(f, "vbat_v");
+    m.shunt_uv = jf(f, "shunt_uv");
+    m.bx_raw = jf(f, "bx_raw");
+    m.by_raw = jf(f, "by_raw");
+    m.bz_raw = jf(f, "bz_raw");
+    m.bx_cal = jf(f, "bx_cal");
+    m.by_cal = jf(f, "by_cal");
+    m.bz_cal = jf(f, "bz_cal");
+    m.imu_temp_c = jf(f, "imu_temp_c");
+    m.roll = jf(f, "roll");
+    m.pitch = jf(f, "pitch");
+    m.yaw = jf(f, "yaw");
+    m.p = jf(f, "p");
+    m.q = jf(f, "q");
+    m.r = jf(f, "r");
+    m.ax = jf(f, "ax");
+    m.ay = jf(f, "ay");
+    m.az = jf(f, "az");
+    m.duty_cmd = jf(f, "duty_cmd");
+    m.motors_mask = ju8(f, "motors_mask");
+    m.flags = ju8(f, "flags");
+    ok = serialize(m, buf, sizeof(buf));
+    n = TlmExp::PAYLOAD_SIZE;
+  } else if (kind == "TLM_CAL_DATA") {
+    TlmCalData m;
+    m.valid_flags = ju8(f, "valid_flags");
+    jfarr(f, "mag3d_offset", m.mag3d_offset, 3);
+    jfarr(f, "mag3d_matrix", m.mag3d_matrix, 9);
+    jfarr(f, "accel6_offset", m.accel6_offset, 3);
+    jfarr(f, "accel6_scale", m.accel6_scale, 3);
+    m.attmount_roll_rad = jf(f, "attmount_roll_rad");
+    m.attmount_pitch_rad = jf(f, "attmount_pitch_rad");
+    m.yawzero_offset_rad = jf(f, "yawzero_offset_rad");
+    jfarr(f, "geomag", m.geomag, 5);
+    m.ff_nlut = ju8(f, "ff_nlut");
+    m.ff_crc32 = ju32(f, "ff_crc32");
+    m.ff_mode = ju8(f, "ff_mode");
+    m.est_mode = ju8(f, "est_mode");
+    ok = serialize(m, buf, sizeof(buf));
+    n = TlmCalData::PAYLOAD_SIZE;
   } else if (kind == "TLM_STATE") {
     TlmState m;
     m.seq_echo = ju32(f, "seq_echo");
@@ -354,6 +503,17 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.ay = jf(f, "ay");
     m.az = jf(f, "az");
     m.loop_dt_us = static_cast<uint16_t>(f.at("loop_dt_us").num);
+    m.yaw_est_rad = jf(f, "yaw_est_rad");
+    m.yaw_gyro_int_rad = jf(f, "yaw_gyro_int_rad");
+    m.yaw_ref_rad = jf(f, "yaw_ref_rad");
+    m.current_a = jf(f, "current_a");
+    m.db_hat_x_ut = jf(f, "db_hat_x_ut");
+    m.db_hat_y_ut = jf(f, "db_hat_y_ut");
+    m.bm_x_ut = jf(f, "bm_x_ut");
+    m.bm_y_ut = jf(f, "bm_y_ut");
+    m.nis = jf(f, "nis");
+    m.ffg = ju8(f, "ffg");
+    m.ff_status = ju8(f, "ff_status");
     ok = serialize(m, buf, sizeof(buf));
     n = TlmState::PAYLOAD_SIZE;
   } else if (kind == "TLM_EVENT") {
@@ -424,6 +584,70 @@ std::vector<uint8_t> reserialize_payload(const std::string& kind,
     CmdSetpoint m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
     n = CmdSetpoint::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MODE") {
+    CmdMode m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdMode::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MOTOR_RUN") {
+    CmdMotorRun m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdMotorRun::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MAG3D_SET") {
+    CmdMag3dSet m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdMag3dSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_ACCEL6_SET") {
+    CmdAccel6Set m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdAccel6Set::PAYLOAD_SIZE;
+  } else if (kind == "CMD_ATTMOUNT_SET") {
+    CmdAttmountSet m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdAttmountSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_YAWZERO_SET") {
+    CmdYawzeroSet m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdYawzeroSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_GEOMAG_SET") {
+    CmdGeomagSet m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdGeomagSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_BEGIN") {
+    CmdFfBegin m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFfBegin::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_LUT") {
+    CmdFfLut m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFfLut::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_MOT") {
+    CmdFfMot m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFfMot::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_AUX") {
+    CmdFfAux m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFfAux::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_COMMIT") {
+    CmdFfCommit m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFfCommit::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FF_MODE") {
+    CmdFfMode m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFfMode::PAYLOAD_SIZE;
+  } else if (kind == "TLM_ACK") {
+    TlmAck m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = TlmAck::PAYLOAD_SIZE;
+  } else if (kind == "TLM_EXP") {
+    TlmExp m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = TlmExp::PAYLOAD_SIZE;
+  } else if (kind == "TLM_CAL_DATA") {
+    TlmCalData m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = TlmCalData::PAYLOAD_SIZE;
   } else if (kind == "TLM_STATE") {
     TlmState m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
@@ -574,6 +798,15 @@ void run_corruption_vector(const JVal& v, const std::map<std::string, JVal>& fra
     wire_got.push_back(COBS_DELIMITER);
     const std::vector<uint8_t> enc = cobs_of(logical_of(con.at("base_frame").str));
     wire_got.insert(wire_got.end(), enc.begin(), enc.end());
+    wire_got.push_back(COBS_DELIMITER);
+  } else if (con_kind == "version_patch") {
+    // ver バイトを書き換えて CRC を再計算(旧バージョン混在フレームの再現)
+    std::vector<uint8_t> logical = logical_of(con.at("base_frame").str);
+    logical[0] = static_cast<uint8_t>(con.at("ver").num);
+    const size_t body_len = logical.size() - 2;
+    const uint16_t crc = crc16_ccitt_false(logical.data(), body_len);
+    wr_u16(logical.data() + body_len, crc);
+    wire_got = cobs_of(logical);
     wire_got.push_back(COBS_DELIMITER);
   } else {
     std::fprintf(stderr, "unknown corruption construct: %s\n", con_kind.c_str());

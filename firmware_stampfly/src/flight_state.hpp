@@ -22,6 +22,7 @@ enum AutoFlightState : uint8_t {
     AUTO_HOVER = 4,
     AUTO_LANDING = 5,
     AUTO_COMPLETE = 6,
+    AUTO_MOTOR_TEST = 7,  // v2: モーターテスト(WAIT⇔MOTOR_TEST、CMD_MODEで遷移)
 };
 
 // PROTOCOL.md FlightState との対応をコンパイル時に固定する
@@ -32,6 +33,7 @@ static_assert(AUTO_TAKEOFF == static_cast<uint8_t>(stampfly::FlightState::TAKEOF
 static_assert(AUTO_HOVER == static_cast<uint8_t>(stampfly::FlightState::HOVER), "enum mismatch");
 static_assert(AUTO_LANDING == static_cast<uint8_t>(stampfly::FlightState::LANDING), "enum mismatch");
 static_assert(AUTO_COMPLETE == static_cast<uint8_t>(stampfly::FlightState::COMPLETE), "enum mismatch");
+static_assert(AUTO_MOTOR_TEST == static_cast<uint8_t>(stampfly::FlightState::MOTOR_TEST), "enum mismatch");
 
 // ループタイミング。Loop_flag のみISR(400Hzタイマ)が書くため volatile。
 struct FlightTimingState {
@@ -61,7 +63,7 @@ struct ControlOutputState {
     float RearLeft_motor_duty = 0.0f;
     float Roll_rate_reference = 0.0f;    // 角度PID出力 = 角速度目標 [rad/s]
     float Pitch_rate_reference = 0.0f;
-    float Yaw_rate_reference = 0.0f;     // ヨーは常に0(無制御)
+    float Yaw_rate_reference = 0.0f;     // ヨー角PID出力 = ヨーレート目標(v2。制御off時0)
     float Roll_angle_reference = 0.0f;   // クランプ後の角度目標 [rad]
     float Pitch_angle_reference = 0.0f;
     float Roll_rate_command = 0.0f;      // 角速度PID出力(トルク相当)
@@ -75,6 +77,9 @@ struct ControlOutputState {
     float Thrust0 = 0.0f;                // 正規化ベーススラスト(0-1)
     float Alt_ref = 0.0f;                // 目標高度 [m](CMD_SETPOINTでクランプ更新)
     float Z_dot_ref = 0.0f;              // 高度PID出力 = 上下速度目標 [m/s]
+    // --- v2: ヨー角制御 ---
+    float Yaw_angle_command = 0.0f;      // 適用中ヨー角目標 [rad](途絶ラッチ後含む)
+    uint8_t Yaw_ctrl_active = 0;         // ヨー角度制御が実際に効いているか(ff_status bit5)
 };
 
 // CMD_SETPOINT の適用追跡(seq_echo・リンク鮮度の根拠)
@@ -84,6 +89,9 @@ struct CommandTrackingState {
     uint32_t last_setpoint_ms = 0;      // 最後のsetpoint受信時刻 [ms]
     float target_roll_rad = 0.0f;       // 受信した姿勢目標 [rad]
     float target_pitch_rad = 0.0f;
+    // --- v2: CMD_SETPOINT 17B(yaw_ref / flags bit1) ---
+    float target_yaw_rad = 0.0f;        // 受信したヨー角目標 [rad](target_yaw_valid時のみ有効)
+    bool target_yaw_valid = false;      // flags bit1 = ヨー角制御ON
 };
 
 struct FlightControlState {
@@ -125,4 +133,23 @@ struct SensorState {
     volatile float Az = 0.0f;
     volatile float Az_bias = 0.0f;
     Alt_kalman EstimatedAltitude;
+
+    // ---- v2: ヨー推定・電流計測の公開値(sensor.cpp が yaw_estimation/ の
+    //      出力から毎tick転記し、telemetry(TLM_STATE 97-134)と飛行制御の
+    //      ヨー角制御(次ステージ)が読む) ----
+    volatile float Yaw_gyro_integral = 0.0f;  // Z軸角速度の単純積算 [rad](400Hz、ahrs_resetでゼロクリア)
+    volatile float Yaw_est_rad = 0.0f;        // アクティブ推定器ヨー [rad](est_mode=1:EKF ψ / 0:補正CF、FF無効時はリファレンスCF)
+    volatile float Yaw_ekf_rad = 0.0f;        // 4状態EKF の ψ [rad]
+    volatile float Current_a = 0.0f;          // INA3221 CH2 総電流 [A](20Hz更新)
+    volatile float Db_hat_x_ut = 0.0f;        // FF補正ベクトル ΔB̂ x [µT]
+    volatile float Db_hat_y_ut = 0.0f;        // 同 y [µT]
+    volatile float Bm_x_ut = 0.0f;            // EKF 磁気バイアス状態 b_m x [µT]
+    volatile float Bm_y_ut = 0.0f;            // 同 y [µT]
+    volatile float Ekf_nis = 0.0f;            // 直近 EKF 更新の NIS
+    volatile uint8_t Ekf_ffg = 0;             // EKF ゲート/健全性ビット(yaw側 ffg 定義)
+    volatile uint8_t Ff_mode = 0;             // FF補正モード(0=off,1=方式A,2=方式B)
+    volatile uint8_t Est_mode = 0;            // 推定器選択(0=相補フィルタ,1=EKF)
+    volatile uint8_t Ff_anchor_valid = 0;     // アイドルアンカー有効(0/1)
+    volatile uint8_t Ff_cal_loaded = 0;       // FF係数確定済み(0/1)
+    volatile uint8_t Mag_fresh = 0;           // fresh磁気が鮮度タイムアウト内(0/1)
 };

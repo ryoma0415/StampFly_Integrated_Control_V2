@@ -16,7 +16,7 @@ baseline_flags（基準ジャンプ>閾値のステップ）を図③に赤×で
 使い方:
     python analyze_calibration.py                       # 一覧から対話選択
     python analyze_calibration.py samples.csv [-o 出力ディレクトリ]
-    引数を省略すると ../pc_server/sweep_results/ 内の samples CSV を新しい順に
+    引数を省略すると ../pc_server/data/sweep_results/ 内の samples CSV を新しい順に
     一覧表示し、番号を入力して1つ選ぶ（会話的選択）。図の出力先は既定で
     data_analysis/graphs/analysis_<stem>/（この解析フォルダ配下）。
 
@@ -747,7 +747,7 @@ SWEEP_GLOB = "sweep_*_samples.csv"
 
 def sweep_dir() -> Path:
     """pc_server が CSV を書き出す sweep_results フォルダ。"""
-    return Path(__file__).resolve().parent.parent / "pc_server" / "sweep_results"
+    return Path(__file__).resolve().parent.parent / "pc_server" / "data" / "sweep_results"
 
 
 def list_samples() -> list[Path]:

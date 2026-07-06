@@ -380,7 +380,7 @@ SEQ_GLOB = "sequence_*_meta.json"
 
 def sweep_dir() -> Path:
     """pc_server が結果を書き出す sweep_results フォルダ。"""
-    return Path(__file__).resolve().parent.parent / "pc_server" / "sweep_results"
+    return Path(__file__).resolve().parent.parent / "pc_server" / "data" / "sweep_results"
 
 
 def list_sequence_metas() -> list[Path]:

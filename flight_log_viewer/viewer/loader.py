@@ -1,0 +1,247 @@
+"""V2 フライトログ CSV(50Hz・94列)の読み込みと派生量の計算。
+
+- 破損した末尾(電源断などで途切れた行)は旧 Drone_Log_Viewer と同様に
+  切り捨てて読む。
+- 列の検証は「警告して続行」とする(pc_server と並行開発のため、列の過不足で
+  即エラーにはしない。必須列 elapsed_time が無い場合のみエラー)。
+- 角度系の派生列(deg 変換・アンラップ・対真値誤差)をここで一括計算する。
+"""
+
+from __future__ import annotations
+
+import io
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from .constants import (
+    LOG_RATE_HZ,
+    TEXT_COLUMNS,
+    TLM_FLAG_FLYING,
+    V2_COLUMNS,
+    YAW_SOURCES,
+)
+
+# ヨー比較の対象(推定3系統)。基準(真値)は mocap があれば mocap、
+# なければ Madgwick(その場合 madgwick 自身は比較から除外)。
+YAW_ESTIMATOR_KEYS: tuple[str, ...] = ("madgwick", "ekf", "gyro_int")
+
+
+# ---------------------------------------------------------------------------
+# 角度ユーティリティ
+# ---------------------------------------------------------------------------
+
+def wrap_pi(angle_rad: np.ndarray | float) -> np.ndarray | float:
+    """角度を ±π に折り返す。"""
+    return (np.asarray(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def wrap_deg(angle_deg: np.ndarray | float) -> np.ndarray | float:
+    """角度を ±180° に折り返す。"""
+    return (np.asarray(angle_deg) + 180.0) % 360.0 - 180.0
+
+
+def unwrap_deg(values: np.ndarray) -> np.ndarray:
+    """NaN を保持したままアンラップする(有限区間のみ np.unwrap)。"""
+    values = np.asarray(values, dtype=float)
+    result = np.full_like(values, np.nan)
+    finite = np.isfinite(values)
+    if finite.sum() >= 2:
+        result[finite] = np.degrees(np.unwrap(np.radians(values[finite])))
+    elif finite.any():
+        result[finite] = values[finite]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# FlightLog データクラス
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FlightLog:
+    """読み込んだ 1 本のフライトログ。df には派生列も追加済み。"""
+
+    path: Path
+    df: pd.DataFrame
+    mode: str                       # "posture" / "position" / "unknown"
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return self.path.stem
+
+    @property
+    def t(self) -> np.ndarray:
+        """経過時間 [s]。"""
+        return self.df["elapsed_time"].to_numpy(dtype=float)
+
+    @property
+    def duration_s(self) -> float:
+        t = self.t
+        return float(t[-1] - t[0]) if len(t) >= 2 else 0.0
+
+    def has(self, column: str) -> bool:
+        """列が存在し、かつ有効値を1つ以上含むか。"""
+        return column in self.df.columns and bool(self.df[column].notna().any())
+
+    def flying_mask(self) -> np.ndarray:
+        """飛行中の行マスク(tlm_flags bit2 を優先、無ければ phase=='flying')。"""
+        if self.has("tlm_flags"):
+            flags = self.df["tlm_flags"].to_numpy(dtype=float)
+            mask = np.zeros(len(flags), dtype=bool)
+            finite = np.isfinite(flags)
+            mask[finite] = (flags[finite].astype(int) & TLM_FLAG_FLYING) != 0
+            if mask.any():
+                return mask
+        if "phase" in self.df.columns:
+            return (self.df["phase"].astype(str) == "flying").to_numpy()
+        return np.zeros(len(self.df), dtype=bool)
+
+    def flight_time_s(self) -> float:
+        """飛行時間 [s](flying 行数 / 50Hz)。"""
+        return float(self.flying_mask().sum()) / LOG_RATE_HZ
+
+    def yaw_reference(self) -> tuple[str, np.ndarray] | None:
+        """ヨー誤差の基準系統(キー名, アンラップ済み deg 系列)を返す。
+
+        MoCap 真値があればそれを、なければ Madgwick を基準とする。
+        どちらも無ければ None。
+        """
+        if self.has("mocap_yaw_deg"):
+            return "mocap", self.df["yaw_mocap_unwrap_deg"].to_numpy(dtype=float)
+        if self.has("tlm_yaw_rad"):
+            return "madgwick", self.df["yaw_madgwick_unwrap_deg"].to_numpy(dtype=float)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CSV 読み込み
+# ---------------------------------------------------------------------------
+
+def _read_csv_with_recovery(csv_path: Path) -> pd.DataFrame:
+    """UTF-8 として壊れた末尾があれば切り捨てて読む(旧実装踏襲)。"""
+    try:
+        return pd.read_csv(csv_path)
+    except UnicodeDecodeError as e:
+        print(f"警告: CSV 読み込みでエンコードエラー ({e})。破損した末尾を切り捨てます。")
+        raw_bytes = Path(csv_path).read_bytes()
+        cut_idx = e.start if getattr(e, "start", None) is not None else len(raw_bytes)
+        clean_text = raw_bytes[:cut_idx].decode("utf-8", errors="ignore")
+        if "\n" not in clean_text:
+            raise ValueError("CSV の先頭から破損しているため読み込めません。") from e
+        clean_text = clean_text.rsplit("\n", 1)[0] + "\n"
+        return pd.read_csv(io.StringIO(clean_text))
+
+
+def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """deg 変換・ヨーのアンラップ・対基準誤差などの派生列を追加して返す。
+
+    列を 1 本ずつ追加すると pandas がフラグメント化警告を出すため、
+    まとめて concat する。
+    """
+    derived: dict[str, np.ndarray] = {}
+
+    # 姿勢 rad → deg
+    for rad_col, deg_col in (
+        ("tlm_roll_rad", "tlm_roll_deg"),
+        ("tlm_pitch_rad", "tlm_pitch_deg"),
+        ("tlm_yaw_ref_rad", "tlm_yaw_ref_deg"),
+        ("traj_phase_rad", "traj_phase_deg"),
+    ):
+        if rad_col in df.columns:
+            derived[deg_col] = np.degrees(df[rad_col].to_numpy(dtype=float))
+
+    # ヨー4系統: deg 列とアンラップ列を作る
+    yaw_deg: dict[str, np.ndarray] = {}
+    for key, column, _label, _color, is_deg in YAW_SOURCES:
+        if column not in df.columns:
+            continue
+        values = df[column].to_numpy(dtype=float)
+        deg = values if is_deg else np.degrees(values)
+        yaw_deg[key] = deg
+        derived[f"yaw_{key}_deg"] = deg
+        derived[f"yaw_{key}_unwrap_deg"] = unwrap_deg(deg)
+
+    # 対基準ヨー誤差(基準 = mocap があれば mocap、なければ madgwick)
+    if "mocap" in yaw_deg and np.isfinite(yaw_deg["mocap"]).any():
+        ref_key = "mocap"
+    elif "madgwick" in yaw_deg and np.isfinite(yaw_deg["madgwick"]).any():
+        ref_key = "madgwick"
+    else:
+        ref_key = None
+    if ref_key is not None:
+        ref = yaw_deg[ref_key]
+        for key in YAW_ESTIMATOR_KEYS:
+            if key == ref_key or key not in yaw_deg:
+                continue
+            derived[f"yaw_err_{key}_deg"] = wrap_deg(yaw_deg[key] - ref)
+
+    # ヨー指令追従誤差(cmd_yaw_ref と アクティブ推定ヨーの差、ヨー制御 ON 行のみ)
+    if "cmd_yaw_ref_deg" in df.columns and "ekf" in yaw_deg and "yaw_ctrl_on" in df.columns:
+        cmd = df["cmd_yaw_ref_deg"].to_numpy(dtype=float)
+        on = df["yaw_ctrl_on"].to_numpy(dtype=float)
+        err = np.asarray(wrap_deg(yaw_deg["ekf"] - cmd), dtype=float)
+        err[~(np.isfinite(on) & (on > 0))] = np.nan
+        derived["yaw_track_err_deg"] = err
+
+    if not derived:
+        return df
+    return pd.concat([df, pd.DataFrame(derived, index=df.index)], axis=1)
+
+
+def load_log(csv_path: str | Path) -> FlightLog:
+    """CSV を読み込み、列を検証し、派生列を追加して FlightLog を返す。"""
+    csv_path = Path(csv_path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"ログファイルが見つかりません: {csv_path}")
+
+    df = _read_csv_with_recovery(csv_path)
+    warnings: list[str] = []
+
+    if "elapsed_time" not in df.columns:
+        raise ValueError(f"必須列 elapsed_time がありません: {csv_path}")
+
+    # 列の検証(過不足は警告のみ。94列契約は docs/LOG_STRUCTURE.md v2 を参照)
+    missing = [c for c in V2_COLUMNS if c not in df.columns]
+    extra = [c for c in df.columns if c not in V2_COLUMNS]
+    if missing:
+        warnings.append(
+            f"契約(94列)に対して欠けている列が {len(missing)} 個あります: "
+            + ", ".join(missing[:8]) + ("…" if len(missing) > 8 else "")
+        )
+    if extra:
+        warnings.append(
+            f"契約に無い列が {len(extra)} 個あります: "
+            + ", ".join(extra[:8]) + ("…" if len(extra) > 8 else "")
+        )
+
+    # 数値列を数値化(空欄 → NaN)。文字列列はそのまま。
+    for col in df.columns:
+        if col not in TEXT_COLUMNS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # elapsed_time が欠損した行は使えないため除外
+    df = df[df["elapsed_time"].notna()].reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError(f"有効な行がありません: {csv_path}")
+
+    df = _add_derived_columns(df)
+
+    # モード判定(mode 列 → ファイル名サフィックスの順)
+    mode = "unknown"
+    if "mode" in df.columns and df["mode"].notna().any():
+        mode = str(df["mode"].dropna().iloc[0])
+    else:
+        stem = csv_path.stem
+        for candidate in ("posture", "position"):
+            if stem.endswith(f"_{candidate}"):
+                mode = candidate
+                break
+
+    for message in warnings:
+        print(f"警告: {message}")
+
+    return FlightLog(path=csv_path, df=df, mode=mode, warnings=warnings)

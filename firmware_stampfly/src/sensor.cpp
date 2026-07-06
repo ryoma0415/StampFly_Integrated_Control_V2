@@ -27,14 +27,15 @@
 #include "imu.hpp"
 #include "tof.hpp"
 #include "flight_control.hpp"
+#include "yaw_estimation/sensor_hub_ff.hpp"
 
 Madgwick Drone_ahrs;
 SensorState sensor_state;
 
-INA3221 ina3221(INA3221_ADDR40_GND);  // Set I2C address to 0x40 (A0 pin -> GND)
+// INA3221 は yaw_estimation/current_sensor(CH2のみ・140µs変換・AVG16)が
+// 唯一の所有者。電圧・電流とも 20Hz 読みに一本化した(V2契約 §2.2)。
 Filter acc_filter;
 Filter az_filter;
-Filter voltage_filter;
 Filter raw_ax_filter;
 Filter raw_ay_filter;
 Filter raw_az_filter;
@@ -91,14 +92,10 @@ void sensor_calc_offset_avarage(void) {
     Offset_counter++;
 }
 
-void test_voltage(void) {
-    for (uint16_t i = 0; i < 1000; i++) {
-        USBSerial.printf("Voltage[%03d]:%f\n\r", i, ina3221.getVoltage(INA3221_CH2));
-    }
-}
-
 void ahrs_reset(void) {
     Drone_ahrs.reset();
+    // Z軸ジャイロ単純積算はAHRSと同じ「離陸時0基準」に揃える(V2契約 §2.2)
+    sensor_state.Yaw_gyro_integral = 0.0f;
 }
 
 void sensor_init() {
@@ -114,9 +111,11 @@ void sensor_init() {
     tof_init();
     imu_init();
     Drone_ahrs.begin(400.0);
-    ina3221.begin(&Wire1);
-    ina3221.reset();
-    voltage_filter.set_parameter(0.005, 0.0025);
+
+    // ヨー推定モジュール初期化: BMM150 / INA3221(CH2のみ・140µs・AVG16)と
+    // NVS 復元(mag3d → accel6 → attmount → geomag → yawzero → ffcal)。
+    // 旧 ina3221.begin + 毎tick getVoltage は current_sensor の 20Hz 読みへ統一。
+    sensorHubFfInit(Wire1);
 
     uint16_t cnt = 0;
     while (cnt < 10) {
@@ -147,7 +146,6 @@ void sensor_init() {
 float sensor_read(void) {
     float acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z;
     float ax, ay, az, gx, gy, gz, acc_norm, rate_norm;
-    float filterd_v;
     static float dp, dq, dr;
     static uint16_t dcnt = 0u;
     int16_t deff;
@@ -164,6 +162,7 @@ float sensor_read(void) {
     float sens_interval;
     float h;
     static float opt_interval = 0.0;
+    bool tof_read_this_tick = false;  // 今tickでToF読みが発生(磁気/電流の位相スタガ用)
 
     st              = micros();
     old_sensor_time = sensor_time;
@@ -234,6 +233,9 @@ float sensor_read(void) {
         sensor_state.Roll_rate  = raw_gx_filter.update(Roll_rate_raw - Roll_rate_offset, flight_control_state.timing.Interval_time);
         sensor_state.Pitch_rate = raw_gy_filter.update(Pitch_rate_raw - Pitch_rate_offset, flight_control_state.timing.Interval_time);
         sensor_state.Yaw_rate   = raw_gz_filter.update(Yaw_rate_raw - Yaw_rate_offset, flight_control_state.timing.Interval_time);
+        // Z軸ジャイロ単純積算(400Hz): Yaw_rate 確定直後に積算し、ahrs_reset()で
+        // ゼロクリアする(ドリフト評価用の第3のヨー系統。V2契約 §2.2)
+        sensor_state.Yaw_gyro_integral += sensor_state.Yaw_rate * flight_control_state.timing.Interval_time;
 
         Drone_ahrs.updateIMU((sensor_state.Pitch_rate) * (float)RAD_TO_DEG, (sensor_state.Roll_rate) * (float)RAD_TO_DEG,
                              -(sensor_state.Yaw_rate) * (float)RAD_TO_DEG, sensor_state.Accel_y, sensor_state.Accel_x, -sensor_state.Accel_z);
@@ -255,6 +257,7 @@ float sensor_read(void) {
                 alt_time                   = micros() * 1.0e-6;
                 h                          = alt_time - old_alt_time;
                 ToF_bottom_data_ready_flag = 0;
+                tof_read_this_tick         = true;  // 重量級I2C読みtick → 磁気/電流を繰延べ
 
                 // 距離の値の更新
                 // old_range[0] = dist;
@@ -319,17 +322,82 @@ float sensor_read(void) {
         if (sensor_state.Over_g == 0.0) sensor_state.Over_g = acc_norm;
     }
 
-    // Battery voltage check
-    sensor_state.Voltage   = ina3221.getVoltage(INA3221_CH2);
-    filterd_v = voltage_filter.update(sensor_state.Voltage, flight_control_state.timing.Control_period);
-
-    if (sensor_state.Under_voltage_flag != UNDER_VOLTAGE_COUNT) {
-        if (filterd_v < POWER_LIMIT)
-            sensor_state.Under_voltage_flag++;
-        else
-            sensor_state.Under_voltage_flag = 0;
-        if (sensor_state.Under_voltage_flag > UNDER_VOLTAGE_COUNT) sensor_state.Under_voltage_flag = UNDER_VOLTAGE_COUNT;
+    // ---- ヨー推定・電流FF補正の統合tick(V2契約 §2.2) ----
+    // 20Hz スロット(電流→磁気の順)・EKF predict(毎tick)/update(fresh磁気のみ)・
+    // アイドルアンカーは sensorHubFfUpdate 内で回る。ToF読みtickでは磁気/電流を
+    // スキップして次tickへ繰延べる(位相スタガ)。
+    {
+        const auto& fout = flight_control_state.output;
+        const AutoFlightState ast = flight_control_state.mode.auto_state;
+        SensorHubFfInputs ff_in;
+        // ω_z = −gyro_z − 起動offset(yaw側と同一の未フィルタ規約で渡す)
+        ff_in.yaw_rate_rad_s = Yaw_rate_raw - Yaw_rate_offset;
+        ff_in.roll_rad = sensor_state.Roll_angle;
+        ff_in.pitch_rad = sensor_state.Pitch_angle;
+        ff_in.dt_s = flight_control_state.timing.Interval_time;
+        ff_in.tof_read_this_tick = tof_read_this_tick;
+        if (ast == AUTO_MOTOR_TEST) {
+            // MOTOR_TEST 中: テスト duty×mask を FF へ配線(V2契約 §2.3)。
+            // ランプダウン中の実出力>0 も「回転中」として扱う(アンカー窓の汚染防止)。
+            const float test_duty = motor_test_applied_duty();
+            ff_in.motors_running = motor_test_output_active();
+            ff_in.duty[0] = test_duty;  // FL,FR,RL,RR とも共通duty(mask外は compute が0扱い)
+            ff_in.duty[1] = test_duty;
+            ff_in.duty[2] = test_duty;
+            ff_in.duty[3] = test_duty;
+            ff_in.motor_mask = motor_test_active_mask();
+        } else {
+            // 「回転中」= 飛行状態、またはPWM実出力あり(アンカー窓の汚染防止)。
+            ff_in.motors_running =
+                (ast == AUTO_TAKEOFF || ast == AUTO_HOVER || ast == AUTO_LANDING) ||
+                fout.FrontLeft_motor_duty > 0.0f || fout.FrontRight_motor_duty > 0.0f ||
+                fout.RearLeft_motor_duty > 0.0f || fout.RearRight_motor_duty > 0.0f;
+            // FF差動項へのduty配線は FL,FR,RL,RR の順(ベース変数は FR,FL,RR,RL 順
+            // なのでここで並べ替える。V2契約 §2.3)
+            ff_in.duty[0] = fout.FrontLeft_motor_duty;
+            ff_in.duty[1] = fout.FrontRight_motor_duty;
+            ff_in.duty[2] = fout.RearLeft_motor_duty;
+            ff_in.duty[3] = fout.RearRight_motor_duty;
+            ff_in.motor_mask = 0x0F;
+        }
+        sensorHubFfUpdate(ff_in);
     }
+
+    // Battery voltage check
+    // 電圧はINA3221(CH2)の20Hz読み(bus_voltage)に一本化(毎tick getVoltage 廃止)。
+    // 低電圧判定「<3.34V が 0.25s 継続」は 20Hz×5サンプル連続に置換(意味を保存)。
+    // 平滑は INA3221 のHW平均(AVG16)が旧 voltage_filter を代替する。
+    // 計測不能(INA3221不調)な20Hzスロットも低電圧と同様に連続カウントし、
+    // 「電圧が測れない機体は飛ばさない」という旧挙動の安全側を保存する。
+    if (g_yaw_est.current_slot_fired) {
+        const bool sample_valid = g_yaw_est.current_sample.valid;
+        if (sample_valid) {
+            sensor_state.Voltage   = g_yaw_est.current_sample.bus_voltage_v;
+            sensor_state.Current_a = g_yaw_est.current_sample.current_a;
+        }
+        if (sensor_state.Under_voltage_flag != UNDER_VOLTAGE_COUNT) {
+            if (!sample_valid || sensor_state.Voltage < POWER_LIMIT)
+                sensor_state.Under_voltage_flag++;
+            else
+                sensor_state.Under_voltage_flag = 0;
+            if (sensor_state.Under_voltage_flag > UNDER_VOLTAGE_COUNT) sensor_state.Under_voltage_flag = UNDER_VOLTAGE_COUNT;
+        }
+    }
+
+    // ヨー推定の公開値を SensorState へ転記(telemetry/飛行制御は sensor_state 経由で読む)
+    sensor_state.Yaw_est_rad     = g_yaw_est.ff.yaw_active_rad;
+    sensor_state.Yaw_ekf_rad     = g_yaw_est.yaw_kf.yaw();
+    sensor_state.Db_hat_x_ut     = g_yaw_est.ff.delta_b.x;
+    sensor_state.Db_hat_y_ut     = g_yaw_est.ff.delta_b.y;
+    sensor_state.Bm_x_ut         = g_yaw_est.yaw_kf.bmx();
+    sensor_state.Bm_y_ut         = g_yaw_est.yaw_kf.bmy();
+    sensor_state.Ekf_nis         = g_yaw_est.yaw_kf.nis();
+    sensor_state.Ekf_ffg         = g_yaw_est.yaw_kf.gateBits();
+    sensor_state.Ff_mode         = g_yaw_est.ff.ff_mode;
+    sensor_state.Est_mode        = g_yaw_est.ff.est_mode;
+    sensor_state.Ff_anchor_valid = g_yaw_est.ff.anchor_valid ? 1 : 0;
+    sensor_state.Ff_cal_loaded   = g_yaw_est.ff_calibration.valid() ? 1 : 0;
+    sensor_state.Mag_fresh       = sensorHubFfMagFresh(millis()) ? 1 : 0;
 
     preAutoState = flight_control_state.mode.auto_state;  // 今の状態を記憶
 

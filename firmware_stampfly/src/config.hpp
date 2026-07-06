@@ -29,6 +29,13 @@ struct FlightConfig {
     PidGainConfig altitude{0.38f, 10.0f, 0.5f, 0.125f};
     PidGainConfig z_velocity{0.08f, 0.95f, 0.08f, 0.125f};
 
+    // --- ヨー角制御(v2: psi_pid。角度誤差 wrapPi → ヨーレート目標) ---
+    // 初期ゲインは契約 §2.3 の kp=3.0, ki=0.3, kd=0.0。PID クラスは
+    // (kp, ti, td) 形式のため ki は ti=kp/ki=10.0 で表現する。
+    // ※ 未飛行の初期値であり、要飛行チューニング。
+    PidGainConfig yaw_angle{3.0f, 10.0f, 0.0f, 0.125f};
+    float yaw_rate_limit_rad_s = 1.0f;      // psi_pid 出力クランプ [rad/s]
+
     // --- 制御ループ周期 ---
     float control_period_s = 0.0025f;       // 400Hz 制御周期 [s]
     uint32_t loop_period_us = 2500;         // タイマアラーム周期 [µs]
@@ -81,7 +88,10 @@ struct FlightConfig {
     uint32_t link_level_hold_ms = 200;      // setpoint途絶: 水平保持(=setpoint_fresh閾値)
     uint32_t link_loss_landing_ms = 500;    // setpoint途絶: 自動着陸(reason=8)
     float low_voltage_threshold_v = 3.34f;  // 低電圧閾値 [V]
-    uint8_t low_voltage_count = 100;        // 低電圧判定の連続tick数
+    uint8_t low_voltage_count = 5;          // 低電圧判定の連続サンプル数。電圧読みは
+                                            // INA3221 の 20Hz 電流読み(bus_voltage)に
+                                            // 一本化したため、旧 400Hz×100tick(0.25s)を
+                                            // 20Hz×5サンプル(0.25s)に置換(意味を保存)
     uint32_t max_flight_time_ms = 120000;   // 最大飛行時間 120s(reason=3)
     float reset_accept_alt_m = 0.15f;       // CMD_RESET 受理高度(COMPLETE時) [m]
     float over_g_threshold_g = 2.0f;        // OverG判定 [g](reason=7)
@@ -91,11 +101,19 @@ struct FlightConfig {
     uint32_t wait_settle_ms = 3000;         // WAITでの静定時間 → AHRSリセット
     uint8_t ahrs_reset_repeat = 20;         // 静定後のAHRSリセット回数
 
+    // --- モーターテスト(MOTOR_TEST 状態。ベンチ実験専用: 機体固定前提) ---
+    // yaw側 motor.cpp / config.hpp の実績値を踏襲。ソフトスタートは1Sバッテリの
+    // 突入電流ブラウンアウト対策なので削除しないこと。
+    float motor_test_max_duty = 1.0f;        // テストdutyクランプ上限(yaw側 MOTOR_TEST_MAX_DUTY)
+    uint32_t motor_test_failsafe_ms = 1500;  // CMD_MOTOR_RUN 途絶で自動停止 [ms]
+    float motor_test_slew_duty_per_s = 2.0f; // ソフトスタートのスルーレート [duty/s]
+
     // --- 通信 ---
     uint8_t wifi_channel = 1;               // ESP-NOWチャネル(PC側機体プロファイルと一致させる)
 
     // --- テレメトリ・表示レート(400Hzループの分周比) ---
     uint16_t telemetry_state_divider = 16;  // TLM_STATE 25Hz
+    uint16_t telemetry_exp_phase_ticks = 8; // TLM_EXP の位相オフセット(TLM_STATEと8tickずらす)
     uint32_t event_resend_ms = 500;         // TLM_EVENT 2Hz 定期再送
     uint16_t led_show_divider = 16;         // LED更新 25Hz
     uint16_t led_blink_period_ticks = 200;  // 点滅の半周期(0.5s @400Hz)

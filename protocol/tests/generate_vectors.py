@@ -12,6 +12,7 @@ stampfly_protocol.py(PROTOCOL.md 準拠)を正としてベクタを生成し、
 from __future__ import annotations
 
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -43,23 +44,37 @@ def build_vectors() -> dict:
     frames = []
 
     # --- 2. CMD_SETPOINT seq=0x41424344(旧バグ回帰オマージュ: ペイロード中の
-    #     0x41 をヘッダと誤認しないこと)---
-    sp1 = sp.CmdSetpoint(roll_ref=0.0524, pitch_ref=-0.0349, alt_ref=0.3, flags=1)
+    #     0x41 をヘッダと誤認しないこと)。v2: 17B(yaw_ref+flags bit1)---
+    sp1 = sp.CmdSetpoint(roll_ref=0.0524, pitch_ref=-0.0349, alt_ref=0.3,
+                         yaw_ref=0.7854, flags=3)
     frames.append(frame_vector(
         "cmd_setpoint_seq_0x41424344", "CMD_SETPOINT",
         sp.MsgType.CMD_SETPOINT, 0x41424344,
-        {"roll_ref": 0.0524, "pitch_ref": -0.0349, "alt_ref": 0.3, "flags": 1},
+        {"roll_ref": 0.0524, "pitch_ref": -0.0349, "alt_ref": 0.3,
+         "yaw_ref": 0.7854, "flags": 3},
         sp1.to_payload()))
 
     # --- 3. payload に 0x00 を多数含むフレーム(alt_ref=0.0 等)の COBS 往復 ---
-    sp0 = sp.CmdSetpoint(roll_ref=0.0, pitch_ref=0.0, alt_ref=0.0, flags=0)
+    sp0 = sp.CmdSetpoint(roll_ref=0.0, pitch_ref=0.0, alt_ref=0.0,
+                         yaw_ref=0.0, flags=0)
     frames.append(frame_vector(
         "cmd_setpoint_all_zero_payload", "CMD_SETPOINT",
         sp.MsgType.CMD_SETPOINT, 1,
-        {"roll_ref": 0.0, "pitch_ref": 0.0, "alt_ref": 0.0, "flags": 0},
+        {"roll_ref": 0.0, "pitch_ref": 0.0, "alt_ref": 0.0,
+         "yaw_ref": 0.0, "flags": 0},
         sp0.to_payload()))
 
-    # --- 4. TLM_STATE: 全フィールド既知値(97B)---
+    # --- 3b. v1 互換動作(flags bit1=0、yaw_ref 無効=レートダンピングのみ)---
+    sp_v1 = sp.CmdSetpoint(roll_ref=0.02, pitch_ref=0.01, alt_ref=0.4,
+                           yaw_ref=0.0, flags=1)
+    frames.append(frame_vector(
+        "cmd_setpoint_yaw_disabled", "CMD_SETPOINT",
+        sp.MsgType.CMD_SETPOINT, 2,
+        {"roll_ref": 0.02, "pitch_ref": 0.01, "alt_ref": 0.4,
+         "yaw_ref": 0.0, "flags": 1},
+        sp_v1.to_payload()))
+
+    # --- 4. TLM_STATE: 全フィールド既知値(135B、v2 末尾追加分を含む)---
     tlm_fields = {
         "seq_echo": 0x01020304,
         "elapsed_ms": 123456,
@@ -77,10 +92,25 @@ def build_vectors() -> dict:
         "duty_fr": 0.41, "duty_fl": 0.42, "duty_rr": 0.43, "duty_rl": 0.44,
         "ax": 0.01, "ay": -0.02, "az": 0.98,
         "loop_dt_us": 2500,
+        "yaw_est_rad": 1.5601,
+        "yaw_gyro_int_rad": 1.5432,
+        "yaw_ref_rad": 1.5708,
+        "current_a": 2.85,
+        "db_hat_x_ut": 3.2,
+        "db_hat_y_ut": -1.1,
+        "bm_x_ut": 0.6,
+        "bm_y_ut": -0.4,
+        "nis": 1.75,
+        "ffg": 0x05,
+        "ff_status": (2 | sp.TlmState.FF_STATUS_EST_EKF |
+                      sp.TlmState.FF_STATUS_ANCHOR_VALID |
+                      sp.TlmState.FF_STATUS_FFCAL_LOADED |
+                      sp.TlmState.FF_STATUS_YAW_CTRL_ACTIVE |
+                      sp.TlmState.FF_STATUS_MAG_FRESH),
     }
     tlm = sp.TlmState(**tlm_fields)
     payload = tlm.to_payload()
-    assert len(payload) == 97
+    assert len(payload) == 135
     frames.append(frame_vector(
         "tlm_state_full", "TLM_STATE", sp.MsgType.TLM_STATE, 1000,
         tlm_fields, payload))
@@ -139,6 +169,164 @@ def build_vectors() -> dict:
     frames.append(frame_vector(
         "cmd_start_empty_payload", "NONE", sp.MsgType.CMD_START, 5, {}, b""))
 
+    # --- v2 新規上りメッセージ(0x14–0x23)---
+    mode = sp.CmdMode(mode=sp.CmdMode.MODE_MOTOR_TEST)
+    frames.append(frame_vector(
+        "cmd_mode_motor_test", "CMD_MODE", sp.MsgType.CMD_MODE, 20,
+        {"mode": 1}, mode.to_payload()))
+
+    run = sp.CmdMotorRun(duty=0.35, mask=sp.CmdMotorRun.MASK_FL | sp.CmdMotorRun.MASK_FR)
+    frames.append(frame_vector(
+        "cmd_motor_run_front_pair", "CMD_MOTOR_RUN", sp.MsgType.CMD_MOTOR_RUN, 21,
+        {"duty": 0.35, "mask": 3}, run.to_payload()))
+
+    frames.append(frame_vector(
+        "cmd_motor_stop_empty_payload", "NONE", sp.MsgType.CMD_MOTOR_STOP, 22, {}, b""))
+
+    frames.append(frame_vector(
+        "cmd_cal_get_empty_payload", "NONE", sp.MsgType.CMD_CAL_GET, 23, {}, b""))
+
+    mag3d_offset = [12.5, -8.25, 3.75]
+    mag3d_matrix = [1.02, 0.01, -0.02,
+                    0.01, 0.98, 0.03,
+                    -0.02, 0.03, 1.05]
+    mag3d = sp.CmdMag3dSet(valid=1, offset=tuple(mag3d_offset),
+                           matrix=tuple(mag3d_matrix))
+    frames.append(frame_vector(
+        "cmd_mag3d_set_full", "CMD_MAG3D_SET", sp.MsgType.CMD_MAG3D_SET, 24,
+        {"valid": 1, "offset": mag3d_offset, "matrix": mag3d_matrix},
+        mag3d.to_payload()))
+
+    accel6_offset = [0.012, -0.008, 0.021]
+    accel6_scale = [0.998, 1.002, 0.995]
+    accel6 = sp.CmdAccel6Set(valid=1, offset=tuple(accel6_offset),
+                             scale=tuple(accel6_scale))
+    frames.append(frame_vector(
+        "cmd_accel6_set_full", "CMD_ACCEL6_SET", sp.MsgType.CMD_ACCEL6_SET, 25,
+        {"valid": 1, "offset": accel6_offset, "scale": accel6_scale},
+        accel6.to_payload()))
+
+    attmount = sp.CmdAttmountSet(valid=1, roll_rad=0.015, pitch_rad=-0.022)
+    frames.append(frame_vector(
+        "cmd_attmount_set", "CMD_ATTMOUNT_SET", sp.MsgType.CMD_ATTMOUNT_SET, 26,
+        {"valid": 1, "roll_rad": 0.015, "pitch_rad": -0.022},
+        attmount.to_payload()))
+
+    yawzero = sp.CmdYawzeroSet(valid=1, offset_rad=-1.234)
+    frames.append(frame_vector(
+        "cmd_yawzero_set", "CMD_YAWZERO_SET", sp.MsgType.CMD_YAWZERO_SET, 27,
+        {"valid": 1, "offset_rad": -1.234}, yawzero.to_payload()))
+
+    geomag = sp.CmdGeomagSet(declination_east_deg=-7.5, inclination_deg=49.5,
+                             horizontal_ut=30.0, vertical_ut=35.1, total_ut=46.2)
+    frames.append(frame_vector(
+        "cmd_geomag_set", "CMD_GEOMAG_SET", sp.MsgType.CMD_GEOMAG_SET, 28,
+        {"declination_east_deg": -7.5, "inclination_deg": 49.5,
+         "horizontal_ut": 30.0, "vertical_ut": 35.1, "total_ut": 46.2},
+        geomag.to_payload()))
+
+    ff_begin = sp.CmdFfBegin(nlut=8)
+    frames.append(frame_vector(
+        "cmd_ff_begin_nlut8", "CMD_FF_BEGIN", sp.MsgType.CMD_FF_BEGIN, 29,
+        {"nlut": 8}, ff_begin.to_payload()))
+
+    ff_lut = sp.CmdFfLut(idx=3, i_a=1.25, db_x=2.5, db_y=-1.75, db_z=0.5)
+    frames.append(frame_vector(
+        "cmd_ff_lut_point", "CMD_FF_LUT", sp.MsgType.CMD_FF_LUT, 30,
+        {"idx": 3, "i_a": 1.25, "db_x": 2.5, "db_y": -1.75, "db_z": 0.5},
+        ff_lut.to_payload()))
+
+    ff_mot_a_tilde = [0.8, -0.6, 0.2]
+    ff_mot = sp.CmdFfMot(idx=sp.CmdFfMot.MOTOR_FL, a_tilde=tuple(ff_mot_a_tilde),
+                         c2=0.9, c1=1.8, c0=0.05)
+    frames.append(frame_vector(
+        "cmd_ff_mot_fl", "CMD_FF_MOT", sp.MsgType.CMD_FF_MOT, 31,
+        {"idx": 0, "a_tilde": ff_mot_a_tilde, "c2": 0.9, "c1": 1.8, "c0": 0.05},
+        ff_mot.to_payload()))
+
+    ff_aux = sp.CmdFfAux(iid_a=0.12)
+    frames.append(frame_vector(
+        "cmd_ff_aux", "CMD_FF_AUX", sp.MsgType.CMD_FF_AUX, 32,
+        {"iid_a": 0.12}, ff_aux.to_payload()))
+
+    ff_commit = sp.CmdFfCommit(crc32=0xDEADBEEF)
+    frames.append(frame_vector(
+        "cmd_ff_commit", "CMD_FF_COMMIT", sp.MsgType.CMD_FF_COMMIT, 33,
+        {"crc32": 0xDEADBEEF}, ff_commit.to_payload()))
+
+    ff_mode = sp.CmdFfMode(ff_mode=sp.CmdFfMode.FF_MODE_B,
+                           est_mode=sp.CmdFfMode.EST_MODE_EKF)
+    frames.append(frame_vector(
+        "cmd_ff_mode_b_ekf", "CMD_FF_MODE", sp.MsgType.CMD_FF_MODE, 34,
+        {"ff_mode": 2, "est_mode": 1}, ff_mode.to_payload()))
+
+    frames.append(frame_vector(
+        "cmd_ff_anchor_empty_payload", "NONE", sp.MsgType.CMD_FF_ANCHOR, 35, {}, b""))
+
+    # --- v2 新規下りメッセージ(0x32–0x34)---
+    ack = sp.TlmAck(acked_type=int(sp.MsgType.CMD_FF_COMMIT), acked_seq=33,
+                    status=sp.TlmAck.STATUS_OK)
+    frames.append(frame_vector(
+        "tlm_ack_ff_commit_ok", "TLM_ACK", sp.MsgType.TLM_ACK, 200,
+        {"acked_type": int(sp.MsgType.CMD_FF_COMMIT), "acked_seq": 33, "status": 0},
+        ack.to_payload()))
+
+    exp_fields = {
+        "elapsed_ms": 654321,
+        "current_a": 3.15, "vbat_v": 3.85, "shunt_uv": 1250.0,
+        "bx_raw": 21.5, "by_raw": -14.25, "bz_raw": 38.75,
+        "bx_cal": 20.1, "by_cal": -13.9, "bz_cal": 37.6,
+        "imu_temp_c": 41.5,
+        "roll": 0.011, "pitch": -0.024, "yaw": 2.618,
+        "p": 0.05, "q": -0.03, "r": 0.02,
+        "ax": 0.015, "ay": -0.01, "az": 1.002,
+        "duty_cmd": 0.45,
+        "motors_mask": 0x0F,
+        "flags": (sp.TlmExp.FLAG_CURRENT_VALID | sp.TlmExp.FLAG_MAG_FRESH |
+                  sp.TlmExp.FLAG_MOTORS_RUNNING),
+    }
+    exp = sp.TlmExp(**exp_fields)
+    exp_payload = exp.to_payload()
+    assert len(exp_payload) == 86
+    frames.append(frame_vector(
+        "tlm_exp_full", "TLM_EXP", sp.MsgType.TLM_EXP, 201,
+        exp_fields, exp_payload))
+
+    cal_fields = {
+        "valid_flags": 0x3F,
+        "mag3d_offset": mag3d_offset,
+        "mag3d_matrix": mag3d_matrix,
+        "accel6_offset": accel6_offset,
+        "accel6_scale": accel6_scale,
+        "attmount_roll_rad": 0.015,
+        "attmount_pitch_rad": -0.022,
+        "yawzero_offset_rad": -1.234,
+        "geomag": [-7.5, 49.5, 30.0, 35.1, 46.2],
+        "ff_nlut": 8,
+        "ff_crc32": 0xDEADBEEF,
+        "ff_mode": 2,
+        "est_mode": 1,
+    }
+    cal = sp.TlmCalData(
+        valid_flags=cal_fields["valid_flags"],
+        mag3d_offset=tuple(cal_fields["mag3d_offset"]),
+        mag3d_matrix=tuple(cal_fields["mag3d_matrix"]),
+        accel6_offset=tuple(cal_fields["accel6_offset"]),
+        accel6_scale=tuple(cal_fields["accel6_scale"]),
+        attmount_roll_rad=cal_fields["attmount_roll_rad"],
+        attmount_pitch_rad=cal_fields["attmount_pitch_rad"],
+        yawzero_offset_rad=cal_fields["yawzero_offset_rad"],
+        geomag=tuple(cal_fields["geomag"]),
+        ff_nlut=cal_fields["ff_nlut"],
+        ff_crc32=cal_fields["ff_crc32"],
+        ff_mode=cal_fields["ff_mode"],
+        est_mode=cal_fields["est_mode"])
+    cal_payload = cal.to_payload()
+    assert len(cal_payload) == 112
+    frames.append(frame_vector(
+        "tlm_cal_data_full", "TLM_CAL_DATA", sp.MsgType.TLM_CAL_DATA, 202,
+        cal_fields, cal_payload))
+
     by_name = {f["name"]: f for f in frames}
 
     def logical_of(name: str) -> bytes:
@@ -160,6 +348,14 @@ def build_vectors() -> dict:
     # 5c. 256B超 → 次の 0x00 まで読み捨て、その後の正常フレームは受信できる
     oversize_wire = (b"\xaa" * 300 + b"\x00" +
                      bytes.fromhex(by_name[base]["wire_hex"]))
+
+    # 5d. v1 フレーム混入(CRC は正しいが ver=0x01)→ ver_errors として破棄
+    #     (新旧混在の可視化。契約 §1「ver_errors として可視化される」)
+    v1_body = bytearray(logical_of(base)[:-2])
+    v1_body[0] = 0x01
+    v1_logical = (bytes(v1_body) +
+                  struct.pack("<H", sp.crc16_ccitt_false(bytes(v1_body))))
+    stale_v1_wire = sp.cobs_encode(v1_logical) + b"\x00"
 
     corruption = [
         {
@@ -187,6 +383,14 @@ def build_vectors() -> dict:
             "expect_frames": 1,
             "expect_counters": {"overflow_drops": 1},
             "expect_frame_logical_hex": [by_name[base]["logical_hex"]],
+        },
+        {
+            "name": "stale_v1_version_frame",
+            "construct": {"kind": "version_patch", "base_frame": base,
+                          "ver": 1},
+            "wire_hex": stale_v1_wire.hex(),
+            "expect_frames": 0,
+            "expect_counters": {"ver_errors": 1},
         },
     ]
 

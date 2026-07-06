@@ -29,7 +29,6 @@
 #include <Arduino.h>
 #include "flight_state.hpp"
 #include "pid.hpp"
-#include <INA3221.h>
 #include <MadgwickAHRS.h>
 #include <common.h>
 #include <stdint.h>

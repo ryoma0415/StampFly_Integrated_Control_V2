@@ -145,7 +145,8 @@ class TestSnapshotContract:
         assert sess["phase"] == "idle"
         assert sess["serial_connected"] is False
         assert sess["relay_fresh"] is False   # RLY_STATS 未受信
-        assert set(sess["setpoint"].keys()) == {"roll_deg", "pitch_deg", "alt_m"}
+        assert set(sess["setpoint"].keys()) == {"roll_deg", "pitch_deg",
+                                                "alt_m", "yaw_deg"}
         assert data["mocap"] is None       # posture モード
         assert sess["target"] is None      # posture モード
 

@@ -16,7 +16,7 @@ import pytest
 import stampfly_protocol as sp
 
 SEED = 0x5F4641  # 固定シード(再現性)
-CASES_PER_TYPE = 60         # 12型 x 60 = 720 ケース(>500)
+CASES_PER_TYPE = 60         # 31型 x 60 = 1860 ケース(>500)
 STREAM_CASES = 50
 
 # LOG_TEXT は UTF-8(PROTOCOL.md)。1B(ASCII)/2B/3B(日本語)/4B(非BMP)の
@@ -38,14 +38,65 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             roll_ref=f32(rng.uniform(-0.6, 0.6)),
             pitch_ref=f32(rng.uniform(-0.6, 0.6)),
             alt_ref=f32(rng.uniform(0.0, 1.5)),
+            yaw_ref=f32(rng.uniform(-3.15, 3.15)),
             flags=rng.randrange(256))
+    if msg_type == sp.MsgType.CMD_MODE:
+        return sp.CmdMode(mode=rng.randrange(2))
+    if msg_type == sp.MsgType.CMD_MOTOR_RUN:
+        return sp.CmdMotorRun(duty=f32(rng.uniform(0.0, 1.0)),
+                              mask=rng.randrange(16))
+    if msg_type == sp.MsgType.CMD_MAG3D_SET:
+        return sp.CmdMag3dSet(
+            valid=rng.randrange(2),
+            offset=tuple(f32(rng.uniform(-100, 100)) for _ in range(3)),
+            matrix=tuple(f32(rng.uniform(-2, 2)) for _ in range(9)))
+    if msg_type == sp.MsgType.CMD_ACCEL6_SET:
+        return sp.CmdAccel6Set(
+            valid=rng.randrange(2),
+            offset=tuple(f32(rng.uniform(-0.2, 0.2)) for _ in range(3)),
+            scale=tuple(f32(rng.uniform(0.9, 1.1)) for _ in range(3)))
+    if msg_type == sp.MsgType.CMD_ATTMOUNT_SET:
+        return sp.CmdAttmountSet(valid=rng.randrange(2),
+                                 roll_rad=f32(rng.uniform(-0.1, 0.1)),
+                                 pitch_rad=f32(rng.uniform(-0.1, 0.1)))
+    if msg_type == sp.MsgType.CMD_YAWZERO_SET:
+        return sp.CmdYawzeroSet(valid=rng.randrange(2),
+                                offset_rad=f32(rng.uniform(-3.15, 3.15)))
+    if msg_type == sp.MsgType.CMD_GEOMAG_SET:
+        return sp.CmdGeomagSet(
+            declination_east_deg=f32(rng.uniform(-15, 15)),
+            inclination_deg=f32(rng.uniform(30, 60)),
+            horizontal_ut=f32(rng.uniform(20, 40)),
+            vertical_ut=f32(rng.uniform(20, 45)),
+            total_ut=f32(rng.uniform(40, 55)))
+    if msg_type == sp.MsgType.CMD_FF_BEGIN:
+        return sp.CmdFfBegin(nlut=rng.randrange(sp.CmdFfBegin.NLUT_MIN,
+                                                sp.CmdFfBegin.NLUT_MAX + 1))
+    if msg_type == sp.MsgType.CMD_FF_LUT:
+        return sp.CmdFfLut(idx=rng.randrange(sp.CmdFfBegin.NLUT_MAX),
+                           i_a=f32(rng.uniform(0, 5)),
+                           db_x=f32(rng.uniform(-20, 20)),
+                           db_y=f32(rng.uniform(-20, 20)),
+                           db_z=f32(rng.uniform(-20, 20)))
+    if msg_type == sp.MsgType.CMD_FF_MOT:
+        return sp.CmdFfMot(idx=rng.randrange(4),
+                           a_tilde=tuple(f32(rng.uniform(-2, 2)) for _ in range(3)),
+                           c2=f32(rng.uniform(-2, 2)),
+                           c1=f32(rng.uniform(-2, 2)),
+                           c0=f32(rng.uniform(-0.5, 0.5)))
+    if msg_type == sp.MsgType.CMD_FF_AUX:
+        return sp.CmdFfAux(iid_a=f32(rng.uniform(0, 0.5)))
+    if msg_type == sp.MsgType.CMD_FF_COMMIT:
+        return sp.CmdFfCommit(crc32=rng.randrange(2**32))
+    if msg_type == sp.MsgType.CMD_FF_MODE:
+        return sp.CmdFfMode(ff_mode=rng.randrange(3), est_mode=rng.randrange(2))
     if msg_type == sp.MsgType.TLM_STATE:
         return sp.TlmState(
             seq_echo=rng.randrange(2**32),
             elapsed_ms=rng.randrange(2**32),
-            state=rng.randrange(7),
+            state=rng.randrange(8),
             flags=rng.randrange(8),
-            reason=rng.randrange(11),
+            reason=rng.randrange(12),
             roll=f32(rng.uniform(-3.2, 3.2)),
             pitch=f32(rng.uniform(-3.2, 3.2)),
             yaw=f32(rng.uniform(-3.2, 3.2)),
@@ -67,12 +118,68 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             ax=f32(rng.uniform(-2, 2)),
             ay=f32(rng.uniform(-2, 2)),
             az=f32(rng.uniform(-2, 2)),
-            loop_dt_us=rng.randrange(2**16))
+            loop_dt_us=rng.randrange(2**16),
+            yaw_est_rad=f32(rng.uniform(-3.2, 3.2)),
+            yaw_gyro_int_rad=f32(rng.uniform(-30, 30)),
+            yaw_ref_rad=f32(rng.uniform(-3.2, 3.2)),
+            current_a=f32(rng.uniform(0, 8)),
+            db_hat_x_ut=f32(rng.uniform(-20, 20)),
+            db_hat_y_ut=f32(rng.uniform(-20, 20)),
+            bm_x_ut=f32(rng.uniform(-5, 5)),
+            bm_y_ut=f32(rng.uniform(-5, 5)),
+            nis=f32(rng.uniform(0, 20)),
+            ffg=rng.randrange(256),
+            ff_status=rng.randrange(128))
     if msg_type == sp.MsgType.TLM_EVENT:
         return sp.TlmEvent(
-            state=rng.randrange(7), prev_state=rng.randrange(7),
-            reason=rng.randrange(11), flags=rng.randrange(256),
+            state=rng.randrange(8), prev_state=rng.randrange(8),
+            reason=rng.randrange(12), flags=rng.randrange(256),
             voltage=f32(rng.uniform(3.0, 4.3)))
+    if msg_type == sp.MsgType.TLM_ACK:
+        return sp.TlmAck(acked_type=rng.randrange(0x14, 0x24),
+                         acked_seq=rng.randrange(2**32),
+                         status=rng.randrange(6))
+    if msg_type == sp.MsgType.TLM_EXP:
+        return sp.TlmExp(
+            elapsed_ms=rng.randrange(2**32),
+            current_a=f32(rng.uniform(0, 8)),
+            vbat_v=f32(rng.uniform(3.0, 4.3)),
+            shunt_uv=f32(rng.uniform(0, 5000)),
+            bx_raw=f32(rng.uniform(-100, 100)),
+            by_raw=f32(rng.uniform(-100, 100)),
+            bz_raw=f32(rng.uniform(-100, 100)),
+            bx_cal=f32(rng.uniform(-100, 100)),
+            by_cal=f32(rng.uniform(-100, 100)),
+            bz_cal=f32(rng.uniform(-100, 100)),
+            imu_temp_c=f32(rng.uniform(10, 60)),
+            roll=f32(rng.uniform(-3.2, 3.2)),
+            pitch=f32(rng.uniform(-3.2, 3.2)),
+            yaw=f32(rng.uniform(-3.2, 3.2)),
+            p=f32(rng.uniform(-10, 10)),
+            q=f32(rng.uniform(-10, 10)),
+            r=f32(rng.uniform(-10, 10)),
+            ax=f32(rng.uniform(-2, 2)),
+            ay=f32(rng.uniform(-2, 2)),
+            az=f32(rng.uniform(-2, 2)),
+            duty_cmd=f32(rng.uniform(0, 1)),
+            motors_mask=rng.randrange(16),
+            flags=rng.randrange(8))
+    if msg_type == sp.MsgType.TLM_CAL_DATA:
+        return sp.TlmCalData(
+            valid_flags=rng.randrange(64),
+            mag3d_offset=tuple(f32(rng.uniform(-100, 100)) for _ in range(3)),
+            mag3d_matrix=tuple(f32(rng.uniform(-2, 2)) for _ in range(9)),
+            accel6_offset=tuple(f32(rng.uniform(-0.2, 0.2)) for _ in range(3)),
+            accel6_scale=tuple(f32(rng.uniform(0.9, 1.1)) for _ in range(3)),
+            attmount_roll_rad=f32(rng.uniform(-0.1, 0.1)),
+            attmount_pitch_rad=f32(rng.uniform(-0.1, 0.1)),
+            yawzero_offset_rad=f32(rng.uniform(-3.15, 3.15)),
+            geomag=tuple(f32(rng.uniform(-15, 55)) for _ in range(5)),
+            ff_nlut=rng.randrange(sp.CmdFfBegin.NLUT_MIN,
+                                  sp.CmdFfBegin.NLUT_MAX + 1),
+            ff_crc32=rng.randrange(2**32),
+            ff_mode=rng.randrange(3),
+            est_mode=rng.randrange(2))
     if msg_type == sp.MsgType.LOG_TEXT:
         # UTF-8 バイト数の上限(budget)内で文字単位に詰める(文字は分断しない)
         budget = rng.randrange(sp.MAX_LOG_TEXT_SIZE + 1)

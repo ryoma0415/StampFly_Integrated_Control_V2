@@ -3,7 +3,13 @@
 このファイルだけが Web フレームワークに依存する薄い層:
 - static/ の配信(ビルド不要 vanilla JS UI)
 - REST: /api/ports, /api/airframes, /api/config
+- v2 REST(Experiment タブ): /api/sweep, /api/sequence, /api/cal3d,
+  /api/accel6, /api/quickcal, /api/geomag, /api/calprofile, /api/ffprofile
+  (GET=状態、POST {"action": ...}=操作。core 層の戻り値 dict をそのまま返す)
 - WebSocket /ws: UI コマンド受付 + 20Hz 状態配信 + 即時 event/log 配信
+  (v2 コマンド: set_mode "experiment" / experiment_activate / set_yaw_control /
+   circle_start / circle_stop / motor_start / motor_set / motor_stop、
+   setpoint メッセージの yaw_deg、yaw メッセージ)
 
 ブロッキングする SessionManager 呼び出しは asyncio.to_thread で executor に
 逃がし、スレッド→async の橋渡しは queue.Queue を 20Hz でポーリングして行う
@@ -145,6 +151,171 @@ async def api_config() -> dict:
 
 
 # ----------------------------------------------------------------------
+# v2 REST(Experiment タブ)。すべてブロッキングし得るため to_thread。
+# 失敗も HTTP 200 で {"ok": false, "message": ...} を返し UI が表示する。
+# ----------------------------------------------------------------------
+
+_UNKNOWN_ACTION = {"ok": False, "message": "不明な action です"}
+
+
+@app.get("/api/sweep")
+async def api_sweep_status() -> dict:
+    return await asyncio.to_thread(session.experiment.sweep.status)
+
+
+@app.post("/api/sweep")
+async def api_sweep(body: dict) -> dict:
+    action = body.get("action")
+    if action == "start":
+        return await asyncio.to_thread(
+            session.sweep_start, body.get("mask"), body.get("pattern"),
+            body.get("notes"))
+    if action == "abort":
+        return await asyncio.to_thread(session.experiment.sweep.abort)
+    return _UNKNOWN_ACTION
+
+
+@app.get("/api/sequence")
+async def api_sequence_status() -> dict:
+    return await asyncio.to_thread(session.experiment.sequence.status)
+
+
+@app.post("/api/sequence")
+async def api_sequence(body: dict) -> dict:
+    action = body.get("action")
+    if action == "start":
+        return await asyncio.to_thread(
+            session.sequence_start, body.get("masks"), body.get("pattern"),
+            body.get("notes"), body.get("min_start_vbat"))
+    if action == "abort":
+        return await asyncio.to_thread(session.experiment.sequence.abort)
+    if action == "resume":
+        return await asyncio.to_thread(
+            session.experiment.sequence.resume, bool(body.get("force")))
+    return _UNKNOWN_ACTION
+
+
+@app.get("/api/cal3d")
+async def api_cal3d_status() -> dict:
+    return await asyncio.to_thread(session.calibration.mag3d_status)
+
+
+@app.post("/api/cal3d")
+async def api_cal3d(body: dict) -> dict:
+    action = body.get("action")
+    handlers = {
+        "start": session.calibration.mag3d_start,
+        "stop": session.calibration.mag3d_stop,
+        "fit": session.calibration.mag3d_fit,
+        "apply": session.calibration.mag3d_apply,
+        "clear": session.calibration.mag3d_clear,
+    }
+    handler = handlers.get(action)
+    if handler is None:
+        return _UNKNOWN_ACTION
+    return await asyncio.to_thread(handler)
+
+
+@app.get("/api/accel6")
+async def api_accel6_status() -> dict:
+    return await asyncio.to_thread(session.calibration.accel6_status)
+
+
+@app.post("/api/accel6")
+async def api_accel6(body: dict) -> dict:
+    action = body.get("action")
+    if action == "start":
+        return await asyncio.to_thread(session.calibration.accel6_start)
+    if action == "capture":
+        return await asyncio.to_thread(session.calibration.accel6_capture,
+                                       str(body.get("face", "")))
+    if action == "apply":
+        return await asyncio.to_thread(session.calibration.accel6_apply)
+    if action == "clear":
+        return await asyncio.to_thread(session.calibration.accel6_clear)
+    return _UNKNOWN_ACTION
+
+
+@app.post("/api/quickcal")
+async def api_quickcal(body: dict) -> dict:
+    """Attitude 0 / Yaw 0 / Yaw Clear(yaw側コマンド行の移植)。"""
+    action = body.get("action")
+    handlers = {
+        "attitude_zero": session.calibration.attitude_zero,
+        "attitude_clear": session.calibration.attitude_zero_clear,
+        "yaw_zero": session.calibration.yaw_zero,
+        "yaw_clear": session.calibration.yaw_zero_clear,
+    }
+    handler = handlers.get(action)
+    if handler is None:
+        return _UNKNOWN_ACTION
+    return await asyncio.to_thread(handler)
+
+
+@app.get("/api/geomag")
+async def api_geomag_status() -> dict:
+    return await asyncio.to_thread(session.calibration.geomag_status)
+
+
+@app.post("/api/geomag")
+async def api_geomag(body: dict) -> dict:
+    action = body.get("action")
+    if action == "select":
+        return await asyncio.to_thread(session.calibration.geomag_select,
+                                       body.get("id"))
+    if action == "apply":
+        return await asyncio.to_thread(session.calibration.geomag_apply)
+    return _UNKNOWN_ACTION
+
+
+@app.get("/api/calprofile")
+async def api_calprofile_status() -> dict:
+    return await asyncio.to_thread(session.calibration.calprofile_status)
+
+
+@app.post("/api/calprofile")
+async def api_calprofile(body: dict) -> dict:
+    action = body.get("action")
+    if action == "save":
+        return await asyncio.to_thread(session.calibration.calprofile_save,
+                                       body.get("name"))
+    if action == "apply":
+        return await asyncio.to_thread(session.calibration.calprofile_apply,
+                                       body.get("name"))
+    if action == "delete":
+        return await asyncio.to_thread(session.calibration.calprofile_delete,
+                                       body.get("name"))
+    return _UNKNOWN_ACTION
+
+
+@app.get("/api/ffprofile")
+async def api_ffprofile_status() -> dict:
+    return await asyncio.to_thread(session.ffprofile.status)
+
+
+@app.post("/api/ffprofile")
+async def api_ffprofile(body: dict) -> dict:
+    action = body.get("action")
+    if action == "extract":
+        return await asyncio.to_thread(
+            session.ffprofile.extract, body.get("folder"), body.get("stems"),
+            body.get("name"), body.get("memo"))
+    if action == "apply":
+        return await asyncio.to_thread(
+            session.ffprofile.apply, body.get("name"), body.get("ff"),
+            body.get("est"), bool(body.get("force")))
+    if action == "mode":
+        return await asyncio.to_thread(session.ffprofile.mode,
+                                       body.get("ff"), body.get("est"))
+    if action == "anchor":
+        return await asyncio.to_thread(session.ffprofile.anchor)
+    if action == "delete":
+        return await asyncio.to_thread(session.ffprofile.delete,
+                                       body.get("name"))
+    return _UNKNOWN_ACTION
+
+
+# ----------------------------------------------------------------------
 # WebSocket
 # ----------------------------------------------------------------------
 
@@ -167,6 +338,32 @@ async def _handle_command(message: dict) -> None:
         await asyncio.to_thread(session.reset)
     elif action == "set_logging":
         await asyncio.to_thread(session.set_logging, bool(message.get("enabled")))
+    elif action == "experiment_activate":
+        await asyncio.to_thread(session.activate_experiment)
+    elif action == "set_yaw_control":
+        await asyncio.to_thread(session.set_yaw_control,
+                                bool(message.get("enabled")))
+    elif action == "circle_start":
+        await asyncio.to_thread(
+            session.circle_start,
+            float(message.get("center_x", 0.0)),
+            float(message.get("center_y", 0.0)),
+            float(message.get("radius_m", 0.0)),
+            float(message.get("period_s", 0.0)),
+            bool(message.get("clockwise", True)),
+            float(message.get("alt_m", 0.0)),
+            bool(message.get("face_tangent", False)))
+    elif action == "circle_stop":
+        await asyncio.to_thread(session.circle_stop)
+    elif action == "motor_start":
+        await asyncio.to_thread(session.motor_start,
+                                float(message.get("duty", 0.0)),
+                                int(message.get("mask", 0x0F)))
+    elif action == "motor_set":
+        await asyncio.to_thread(session.motor_apply,
+                                float(message.get("duty", 0.0)))
+    elif action == "motor_stop":
+        await asyncio.to_thread(session.motor_stop)
     else:
         session.warn(f"不明なコマンド: {action}")
 
@@ -178,9 +375,15 @@ async def _handle_message(message: dict) -> None:
             await _handle_command(message)
         elif msg_type == "setpoint":
             # Posture モード: deg/m → session 層で rad へ変換(非ブロッキング)
+            yaw_deg = message.get("yaw_deg")
             session.set_setpoint_deg(float(message["roll_deg"]),
                                      float(message["pitch_deg"]),
-                                     float(message["alt_m"]))
+                                     float(message["alt_m"]),
+                                     yaw_deg=(None if yaw_deg is None
+                                              else float(yaw_deg)))
+        elif msg_type == "yaw":
+            # 共通ヨー角スライダ(±180°、両モードへ反映。非ブロッキング)
+            session.set_yaw_setpoint_deg(float(message["yaw_deg"]))
         elif msg_type == "target":
             # Position モード: 制御座標系 m(非ブロッキング)
             session.set_target(float(message["x"]),

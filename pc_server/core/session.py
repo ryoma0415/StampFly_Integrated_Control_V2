@@ -29,6 +29,9 @@ from typing import Callable, Optional
 import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from . import config as cfg
+from .calibration import CalibrationManager, ack_detail, ack_ok
+from .experiment import ExperimentHub
+from .ffprofile import FfProfileManager
 from .logger import FlightLogger
 from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
 from .position import PositionController
@@ -37,6 +40,9 @@ from .serial_link import SerialLink, SerialLinkError
 
 MODE_POSTURE = "posture"
 MODE_POSITION = "position"
+MODE_EXPERIMENT = "experiment"   # v2: モーターテスト/スイープ/キャリブ実験
+
+_ALL_MODES = (MODE_POSTURE, MODE_POSITION, MODE_EXPERIMENT)
 
 PHASE_IDLE = "idle"
 PHASE_CONNECTED = "connected"
@@ -137,11 +143,22 @@ class SessionManager:
         self.logger = FlightLogger(
             flush_every_rows=self.server_config["logging"]["flush_every_rows"])
 
+        # v2: 実験モード(モーターテスト/スイープ)+キャリブ/FF プロファイル
+        self.experiment = ExperimentHub(self.server_config, self.serial,
+                                        notify=self.warn)
+        self.calibration = CalibrationManager(self.server_config, self.serial,
+                                              self.experiment, notify=self.info)
+        self.ffprofile = FfProfileManager(self.serial, self.experiment,
+                                          self.calibration, notify=self.warn)
+
         # 受信ディスパッチ登録(ハンドラは RX スレッド上: ブロッキング禁止)
         self.serial.register_handler(proto.MsgType.TLM_STATE, self._on_tlm_state)
         self.serial.register_handler(proto.MsgType.TLM_EVENT, self._on_tlm_event)
         self.serial.register_handler(proto.MsgType.LOG_TEXT, self._on_log_text)
         self.serial.register_handler(proto.MsgType.RLY_STATS, self._on_rly_stats)
+        self.serial.register_handler(proto.MsgType.TLM_EXP, self._on_tlm_exp)
+        self.serial.register_handler(proto.MsgType.TLM_CAL_DATA,
+                                     self._on_tlm_cal_data)
 
         # UI コマンドの直列化(_ui_command デコレータが使用)。supervisor の
         # stop()/teardown とも共有する。self._lock より外側で取得すること
@@ -159,6 +176,8 @@ class SessionManager:
         self._logging_enabled = False
         self._armed_since: Optional[float] = None
         self._link_lost = False
+        # 実験モード: 機体が MOTOR_TEST 状態であることを ACK で確認済みか
+        self._experiment_active = False
 
         # STOP 再送管理: None または {"deadline": t, "resends": n}
         self._stop_pending: Optional[dict] = None
@@ -221,7 +240,13 @@ class SessionManager:
         # 完了まで上り転送はリレー側で拒否されるため、送信スレッド起動より先に行う)
         self._configure_relay_target(airframe)
 
-        self._start_active_sender()
+        with self._lock:
+            mode = self._mode
+        if mode == MODE_EXPERIMENT:
+            # 実験モードで接続: 50Hz 送信は開始せず CMD_MODE(1)+ACK
+            self._enter_experiment()
+        else:
+            self._start_active_sender()
         if self._logging_enabled:
             self._start_log_file()
         self._supervisor_stop.clear()
@@ -468,8 +493,14 @@ class SessionManager:
 
     @_ui_command
     def set_mode(self, mode: str) -> bool:
-        """posture/position モードを切り替える(飛行中は不可)。"""
-        if mode not in (MODE_POSTURE, MODE_POSITION):
+        """posture/position/experiment モードを切り替える(飛行中は不可)。
+
+        experiment 開始(契約 §3.1): 飛行中は拒否 → 50Hz セットポイント送信
+        停止 → CMD_MODE(1) 送信+ACK 確認。experiment 終了: モーター停止確認 →
+        CMD_MODE(0)+ACK → posture/position に復帰(50Hz 送信再開)。
+        未接続時はモードのみ切り替え、CMD_MODE は次の connect で送る。
+        """
+        if mode not in _ALL_MODES:
             self.warn(f"不明なモード: {mode}")
             return False
         with self._lock:
@@ -478,15 +509,81 @@ class SessionManager:
                 return False
             if self._mode == mode:
                 return True
+            previous = self._mode
+        if previous == MODE_EXPERIMENT:
+            # 実験モードからの離脱: モーター停止確認 → CMD_MODE(0)+ACK
+            self._exit_experiment()
         self._stop_active_sender()
         with self._lock:
             self._mode = mode
         if self.serial.is_connected:
-            self._start_active_sender()
+            if mode == MODE_EXPERIMENT:
+                if not self._enter_experiment():
+                    # 機体が MOTOR_TEST に入れなかった → 元のモードへ戻す
+                    with self._lock:
+                        self._mode = previous
+                    if previous != MODE_EXPERIMENT:
+                        self._start_active_sender()
+                    return False
+            else:
+                self._start_active_sender()
             if self._logging_enabled:
                 self._start_log_file()   # ファイル名にモードを含むため切替
         self.info(f"モード: {mode}")
         return True
+
+    @_ui_command
+    def activate_experiment(self) -> bool:
+        """実験モードの再有効化(CMD_STOP 等で機体が WAIT に戻った後の再開)。"""
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_EXPERIMENT:
+            self.warn("実験モードではありません")
+            return False
+        if not self.serial.is_connected:
+            self.warn("未接続のため実験モードを有効化できません")
+            return False
+        return self._enter_experiment()
+
+    def _enter_experiment(self) -> bool:
+        """CMD_MODE(1) を送信し ACK を確認して実験機能を有効化する。"""
+        payload = proto.CmdMode(mode=proto.CmdMode.MODE_MOTOR_TEST).to_payload()
+        try:
+            ack = self.serial.send_with_ack(proto.MsgType.CMD_MODE, payload)
+        except SerialLinkError as exc:
+            self.warn(f"CMD_MODE(MOTOR_TEST) 送信失敗: {exc}")
+            return False
+        if not ack_ok(ack):
+            self.warn(f"実験モードに入れませんでした"
+                      f"(CMD_MODE ACK: {ack_detail(ack)})。"
+                      "機体が WAIT 状態か確認してください")
+            return False
+        with self._lock:
+            self._experiment_active = True
+        self.experiment.activate()
+        self.info("実験モード開始(機体: MOTOR_TEST)")
+        return True
+
+    def _exit_experiment(self) -> None:
+        """実験機能を停止し、接続中なら CMD_MODE(0) で WAIT に戻す。"""
+        self.experiment.deactivate()   # スイープ中断+モーター停止を含む
+        with self._lock:
+            was_active = self._experiment_active
+            self._experiment_active = False
+        if not (was_active and self.serial.is_connected):
+            return
+        payload = proto.CmdMode(mode=proto.CmdMode.MODE_FLIGHT).to_payload()
+        try:
+            ack = self.serial.send_with_ack(proto.MsgType.CMD_MODE, payload)
+        except SerialLinkError as exc:
+            self.warn(f"CMD_MODE(FLIGHT) 送信失敗: {exc}")
+            return
+        if not ack_ok(ack):
+            # 機体側フェイルセーフ(モーター1.5s途絶停止)に任せ、警告のみ
+            self.warn(f"実験モード終了の ACK が確認できません"
+                      f"({ack_detail(ack)})。機体状態を確認してください")
+        else:
+            self.info("実験モード終了(機体: WAIT)")
 
     @_ui_command
     def start(self) -> bool:
@@ -497,6 +594,11 @@ class SessionManager:
             airframe = self._airframe
         if phase != PHASE_CONNECTED:
             self.warn(f"開始できません(phase={phase})")
+            return False
+        if mode == MODE_EXPERIMENT:
+            # 実験モード中は START 不可(契約 §3.1。機体側も MOTOR_TEST 中の
+            # CMD_START を reason=10 で拒否する)
+            self.warn("実験モード中は離陸できません")
             return False
         if airframe is None:
             # 接続後でも PUT /api/airframes で選択中プロファイルが削除/MAC 未設定化
@@ -530,6 +632,17 @@ class SessionManager:
             self.warn("未接続のため停止コマンドを送れません")
             return False
         self.position.set_control_active(False)
+        with self._lock:
+            mode = self._mode
+        if mode == MODE_EXPERIMENT:
+            # 緊急停止: スイープ/シーケンス中断+モーター停止(キープアライブ
+            # が回し続けないよう PC 側状態も落とす)。CMD_STOP で機体は
+            # MOTOR_TEST→WAIT に遷移するため、実験の再開には再有効化が必要。
+            self.experiment.sequence.abort_if_running()
+            self.experiment.sweep.abort_if_running()
+            self.experiment.motor_stop()
+            with self._lock:
+                self._experiment_active = False
         # 再送監視は送信「前」に仕掛ける: 送信直後に届く LANDING イベント
         # (RXスレッド)が _stop_pending を消す方が常に後勝ちになるようにし、
         # 着陸成功後の偽の再送・「応答なし」警告を防ぐ。
@@ -570,17 +683,120 @@ class SessionManager:
             self.logger.stop()
             self.info("ログ停止")
 
-    def set_setpoint_deg(self, roll_deg: float, pitch_deg: float, alt_m: float) -> None:
+    def set_setpoint_deg(self, roll_deg: float, pitch_deg: float, alt_m: float,
+                         yaw_deg: Optional[float] = None) -> None:
         """Posture モードの UI setpoint(deg/m)。rad へ変換して渡す。"""
-        self.posture.set_setpoint(roll_deg * DEG_TO_RAD, pitch_deg * DEG_TO_RAD, alt_m)
+        self.posture.set_setpoint(
+            roll_deg * DEG_TO_RAD, pitch_deg * DEG_TO_RAD, alt_m,
+            yaw_rad=None if yaw_deg is None else yaw_deg * DEG_TO_RAD)
 
     def set_target(self, x: float, y: float, z: float) -> None:
         """Position モードの目標位置(制御座標系 m)。"""
         self.position.set_target(x, y, z)
 
+    def set_yaw_setpoint_deg(self, yaw_deg: float) -> None:
+        """UI ヨー角スライダ(±180°)。両モードのコントローラへ反映する。"""
+        yaw_rad = yaw_deg * DEG_TO_RAD
+        self.posture.set_setpoint_yaw_only(yaw_rad)
+        self.position.set_yaw_setpoint(yaw_rad)
+
+    @_ui_command
+    def set_yaw_control(self, enabled: bool) -> None:
+        """ヨー角制御 ON/OFF(CMD_SETPOINT flags bit1)。"""
+        self.posture.set_yaw_control(enabled)
+        self.position.set_yaw_control(enabled)
+        self.info(f"ヨー角制御: {'ON' if enabled else 'OFF'}")
+
+    # ------------------------------------------------------------------
+    # v2: 円軌道モード(Position タブ)
+    # ------------------------------------------------------------------
+
+    @_ui_command
+    def circle_start(self, center_x: float, center_y: float, radius_m: float,
+                     period_s: float, clockwise: bool, alt_m: float,
+                     face_tangent: bool) -> bool:
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_POSITION:
+            self.warn("円軌道は Position モードでのみ使用できます")
+            return False
+        ok, error = self.position.start_circle(
+            center_x, center_y, radius_m, period_s, clockwise, alt_m,
+            face_tangent, now=self._clock())
+        if not ok:
+            self.warn(f"円軌道を開始できません: {error}")
+            return False
+        direction = "CW" if clockwise else "CCW"
+        self.info(f"円軌道開始: 中心=({center_x:.2f}, {center_y:.2f}) "
+                  f"r={radius_m:.2f}m 周期={period_s:.1f}s {direction} "
+                  f"高度={alt_m:.2f}m"
+                  + ("(進行方向を向く)" if face_tangent else ""))
+        return True
+
+    @_ui_command
+    def circle_stop(self) -> None:
+        self.position.stop_circle()
+        self.info("円軌道停止: 現在目標でホバリングに復帰します")
+
+    # ------------------------------------------------------------------
+    # v2: モーターテスト(Experiment タブ)
+    # ------------------------------------------------------------------
+
+    def _experiment_ready(self) -> Optional[str]:
+        """モーター操作の前提チェック。問題があれば理由を返す。"""
+        with self._lock:
+            mode = self._mode
+            active = self._experiment_active
+        if mode != MODE_EXPERIMENT:
+            return "実験モードではありません"
+        if not self.serial.is_connected:
+            return "未接続です"
+        if not active:
+            return "実験モードが有効化されていません(再有効化してください)"
+        return None
+
+    @_ui_command
+    def motor_start(self, duty: float, mask: int) -> dict:
+        reason = self._experiment_ready()
+        if reason is not None:
+            self.warn(f"モーター開始不可: {reason}")
+            return {"ok": False, "message": reason}
+        return self.experiment.motor_start(duty, mask)
+
+    @_ui_command
+    def motor_apply(self, duty: float) -> dict:
+        reason = self._experiment_ready()
+        if reason is not None:
+            self.warn(f"duty 変更不可: {reason}")
+            return {"ok": False, "message": reason}
+        return self.experiment.motor_apply(duty)
+
+    @_ui_command
+    def motor_stop(self) -> dict:
+        # 停止は前提チェックなしで常に受け付ける(SPACE 緊急停止経路)
+        if not self.serial.is_connected:
+            return {"ok": False, "message": "未接続です"}
+        return self.experiment.motor_stop()
+
+    def sweep_start(self, mask, pattern, notes) -> dict:
+        reason = self._experiment_ready()
+        if reason is not None:
+            return {"ok": False, "message": reason,
+                    **self.experiment.sweep.status()}
+        return self.experiment.sweep.start(mask, pattern=pattern, notes=notes)
+
+    def sequence_start(self, masks, pattern, notes, min_start_vbat) -> dict:
+        reason = self._experiment_ready()
+        if reason is not None:
+            return {"ok": False, "message": reason,
+                    **self.experiment.sequence.status()}
+        return self.experiment.sequence.start(
+            masks, pattern=pattern, notes=notes, min_start_vbat=min_start_vbat)
+
     def shutdown(self) -> None:
         """サーバ終了時の後始末。"""
         self.disconnect()
+        self.experiment.shutdown()
 
     # ==================================================================
     # 内部: 接続まわり
@@ -636,6 +852,9 @@ class SessionManager:
 
     def _teardown_session(self, message: str) -> None:
         self._stop_active_sender()
+        # 実験機能を停止(シリアルはこの後閉じるため CMD_MODE は送らない。
+        # 機体側はモーターコマンド 1.5s 途絶で自動停止する)
+        self.experiment.deactivate()
         self.logger.stop()
         self.serial.disconnect()
         with self._lock:
@@ -645,6 +864,7 @@ class SessionManager:
             self._armed_since = None
             self._mocap_warned = False
             self._mocap_stop_sent = False
+            self._experiment_active = False
         self.position.set_control_active(False)
         self.info(message)
 
@@ -660,16 +880,27 @@ class SessionManager:
 
     def _emit_setpoint(self, roll_rad: float, pitch_rad: float, alt_m: float,
                        meta: dict) -> None:
-        """整形済みセットポイントにバイアスを加算し、送信してログする。"""
+        """整形済みセットポイントにバイアスを加算し、送信してログする。
+
+        v2: ヨー目標は meta("yaw_ref_rad" / "yaw_ctrl_on")で受け取り、
+        ON のとき flags bit1(FLAG_YAW_REF_VALID)を立てて 17B で送信する。
+        OFF のときは yaw_ref=0 / bit1=0(機体は V1 と同一のレートダンピング)。
+        """
         with self._lock:
             bias_roll = self._bias_roll_rad
             bias_pitch = self._bias_pitch_rad
             phase = self._phase
+        yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
+        yaw_ref = float(meta.get("yaw_ref_rad") or 0.0) if yaw_ctrl_on else 0.0
+        flags = proto.CmdSetpoint.FLAG_ALT_REF_VALID
+        if yaw_ctrl_on:
+            flags |= proto.CmdSetpoint.FLAG_YAW_REF_VALID
         setpoint = proto.CmdSetpoint(
             roll_ref=roll_rad + bias_roll,
             pitch_ref=pitch_rad + bias_pitch,
             alt_ref=alt_m,
-            flags=proto.CmdSetpoint.FLAG_ALT_REF_VALID,
+            yaw_ref=yaw_ref,
+            flags=flags,
         )
         seq: Optional[int] = None
         send_success = False
@@ -698,6 +929,11 @@ class SessionManager:
             "alt_ref_m": setpoint.alt_ref,
             "roll_bias_deg": self._bias_roll_rad * RAD_TO_DEG,
             "pitch_bias_deg": self._bias_pitch_rad * RAD_TO_DEG,
+            # v2: ヨー指令(送信した CMD_SETPOINT のヨー目標)
+            "cmd_yaw_ref_rad": setpoint.yaw_ref,
+            "cmd_yaw_ref_deg": setpoint.yaw_ref * RAD_TO_DEG,
+            "yaw_ctrl_on": bool(setpoint.flags
+                                & proto.CmdSetpoint.FLAG_YAW_REF_VALID),
         }
 
         # Position モードの診断列
@@ -720,7 +956,8 @@ class SessionManager:
                     "is_outlier", "used_prediction", "confidence",
                     "consecutive_outliers", "data_source", "filter_threshold",
                     "tracking_valid", "rb_error", "frame_number", "marker_count",
-                    "frame_dt_ms", "mocap_age_ms"):
+                    "frame_dt_ms", "mocap_age_ms",
+                    "mocap_yaw_deg", "traj_mode", "traj_phase_rad"):
             if key in meta:
                 row[key] = meta[key]
         if "marker_count" in meta:
@@ -762,6 +999,18 @@ class SessionManager:
                 "tlm_ay_g": tlm.ay,
                 "tlm_az_g": tlm.az,
                 "tlm_loop_dt_us": tlm.loop_dt_us,
+                # v2: TLM_STATE 末尾拡張(ヨー推定/FF 診断)
+                "tlm_yaw_est_rad": tlm.yaw_est_rad,
+                "tlm_yaw_gyro_int_rad": tlm.yaw_gyro_int_rad,
+                "tlm_yaw_ref_rad": tlm.yaw_ref_rad,
+                "tlm_current_a": tlm.current_a,
+                "tlm_db_hat_x_ut": tlm.db_hat_x_ut,
+                "tlm_db_hat_y_ut": tlm.db_hat_y_ut,
+                "tlm_bm_x_ut": tlm.bm_x_ut,
+                "tlm_bm_y_ut": tlm.bm_y_ut,
+                "tlm_nis": tlm.nis,
+                "tlm_ffg": tlm.ffg,
+                "tlm_ff_status": tlm.ff_status,
             })
         return row
 
@@ -826,6 +1075,22 @@ class SessionManager:
         with self._lock:
             self._rly_stats = stats
             self._rly_stats_t = self._clock()
+
+    def _on_tlm_exp(self, frame: proto.Frame) -> None:
+        """TLM_EXP(実験テレメトリ)→ ExperimentHub へ(RXスレッド上)。"""
+        try:
+            tlm = proto.TlmExp.from_payload(frame.payload)
+        except ValueError:
+            return
+        self.experiment.on_tlm_exp(tlm, frame.seq)
+
+    def _on_tlm_cal_data(self, frame: proto.Frame) -> None:
+        """TLM_CAL_DATA → CalibrationManager へ(RXスレッド上)。"""
+        try:
+            cal = proto.TlmCalData.from_payload(frame.payload)
+        except ValueError:
+            return
+        self.calibration.on_cal_data(cal)
 
     def _update_phase_from_drone(self, state: int, flags: int) -> None:
         """ドローンの報告状態から armed/flying/connected フェーズを更新する。"""
@@ -965,6 +1230,7 @@ class SessionManager:
             rly_stats = self._rly_stats
             rly_stats_t = self._rly_stats_t
             mocap_warned = self._mocap_warned
+            experiment_active = self._experiment_active
 
         # drone: TLM_STATE 全フィールド(角度・角速度は deg 換算)+ fresh。
         # 一度も受信していない間は null — ゼロ値を実測値として配ると UI 側で
@@ -1006,18 +1272,45 @@ class SessionManager:
                 "az": tlm.az,
                 "loop_dt_us": tlm.loop_dt_us,
                 "fresh": (now - tlm_t) <= self._telemetry_fresh_s,
+                # v2: ヨー推定/FF 診断(角度は deg 換算、UI 単位規約)
+                "yaw_est": tlm.yaw_est_rad * RAD_TO_DEG,
+                "yaw_gyro_int": tlm.yaw_gyro_int_rad * RAD_TO_DEG,
+                "yaw_ref": tlm.yaw_ref_rad * RAD_TO_DEG,
+                "current_a": tlm.current_a,
+                "db_hat_x_ut": tlm.db_hat_x_ut,
+                "db_hat_y_ut": tlm.db_hat_y_ut,
+                "bm_x_ut": tlm.bm_x_ut,
+                "bm_y_ut": tlm.bm_y_ut,
+                "nis": tlm.nis,
+                "ffg": tlm.ffg,
+                "ff_status": tlm.ff_status,
+                "ff_mode": tlm.ff_status & proto.TlmState.FF_STATUS_FF_MODE_MASK,
+                "est_mode_ekf": bool(tlm.ff_status
+                                     & proto.TlmState.FF_STATUS_EST_EKF),
+                "anchor_valid": bool(tlm.ff_status
+                                     & proto.TlmState.FF_STATUS_ANCHOR_VALID),
+                "ffcal_loaded": bool(tlm.ff_status
+                                     & proto.TlmState.FF_STATUS_FFCAL_LOADED),
+                "yaw_ctrl_active": bool(
+                    tlm.ff_status & proto.TlmState.FF_STATUS_YAW_CTRL_ACTIVE),
+                "mag_fresh": bool(tlm.ff_status
+                                  & proto.TlmState.FF_STATUS_MAG_FRESH),
             }
 
         # mocap: Position モード時のみ(リジッドボディ未検出なら null)
         mocap = self.position.mocap_snapshot(now) if mode == MODE_POSITION else None
 
         # setpoint: 現在の整形済みセットポイント(バイアス加算前、UI単位)
+        trajectory = None
         if mode == MODE_POSITION:
             roll_rad, pitch_rad, alt_m = self.position.current_setpoint()
+            yaw_rad, yaw_ctrl_on = self.position.yaw_setpoint()
             tx, ty, tz = self.position.get_target()
             target = {"x": tx, "y": ty, "z": tz}
+            trajectory = self.position.trajectory_snapshot()
         else:
             roll_rad, pitch_rad, alt_m = self.posture.current_setpoint()
+            yaw_rad, yaw_ctrl_on = self.posture.yaw_setpoint()
             target = None
 
         relay_stats = None
@@ -1049,7 +1342,10 @@ class SessionManager:
                 "roll_deg": roll_rad * RAD_TO_DEG,
                 "pitch_deg": pitch_rad * RAD_TO_DEG,
                 "alt_m": alt_m,
+                "yaw_deg": yaw_rad * RAD_TO_DEG,
             },
+            "yaw_ctrl_on": yaw_ctrl_on,
+            "trajectory": trajectory,
             "latency_ms": self.serial.latency_ms,
             "relay_stats": relay_stats,
             # リレー鮮度: RLY_STATS(1Hz)の受信時刻ベース。counter が静止していても
@@ -1059,6 +1355,35 @@ class SessionManager:
             "link_stats": self.serial.stats(),
             "mocap_dropout": mocap_warned,
         }
+
+        # 実験モードの状態(UI の Experiment タブが 20Hz で参照)
+        experiment = None
+        if mode == MODE_EXPERIMENT:
+            exp_sample, exp_age = self.experiment.latest_sample()
+            experiment = {
+                "active": experiment_active,
+                "motor": self.experiment.motor_status(),
+                "sweep": self.experiment.sweep.status(),
+                "sequence": self.experiment.sequence.status(),
+                "cal3d": self.experiment.cal3d_status(),
+                "exp_age_s": exp_age,
+                "exp": None if exp_sample is None else {
+                    "current_a": exp_sample["current_a"],
+                    "vbat_v": exp_sample["vbat_v"],
+                    "cv": exp_sample["cv"],
+                    "b_raw": exp_sample["b_raw"],
+                    "b_cal": exp_sample["b_cal"],
+                    "imu_temp_c": exp_sample["imu_temp_c"],
+                    "roll_deg": exp_sample["roll_rad"] * RAD_TO_DEG,
+                    "pitch_deg": exp_sample["pitch_rad"] * RAD_TO_DEG,
+                    "yaw_deg": exp_sample["yaw_rad"] * RAD_TO_DEG,
+                    "duty_cmd": exp_sample["duty_cmd_fw"],
+                    "motors_mask": exp_sample["motors_mask_fw"],
+                    "mag_fresh": exp_sample["mag_fresh"],
+                    "motors_running": exp_sample["motors_running"],
+                },
+            }
+        session["experiment"] = experiment
 
         return {"type": "state",
                 "data": {"drone": drone, "mocap": mocap, "session": session}}

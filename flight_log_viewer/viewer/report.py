@@ -1,0 +1,495 @@
+"""サマリレポート(summary.txt + index.html)と 2 ログ比較レポートの生成。
+
+- 単一ログ: 飛行時間・位置 RMS 誤差・ヨー RMS/最大誤差・ドリフト率・電圧推移
+  などの統計をテキストと HTML(図の index)で出力する。
+- 比較モード: 2 本のログのヨー安定性(RMS / ドリフト率 / NIS / ゲート発火)を
+  並べて比較する HTML と重ね描き図を出力する。
+"""
+
+from __future__ import annotations
+
+import html
+import math
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+
+from . import jp_font
+
+jp_font.setup_japanese_font()
+
+from .constants import (  # noqa: E402
+    LOW_VOLTAGE_THRESHOLD_V,
+    TLM_FLAG_LOW_VOLTAGE,
+)
+from .loader import FlightLog  # noqa: E402
+from .style import legend_dark, new_fig, save_fig  # noqa: E402
+from .yaw_analysis import _SOURCE_INFO, compute_yaw_stats  # noqa: E402
+
+# 図キャプション(ファイル名 → 表示名)
+_FIGURE_CAPTIONS: dict[str, str] = {
+    "01_xy_trajectory.png": "XY 飛行軌跡と目標",
+    "02_attitude.png": "姿勢: 指令 vs 実測",
+    "03_altitude.png": "高度と昇降速度",
+    "04_position_tracking.png": "位置追従(目標 vs 実測)",
+    "05_pid_components.png": "XY PID 成分",
+    "06_duty.png": "モーター duty",
+    "07_power.png": "電源(電圧 / 電流)",
+    "08_latency_loop_dt.png": "通信レイテンシ / 制御周期",
+    "09_mocap_diagnostics.png": "MoCap 診断",
+    "10_yaw_four_sources.png": "ヨー4系統比較",
+    "11_yaw_error.png": "ヨー誤差時系列",
+    "12_ekf_diagnostics.png": "EKF 診断(NIS / b_m / db̂ / ゲート)",
+    "13_ff_status.png": "ff_status タイムライン",
+    "14_yaw_tracking.png": "ヨー指令追従",
+}
+
+
+def _fmt(value: float, digits: int = 2, unit: str = "") -> str:
+    """NaN を「—」にする数値フォーマッタ。"""
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return "—"
+    return f"{value:.{digits}f}{unit}"
+
+
+# ---------------------------------------------------------------------------
+# サマリ統計
+# ---------------------------------------------------------------------------
+
+def compute_summary(log: FlightLog) -> dict:
+    """レポートに載せる統計一式を計算して辞書で返す。"""
+    df = log.df
+    summary: dict = {
+        "log_name": log.name,
+        "mode": log.mode,
+        "rows": len(df),
+        "duration_s": log.duration_s,
+        "flight_time_s": log.flight_time_s(),
+        "yaw": compute_yaw_stats(log),
+        # 位置
+        "pos_rms_x_m": math.nan,
+        "pos_rms_y_m": math.nan,
+        "pos_rms_2d_m": math.nan,
+        "pos_max_2d_m": math.nan,
+        # 電源
+        "voltage_start_v": math.nan,
+        "voltage_end_v": math.nan,
+        "voltage_min_v": math.nan,
+        "low_voltage_rows": 0,
+        "current_mean_a": math.nan,
+        "current_max_a": math.nan,
+        # 通信 / 周期
+        "latency_mean_ms": math.nan,
+        "latency_p95_ms": math.nan,
+        "loop_dt_mean_us": math.nan,
+        "loop_dt_max_us": math.nan,
+    }
+
+    # 位置 RMS(閉ループ制御中の行のみ)
+    if log.has("error_x") and log.has("error_y"):
+        ex = df["error_x"].to_numpy(dtype=float)
+        ey = df["error_y"].to_numpy(dtype=float)
+        mask = np.isfinite(ex) & np.isfinite(ey)
+        if log.has("control_active"):
+            active = df["control_active"].to_numpy(dtype=float)
+            mask &= np.isfinite(active) & (active > 0)
+        if mask.any():
+            summary["pos_rms_x_m"] = float(np.sqrt(np.mean(ex[mask] ** 2)))
+            summary["pos_rms_y_m"] = float(np.sqrt(np.mean(ey[mask] ** 2)))
+            e2d = np.hypot(ex[mask], ey[mask])
+            summary["pos_rms_2d_m"] = float(np.sqrt(np.mean(e2d ** 2)))
+            summary["pos_max_2d_m"] = float(np.max(e2d))
+
+    # 電圧推移
+    if log.has("tlm_voltage_v"):
+        volts = df["tlm_voltage_v"].to_numpy(dtype=float)
+        finite = volts[np.isfinite(volts)]
+        if finite.size:
+            summary["voltage_start_v"] = float(finite[0])
+            summary["voltage_end_v"] = float(finite[-1])
+            summary["voltage_min_v"] = float(np.min(finite))
+    if log.has("tlm_flags"):
+        flags = df["tlm_flags"].to_numpy(dtype=float)
+        finite = np.isfinite(flags)
+        summary["low_voltage_rows"] = int(
+            ((flags[finite].astype(int) & TLM_FLAG_LOW_VOLTAGE) != 0).sum())
+
+    # 電流
+    if log.has("tlm_current_a"):
+        cur = df["tlm_current_a"].to_numpy(dtype=float)
+        finite = cur[np.isfinite(cur)]
+        if finite.size:
+            summary["current_mean_a"] = float(np.mean(finite))
+            summary["current_max_a"] = float(np.max(finite))
+
+    # レイテンシ / 制御周期
+    if log.has("feedback_latency_ms"):
+        lat = df["feedback_latency_ms"].to_numpy(dtype=float)
+        finite = lat[np.isfinite(lat)]
+        if finite.size:
+            summary["latency_mean_ms"] = float(np.mean(finite))
+            summary["latency_p95_ms"] = float(np.percentile(finite, 95))
+    if log.has("tlm_loop_dt_us"):
+        dt = df["tlm_loop_dt_us"].to_numpy(dtype=float)
+        finite = dt[np.isfinite(dt)]
+        if finite.size:
+            summary["loop_dt_mean_us"] = float(np.mean(finite))
+            summary["loop_dt_max_us"] = float(np.max(finite))
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# テキストサマリ
+# ---------------------------------------------------------------------------
+
+def _summary_lines(summary: dict) -> list[str]:
+    """summary.txt 用の行リストを作る。"""
+    yaw = summary["yaw"]
+    lines: list[str] = []
+    lines.append("=" * 64)
+    lines.append(f"フライトログ サマリ: {summary['log_name']}")
+    lines.append(f"生成日時: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("=" * 64)
+    lines.append("")
+    lines.append("【セッション】")
+    lines.append(f"  モード          : {summary['mode']}")
+    lines.append(f"  記録行数        : {summary['rows']} 行 (50Hz)")
+    lines.append(f"  記録時間        : {_fmt(summary['duration_s'], 1, ' s')}")
+    lines.append(f"  飛行時間        : {_fmt(summary['flight_time_s'], 1, ' s')}")
+    lines.append("")
+
+    if math.isfinite(summary["pos_rms_2d_m"]):
+        lines.append("【位置制御(閉ループ区間)】")
+        lines.append(f"  RMS 誤差 X      : {_fmt(summary['pos_rms_x_m'], 3, ' m')}")
+        lines.append(f"  RMS 誤差 Y      : {_fmt(summary['pos_rms_y_m'], 3, ' m')}")
+        lines.append(f"  RMS 誤差 2D     : {_fmt(summary['pos_rms_2d_m'], 3, ' m')}")
+        lines.append(f"  最大誤差 2D     : {_fmt(summary['pos_max_2d_m'], 3, ' m')}")
+        lines.append("")
+
+    ref = yaw.get("reference")
+    if ref is not None and yaw["errors"]:
+        ref_label = _SOURCE_INFO[ref][0]
+        lines.append(f"【ヨー推定(基準: {ref_label})】")
+        for stat in yaw["errors"]:
+            lines.append(
+                f"  {stat.label:<18}: RMS {_fmt(stat.rms_deg, 2, '°'):>9}"
+                f" / 最大 {_fmt(stat.max_abs_deg, 2, '°'):>9}"
+                f" / ドリフト {_fmt(stat.drift_deg_per_min, 2, '°/min'):>12}"
+                f" (n={stat.n})")
+        lines.append("")
+    if math.isfinite(yaw.get("tracking_rms_deg", math.nan)):
+        lines.append("【ヨー指令追従(ヨー制御 ON 区間)】")
+        lines.append(f"  RMS 追従誤差    : {_fmt(yaw['tracking_rms_deg'], 2, '°')}")
+        lines.append(f"  最大追従誤差    : {_fmt(yaw['tracking_max_deg'], 2, '°')}")
+        lines.append("")
+    if math.isfinite(yaw.get("nis_mean", math.nan)) or yaw.get("gate_rates"):
+        lines.append("【EKF 健全性】")
+        lines.append(f"  NIS 平均 / p95 / 最大 : {_fmt(yaw['nis_mean'])} /"
+                     f" {_fmt(yaw['nis_p95'])} / {_fmt(yaw['nis_max'])}")
+        lines.append(f"  ‖b_m‖ 最大            : {_fmt(yaw['bm_max_ut'], 2, ' µT')}")
+        for name, (count, rate) in yaw.get("gate_rates", {}).items():
+            if count > 0:
+                lines.append(f"  ゲート {name:<12}: {count} 行 ({rate:.1f}%)")
+        lines.append("")
+
+    lines.append("【電源】")
+    lines.append(f"  電圧 開始→終了  : {_fmt(summary['voltage_start_v'], 2, ' V')}"
+                 f" → {_fmt(summary['voltage_end_v'], 2, ' V')}"
+                 f" (最低 {_fmt(summary['voltage_min_v'], 2, ' V')})")
+    lines.append(f"  低電圧フラグ行  : {summary['low_voltage_rows']} 行"
+                 f" (しきい値 {LOW_VOLTAGE_THRESHOLD_V} V)")
+    lines.append(f"  電流 平均 / 最大: {_fmt(summary['current_mean_a'], 2, ' A')}"
+                 f" / {_fmt(summary['current_max_a'], 2, ' A')}")
+    lines.append("")
+    lines.append("【通信 / 制御周期】")
+    lines.append(f"  レイテンシ 平均 / p95 : {_fmt(summary['latency_mean_ms'], 1, ' ms')}"
+                 f" / {_fmt(summary['latency_p95_ms'], 1, ' ms')}")
+    lines.append(f"  loop_dt 平均 / 最大   : {_fmt(summary['loop_dt_mean_us'], 0, ' µs')}"
+                 f" / {_fmt(summary['loop_dt_max_us'], 0, ' µs')}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+
+_HTML_STYLE = """
+body { background: #1e1e1e; color: #e5e7eb; font-family: 'Hiragino Sans',
+       'Noto Sans CJK JP', sans-serif; margin: 0; padding: 24px; }
+h1 { font-size: 1.4rem; border-bottom: 2px solid #3b82f6; padding-bottom: 8px; }
+h2 { font-size: 1.1rem; color: #93c5fd; margin-top: 28px; }
+table { border-collapse: collapse; margin: 8px 0 16px; }
+th, td { border: 1px solid #4b5563; padding: 6px 12px; font-size: 0.85rem; }
+th { background: #374151; text-align: left; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.figure { margin: 16px 0; }
+.figure img { max-width: 100%; border: 1px solid #4b5563; border-radius: 4px; }
+.figure .caption { color: #9ca3af; font-size: 0.85rem; margin: 4px 0; }
+.warn { color: #fbbf24; }
+.meta { color: #9ca3af; font-size: 0.8rem; }
+"""
+
+
+def _html_page(title: str, body: str) -> str:
+    return (
+        "<!DOCTYPE html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<title>{html.escape(title)}</title>\n<style>{_HTML_STYLE}</style>\n"
+        f"</head>\n<body>\n{body}\n</body>\n</html>\n"
+    )
+
+
+def _stats_table_html(summary: dict) -> str:
+    """統計テーブル群の HTML 断片を作る。"""
+    yaw = summary["yaw"]
+    parts: list[str] = []
+
+    parts.append("<h2>セッション</h2><table>")
+    parts.append(f"<tr><th>モード</th><td>{html.escape(summary['mode'])}</td></tr>")
+    parts.append(f"<tr><th>記録行数</th><td class='num'>{summary['rows']}</td></tr>")
+    parts.append(f"<tr><th>記録時間</th><td class='num'>{_fmt(summary['duration_s'], 1, ' s')}</td></tr>")
+    parts.append(f"<tr><th>飛行時間</th><td class='num'>{_fmt(summary['flight_time_s'], 1, ' s')}</td></tr>")
+    parts.append("</table>")
+
+    if math.isfinite(summary["pos_rms_2d_m"]):
+        parts.append("<h2>位置制御(閉ループ区間)</h2><table>")
+        parts.append("<tr><th>RMS X</th><th>RMS Y</th><th>RMS 2D</th><th>最大 2D</th></tr>")
+        parts.append(
+            f"<tr><td class='num'>{_fmt(summary['pos_rms_x_m'], 3, ' m')}</td>"
+            f"<td class='num'>{_fmt(summary['pos_rms_y_m'], 3, ' m')}</td>"
+            f"<td class='num'>{_fmt(summary['pos_rms_2d_m'], 3, ' m')}</td>"
+            f"<td class='num'>{_fmt(summary['pos_max_2d_m'], 3, ' m')}</td></tr>")
+        parts.append("</table>")
+
+    ref = yaw.get("reference")
+    if ref is not None and yaw["errors"]:
+        ref_label = _SOURCE_INFO[ref][0]
+        parts.append(f"<h2>ヨー推定(基準: {html.escape(ref_label)})</h2><table>")
+        parts.append("<tr><th>系統</th><th>RMS [°]</th><th>最大 [°]</th>"
+                     "<th>ドリフト [°/min]</th><th>n</th></tr>")
+        for stat in yaw["errors"]:
+            parts.append(
+                f"<tr><td>{html.escape(stat.label)}</td>"
+                f"<td class='num'>{_fmt(stat.rms_deg)}</td>"
+                f"<td class='num'>{_fmt(stat.max_abs_deg)}</td>"
+                f"<td class='num'>{_fmt(stat.drift_deg_per_min, 2)}</td>"
+                f"<td class='num'>{stat.n}</td></tr>")
+        parts.append("</table>")
+        if ref == "madgwick":
+            parts.append("<p class='warn'>※ MoCap 真値が無いため Madgwick を基準に"
+                         "した相対比較です。</p>")
+
+    if math.isfinite(yaw.get("tracking_rms_deg", math.nan)):
+        parts.append("<h2>ヨー指令追従(ON 区間)</h2><table>")
+        parts.append(
+            f"<tr><th>RMS</th><td class='num'>{_fmt(yaw['tracking_rms_deg'], 2, '°')}</td>"
+            f"<th>最大</th><td class='num'>{_fmt(yaw['tracking_max_deg'], 2, '°')}</td></tr>")
+        parts.append("</table>")
+
+    parts.append("<h2>電源 / 通信</h2><table>")
+    parts.append(
+        f"<tr><th>電圧 開始 → 終了(最低)</th><td class='num'>"
+        f"{_fmt(summary['voltage_start_v'], 2, ' V')} → "
+        f"{_fmt(summary['voltage_end_v'], 2, ' V')}"
+        f"({_fmt(summary['voltage_min_v'], 2, ' V')})</td></tr>")
+    parts.append(f"<tr><th>低電圧フラグ行</th><td class='num'>{summary['low_voltage_rows']}</td></tr>")
+    parts.append(
+        f"<tr><th>電流 平均 / 最大</th><td class='num'>"
+        f"{_fmt(summary['current_mean_a'], 2, ' A')} / "
+        f"{_fmt(summary['current_max_a'], 2, ' A')}</td></tr>")
+    parts.append(
+        f"<tr><th>レイテンシ 平均 / p95</th><td class='num'>"
+        f"{_fmt(summary['latency_mean_ms'], 1, ' ms')} / "
+        f"{_fmt(summary['latency_p95_ms'], 1, ' ms')}</td></tr>")
+    parts.append(
+        f"<tr><th>loop_dt 平均 / 最大</th><td class='num'>"
+        f"{_fmt(summary['loop_dt_mean_us'], 0, ' µs')} / "
+        f"{_fmt(summary['loop_dt_max_us'], 0, ' µs')}</td></tr>")
+    parts.append("</table>")
+
+    if yaw.get("gate_rates"):
+        fired = {k: v for k, v in yaw["gate_rates"].items() if v[0] > 0}
+        parts.append("<h2>EKF ゲート発火</h2>")
+        if fired:
+            parts.append("<table><tr><th>ゲート</th><th>行数</th><th>割合</th></tr>")
+            for name, (count, rate) in fired.items():
+                parts.append(f"<tr><td>{html.escape(name)}</td>"
+                             f"<td class='num'>{count}</td>"
+                             f"<td class='num'>{rate:.1f}%</td></tr>")
+            parts.append("</table>")
+        else:
+            parts.append("<p>ゲート発火なし(全区間で磁気更新が正常採用)。</p>")
+
+    return "\n".join(parts)
+
+
+def generate_report(log: FlightLog, out_dir: str | Path,
+                    figure_paths: list[Path] | None = None) -> tuple[Path, Path]:
+    """summary.txt と index.html を out_dir に生成する。
+
+    figure_paths を省略した場合は out_dir 内の PNG を番号順に載せる。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print("\nサマリレポートを生成します...")
+
+    summary = compute_summary(log)
+
+    # summary.txt
+    txt_path = out_dir / "summary.txt"
+    txt_path.write_text("\n".join(_summary_lines(summary)) + "\n", encoding="utf-8")
+    print(f"  保存: {txt_path}")
+
+    # index.html
+    if figure_paths is None:
+        figure_paths = sorted(out_dir.glob("*.png"))
+    body: list[str] = []
+    body.append(f"<h1>フライトログレポート: {html.escape(summary['log_name'])}</h1>")
+    body.append(f"<p class='meta'>生成日時: {datetime.now().isoformat(timespec='seconds')}"
+                f" / 元ファイル: {html.escape(str(log.path))}</p>")
+    for warning in log.warnings:
+        body.append(f"<p class='warn'>警告: {html.escape(warning)}</p>")
+    body.append(_stats_table_html(summary))
+    body.append("<h2>グラフ</h2>")
+    for path in figure_paths:
+        caption = _FIGURE_CAPTIONS.get(path.name, path.stem)
+        body.append(
+            f"<div class='figure'><div class='caption'>{html.escape(caption)}"
+            f" ({html.escape(path.name)})</div>"
+            f"<img src='{html.escape(path.name)}' alt='{html.escape(caption)}'></div>")
+
+    html_path = out_dir / "index.html"
+    html_path.write_text(
+        _html_page(f"フライトログレポート: {summary['log_name']}", "\n".join(body)),
+        encoding="utf-8")
+    print(f"  保存: {html_path}")
+    return txt_path, html_path
+
+
+# ---------------------------------------------------------------------------
+# 2 ログ比較(ヨー安定性)
+# ---------------------------------------------------------------------------
+
+def _fig_compare_yaw(log_a: FlightLog, log_b: FlightLog, out_dir: Path) -> Path | None:
+    """比較図: 両ログのヨー誤差を重ね描き(A=実線 / B=破線)。"""
+    keys = ("madgwick", "ekf", "gyro_int")
+    has_any = False
+    fig, ax = new_fig(figsize=(13.0, 6.0))
+    for log, suffix, linestyle in ((log_a, "A", "-"), (log_b, "B", "--")):
+        for key in keys:
+            col = f"yaw_err_{key}_deg"
+            if col not in log.df.columns or not log.df[col].notna().any():
+                continue
+            label_name, color = _SOURCE_INFO[key]
+            ax.plot(log.t, log.df[col], color=color, linewidth=0.9,
+                    linestyle=linestyle, alpha=0.85,
+                    label=f"[{suffix}] {label_name}")
+            has_any = True
+    if not has_any:
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+        plt.close(fig)
+        return None
+    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.6)
+    ax.set_title(f"ヨー誤差比較  A={log_a.name} / B={log_b.name}", fontsize=13)
+    ax.set_xlabel("時間 [s]", fontsize=11)
+    ax.set_ylabel("誤差 [deg]", fontsize=10)
+    legend_dark(ax, loc="best", ncol=2, fontsize=8)
+    return save_fig(fig, out_dir, "compare_yaw_error.png")
+
+
+def generate_comparison(log_a: FlightLog, log_b: FlightLog,
+                        out_dir: str | Path) -> Path:
+    """2 ログのヨー安定性比較レポート(comparison.html)を生成する。"""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n比較レポートを生成します: A={log_a.name} / B={log_b.name}")
+
+    stats_a = compute_yaw_stats(log_a)
+    stats_b = compute_yaw_stats(log_b)
+    fig_path = _fig_compare_yaw(log_a, log_b, out_dir)
+
+    def _stat_map(stats: dict) -> dict[str, object]:
+        return {s.key: s for s in stats["errors"]}
+
+    map_a, map_b = _stat_map(stats_a), _stat_map(stats_b)
+    keys = [k for k in ("madgwick", "ekf", "gyro_int") if k in map_a or k in map_b]
+
+    body: list[str] = []
+    body.append("<h1>ヨー安定性比較レポート</h1>")
+    body.append(f"<p class='meta'>A: {html.escape(str(log_a.path))}<br>"
+                f"B: {html.escape(str(log_b.path))}<br>"
+                f"生成日時: {datetime.now().isoformat(timespec='seconds')}</p>")
+
+    ref_a = stats_a.get("reference")
+    ref_b = stats_b.get("reference")
+    ref_note = []
+    for name, ref in (("A", ref_a), ("B", ref_b)):
+        if ref is not None:
+            ref_note.append(f"{name}: {_SOURCE_INFO[ref][0]}")
+    body.append(f"<p>誤差基準 — {' / '.join(ref_note) if ref_note else 'なし'}</p>")
+    if ref_a != ref_b:
+        body.append("<p class='warn'>※ 2 ログで誤差基準が異なるため単純比較には"
+                    "注意してください。</p>")
+
+    body.append("<h2>ヨー誤差統計</h2><table>")
+    body.append("<tr><th rowspan='2'>系統</th>"
+                "<th colspan='3'>A: " + html.escape(log_a.name) + "</th>"
+                "<th colspan='3'>B: " + html.escape(log_b.name) + "</th></tr>")
+    body.append("<tr><th>RMS [°]</th><th>最大 [°]</th><th>ドリフト [°/min]</th>"
+                "<th>RMS [°]</th><th>最大 [°]</th><th>ドリフト [°/min]</th></tr>")
+    for key in keys:
+        label = _SOURCE_INFO[key][0]
+        cells = [f"<td>{html.escape(label)}</td>"]
+        for stat_map in (map_a, map_b):
+            stat = stat_map.get(key)
+            if stat is None:
+                cells.append("<td class='num'>—</td>" * 3)
+            else:
+                cells.append(
+                    f"<td class='num'>{_fmt(stat.rms_deg)}</td>"
+                    f"<td class='num'>{_fmt(stat.max_abs_deg)}</td>"
+                    f"<td class='num'>{_fmt(stat.drift_deg_per_min, 2)}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    body.append("</table>")
+
+    body.append("<h2>EKF 健全性</h2><table>")
+    body.append("<tr><th>指標</th><th>A</th><th>B</th></tr>")
+    for label, key, digits, unit in (
+        ("NIS 平均", "nis_mean", 2, ""),
+        ("NIS p95", "nis_p95", 2, ""),
+        ("‖b_m‖ 最大", "bm_max_ut", 2, " µT"),
+        ("ヨー追従 RMS", "tracking_rms_deg", 2, "°"),
+    ):
+        body.append(
+            f"<tr><td>{html.escape(label)}</td>"
+            f"<td class='num'>{_fmt(stats_a.get(key, math.nan), digits, unit)}</td>"
+            f"<td class='num'>{_fmt(stats_b.get(key, math.nan), digits, unit)}</td></tr>")
+    body.append("</table>")
+
+    gate_names = sorted(set(stats_a.get("gate_rates", {})) | set(stats_b.get("gate_rates", {})))
+    fired = [n for n in gate_names
+             if stats_a.get("gate_rates", {}).get(n, (0, 0.0))[0] > 0
+             or stats_b.get("gate_rates", {}).get(n, (0, 0.0))[0] > 0]
+    if fired:
+        body.append("<h2>ゲート発火率</h2><table>")
+        body.append("<tr><th>ゲート</th><th>A</th><th>B</th></tr>")
+        for name in fired:
+            rate_a = stats_a.get("gate_rates", {}).get(name, (0, 0.0))[1]
+            rate_b = stats_b.get("gate_rates", {}).get(name, (0, 0.0))[1]
+            body.append(f"<tr><td>{html.escape(name)}</td>"
+                        f"<td class='num'>{rate_a:.1f}%</td>"
+                        f"<td class='num'>{rate_b:.1f}%</td></tr>")
+        body.append("</table>")
+
+    if fig_path is not None:
+        body.append("<h2>ヨー誤差重ね描き</h2>")
+        body.append(f"<div class='figure'><img src='{html.escape(fig_path.name)}'"
+                    f" alt='ヨー誤差比較'></div>")
+
+    html_path = out_dir / "comparison.html"
+    html_path.write_text(
+        _html_page(f"ヨー安定性比較: {log_a.name} vs {log_b.name}", "\n".join(body)),
+        encoding="utf-8")
+    print(f"  保存: {html_path}")
+    return html_path

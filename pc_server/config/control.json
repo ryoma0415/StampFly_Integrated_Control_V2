@@ -30,5 +30,12 @@
     "confidence_zero_threshold": 0.2,
     "frame_hold_ms": 300
   },
-  "target_default": { "x": 0.0, "y": 0.0, "z": 0.3 }
+  "target_default": { "x": 0.0, "y": 0.0, "z": 0.3 },
+  "trajectory": {
+    "radius_min_m": 0.05,
+    "radius_max_m": 1.5,
+    "period_min_s": 3.0,
+    "period_max_s": 120.0,
+    "center_abs_max_m": 2.0
+  }
 }

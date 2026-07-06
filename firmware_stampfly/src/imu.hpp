@@ -42,5 +42,8 @@ float imu_get_acc_z(void);
 float imu_get_gyro_x(void);
 float imu_get_gyro_y(void);
 float imu_get_gyro_z(void);
+// BMI270 ダイ温度 [℃](raw/512 + 23)。TLM_EXP の熱特性記録用(yaw側から移植)。
+// 読み取り失敗時は NAN を返す。
+float imu_get_temperature(void);
 
 #endif

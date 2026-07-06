@@ -44,6 +44,7 @@
     <nav id="tabbar">
       <button id="tabPosture" class="tab active" data-mode="posture">Posture<span class="tab-jp">姿勢制御</span></button>
       <button id="tabPosition" class="tab" data-mode="position">Position<span class="tab-jp">位置制御</span></button>
+      <button id="tabExperiment" class="tab" data-mode="experiment">Experiment<span class="tab-jp">実験</span></button>
     </nav>
 
     <!-- ---- Posture タブ ---- -->
@@ -74,6 +75,9 @@
         </div>
         <p class="note" id="postureNote">スライダはシリアル接続後に操作できます</p>
       </div>
+
+      <!-- 共通ヨーブロックの装着先(Posture 表示時) -->
+      <div id="yawSlotPosture"></div>
     </div>
 
     <!-- ---- Position タブ ---- -->
@@ -95,6 +99,42 @@
         </div>
       </div>
 
+      <!-- v2: 軌道セレクタ+円軌道パラメータ(契約 §3.3) -->
+      <div class="traj-block">
+        <div class="traj-head">
+          <span class="mlabel">軌道</span>
+          <select id="trajSelect">
+            <option value="hover">ホバリング(固定目標)</option>
+            <option value="circle">円軌道</option>
+          </select>
+          <span id="trajStatus" class="badge b-ok hidden">円軌道 実行中</span>
+        </div>
+        <div id="circleParams" class="circle-params hidden">
+          <div class="target-row">
+            <label>中心 X<input type="number" id="circleCx" step="0.05" value="0.00"><span class="unit">m</span></label>
+            <label>中心 Y<input type="number" id="circleCy" step="0.05" value="0.00"><span class="unit">m</span></label>
+            <label>半径<input type="number" id="circleR" step="0.05" min="0.05" max="1.5" value="0.50"><span class="unit">m</span></label>
+          </div>
+          <div class="target-row">
+            <label>周期<input type="number" id="circlePeriod" step="1" min="3" max="120" value="20"><span class="unit">s</span></label>
+            <label>回転
+              <select id="circleDir">
+                <option value="ccw">CCW(反時計)</option>
+                <option value="cw">CW(時計)</option>
+              </select>
+            </label>
+            <label>高度<input type="number" id="circleAlt" step="0.05" min="0.1" max="1.0" value="0.30"><span class="unit">m</span></label>
+          </div>
+          <label class="switch-label">
+            <input type="checkbox" id="circleFaceTangent">進行方向を向く(ヨー角制御 ON 時のみ有効)
+          </label>
+          <div class="preset-row">
+            <button id="btnCircleStart" class="btn btn-small btn-primary">円軌道開始</button>
+            <button id="btnCircleStop" class="btn btn-small" disabled>停止(ホバ復帰)</button>
+          </div>
+        </div>
+      </div>
+
       <div class="mocap-block">
         <span class="mlabel">MoCap</span>
         <span class="link-ind" id="mocapStatus"><span class="dot"></span><span id="mocapStatusText">未受信</span></span>
@@ -107,6 +147,242 @@
         <span class="mlabel">指令角</span>
         <span class="mono">Roll <span id="cmdRoll">+0.0&deg;</span></span>
         <span class="mono">Pitch <span id="cmdPitch">+0.0&deg;</span></span>
+      </div>
+
+      <!-- 共通ヨーブロックの装着先(Position 表示時) -->
+      <div id="yawSlotPosition"></div>
+    </div>
+
+    <!-- ---- 共通ヨーブロック(JS がアクティブなタブへ移設する) ---- -->
+    <div id="yawBlock" class="yaw-block">
+      <div class="yaw-head">
+        <label class="switch-label">
+          <input type="checkbox" id="yawCtrlToggle" disabled>ヨー角制御
+        </label>
+        <span id="ffWarnBadge" class="badge b-warn hidden" title="ff_mode=0(FF補正なし)のままヨー角制御が ON です。飛行は可能ですが磁気干渉の影響を受けます">FF未適用</span>
+      </div>
+      <div class="slider-row">
+        <span class="slider-name">Yaw</span>
+        <input type="range" id="yawSlider" min="-180" max="180" step="0.1" value="0" disabled>
+        <span class="slider-val mono" id="yawValue">+0.0&deg;</span>
+      </div>
+      <div class="slider-center-row">
+        <button id="btnYawCenter" class="btn btn-small" disabled>ヨー 0&deg;</button>
+      </div>
+      <div id="ffQuickBlock" class="ff-quick hidden">
+        <div class="ff-quick-row">
+          <span class="mlabel">FFプロファイル</span>
+          <select id="ffQuickSelect"></select>
+          <button id="btnFfQuickApply" class="btn btn-small">適用</button>
+        </div>
+        <div id="ffAppliedBanner" class="ff-banner">FF: 未適用</div>
+      </div>
+    </div>
+
+    <!-- ---- Experiment タブ(契約 §3.6) ---- -->
+    <div id="panelExperiment" class="panel">
+      <div class="exp-activate">
+        <span id="expActiveBadge" class="badge b-warn">未有効</span>
+        <button id="btnExpActivate" class="btn btn-small">実験モードを有効化</button>
+        <span class="note">機体が WAIT のとき MOTOR_TEST 状態に入ります(飛行中は不可)</span>
+      </div>
+
+      <p class="note exp-warning">
+        &#x26a0; モーターテスト/スイープは機体を<strong>テープで確実に固定</strong>してから実行してください。
+        リンク断・サーバ停止時は機体側が約1.5秒で自動停止します。
+        <kbd>SPACE</kbd> で即時停止(STOP+モーター停止)。
+      </p>
+      <label class="switch-label fixture-check">
+        <input type="checkbox" id="fixtureCheck">機体をテープで確実に固定したことを確認した
+      </label>
+
+      <!-- モーターテストバー -->
+      <div class="exp-section">
+        <h3>モーターテスト <span class="unit-h">全モーター(FL+FR+RL+RR)</span></h3>
+        <div class="duty-row" id="dutyButtons">
+          <span class="mlabel">Duty</span>
+          <button type="button" class="btn duty-btn" data-duty="0.1">0.1</button>
+          <button type="button" class="btn duty-btn" data-duty="0.2">0.2</button>
+          <button type="button" class="btn duty-btn selected" data-duty="0.3">0.3</button>
+          <button type="button" class="btn duty-btn" data-duty="0.4">0.4</button>
+          <button type="button" class="btn duty-btn" data-duty="0.5">0.5</button>
+          <button type="button" class="btn duty-btn duty-high" data-duty="0.6" disabled>0.6</button>
+          <button type="button" class="btn duty-btn duty-high" data-duty="0.7" disabled>0.7</button>
+          <button type="button" class="btn duty-btn duty-high" data-duty="0.8" disabled>0.8</button>
+          <button type="button" class="btn duty-btn duty-high" data-duty="0.9" disabled>0.9</button>
+          <button type="button" class="btn duty-btn duty-high" data-duty="1.0" disabled>1.0</button>
+        </div>
+        <label class="switch-label">
+          <input type="checkbox" id="highDutyCheck">高出力 0.6〜1.0 を許可(機体固定を再確認)
+        </label>
+        <div class="preset-row">
+          <button id="btnMotorStart" class="btn btn-small btn-primary" disabled>Start</button>
+          <button id="btnMotorApply" class="btn btn-small" disabled>反映</button>
+          <button id="btnMotorStop" class="btn btn-small btn-danger">Stop</button>
+          <span id="motorStatusText" class="mono motor-status">停止</span>
+        </div>
+        <div id="expLive" class="mono exp-live">TLM_EXP: --</div>
+      </div>
+
+      <!-- スイープ -->
+      <div class="exp-section">
+        <h3>電流×磁場スイープ <span class="unit-h">ベンチ計測</span></h3>
+        <div class="sweep-motors">
+          <span class="mlabel">回すモーター</span>
+          <label><input type="checkbox" class="sweep-motor" data-bit="0" checked>FL</label>
+          <label><input type="checkbox" class="sweep-motor" data-bit="1" checked>FR</label>
+          <label><input type="checkbox" class="sweep-motor" data-bit="2" checked>RL</label>
+          <label><input type="checkbox" class="sweep-motor" data-bit="3" checked>RR</label>
+        </div>
+        <div class="sweep-motors">
+          <span class="mlabel">パターン</span>
+          <label><input type="radio" name="sweepPattern" value="updown" checked>往復 0.1→1.0→0.1(推奨)</label>
+          <label><input type="radio" name="sweepPattern" value="up">昇順のみ 0.1→1.0</label>
+        </div>
+        <div class="sweep-notes">
+          <input type="text" id="sweepLocation" placeholder="場所(例: リビング机)" maxlength="100">
+          <input type="text" id="sweepOrientation" placeholder="方位(例: 機首北向き)" maxlength="100">
+          <input type="text" id="sweepMemo" placeholder="備考(電池の状態など)" maxlength="200">
+        </div>
+        <div class="preset-row">
+          <button id="btnSweepStart" class="btn btn-small btn-primary" disabled>&#x25b6; スイープ開始</button>
+          <button id="btnSweepAbort" class="btn btn-small btn-danger" disabled>&#x25a0; 中断</button>
+          <span id="sweepStepTag" class="mono sweep-step"></span>
+        </div>
+        <div class="progress-bar"><div id="sweepProgressFill" class="progress-fill"></div></div>
+        <div class="exp-status-line"><span id="sweepPhase" class="mono">待機中</span></div>
+        <div class="exp-msg" id="sweepMessage">「機体固定」にチェックして開始してください</div>
+        <div class="exp-msg mono" id="sweepResult">直近の保存結果: --</div>
+      </div>
+
+      <!-- 加算性シーケンス -->
+      <div class="exp-section">
+        <h3>加算性シーケンス <span class="unit-h">FL→FR→RL→RR 自動4本</span></h3>
+        <p class="note">各スイープ開始前に電池ガード(vbat &ge; 3.50 V)を確認し、不足時は電池交換待ちで一時停止します(冷却 10s)。パターン・条件記録は上のスイープ設定を使用します。</p>
+        <div class="preset-row">
+          <button id="btnSeqStart" class="btn btn-small btn-primary" disabled>&#x25b6; シーケンス開始</button>
+          <button id="btnSeqResume" class="btn btn-small btn-primary hidden">電池交換完了 → 再開</button>
+          <button id="btnSeqForce" class="btn btn-small hidden">強制再開</button>
+          <button id="btnSeqAbort" class="btn btn-small btn-danger" disabled>&#x25a0; 中断</button>
+          <span id="seqProgress" class="mono sweep-step"></span>
+        </div>
+        <div class="exp-msg" id="seqMessage">--</div>
+        <div class="exp-msg mono" id="seqMeta">保存セット: --</div>
+      </div>
+
+      <!-- キャリブレーション群 -->
+      <div class="exp-grid">
+
+        <div class="exp-card">
+          <h3>3D磁気キャリブレーション</h3>
+          <div class="preset-row wrap">
+            <button class="btn btn-small" data-cal3d-action="start">Start</button>
+            <button class="btn btn-small" data-cal3d-action="stop">Stop</button>
+            <button class="btn btn-small" data-cal3d-action="fit">Fit</button>
+            <button class="btn btn-small btn-primary" data-cal3d-action="apply">Apply</button>
+            <button class="btn btn-small" data-cal3d-action="clear">Clear</button>
+          </div>
+          <div class="progress-bar"><div id="cal3dProgressFill" class="progress-fill"></div></div>
+          <div class="kv-list mono">
+            <span>状態</span><span id="cal3dStatusText">--</span>
+            <span>サンプル</span><span id="cal3dSamples">0</span>
+            <span>Fit RMS</span><span id="cal3dFit">--</span>
+            <span>保存済み</span><span id="cal3dSaved">--</span>
+          </div>
+          <p class="note">Start 後、機体を全方位にゆっくり回してから Fit → Apply。Apply で機体側の FF は自動無効化されます。</p>
+        </div>
+
+        <div class="exp-card">
+          <h3>加速度 6面キャリブレーション</h3>
+          <div class="preset-row wrap">
+            <button class="btn btn-small" data-accel6-action="start">Start</button>
+            <button class="btn btn-small accel6-face" data-accel6-action="capture" data-face="z_pos">+Z</button>
+            <button class="btn btn-small accel6-face" data-accel6-action="capture" data-face="z_neg">-Z</button>
+            <button class="btn btn-small accel6-face" data-accel6-action="capture" data-face="x_pos">+X</button>
+            <button class="btn btn-small accel6-face" data-accel6-action="capture" data-face="x_neg">-X</button>
+            <button class="btn btn-small accel6-face" data-accel6-action="capture" data-face="y_pos">+Y</button>
+            <button class="btn btn-small accel6-face" data-accel6-action="capture" data-face="y_neg">-Y</button>
+            <button class="btn btn-small btn-primary" data-accel6-action="apply">Apply</button>
+            <button class="btn btn-small" data-accel6-action="clear">Clear</button>
+          </div>
+          <div class="kv-list mono">
+            <span>取得済み面</span><span id="accel6Captured">--</span>
+          </div>
+          <div class="exp-msg" id="accel6Msg">各面を静置してからボタンを押してください(約1秒平均)</div>
+        </div>
+
+        <div class="exp-card">
+          <h3>クイック較正</h3>
+          <div class="preset-row wrap">
+            <button class="btn btn-small" data-quickcal-action="attitude_zero">Attitude 0</button>
+            <button class="btn btn-small" data-quickcal-action="attitude_clear">Attitude Clear</button>
+            <button class="btn btn-small" data-quickcal-action="yaw_zero">Yaw 0</button>
+            <button class="btn btn-small" data-quickcal-action="yaw_clear">Yaw Clear</button>
+          </div>
+          <div class="exp-msg" id="quickcalMsg">現在姿勢/ヨーをゼロ基準として機体に設定します</div>
+        </div>
+
+        <div class="exp-card">
+          <h3>地磁気プロファイル</h3>
+          <div class="ff-quick-row">
+            <select id="geomagSelect"></select>
+            <button id="btnGeomagApply" class="btn btn-small">適用</button>
+          </div>
+          <div class="kv-list mono">
+            <span>選択中</span><span id="geomagInfo">--</span>
+          </div>
+          <div class="exp-msg" id="geomagMsg">都道府県を選ぶと保存され、機体へ送信されます</div>
+        </div>
+
+        <div class="exp-card">
+          <h3>キャリブレーション・プロファイル</h3>
+          <div class="ff-quick-row">
+            <input type="text" id="calprofName" placeholder="プロファイル名(例: lab_north)" maxlength="40">
+            <button id="btnCalprofSave" class="btn btn-small">保存(機体から取得)</button>
+          </div>
+          <div class="ff-quick-row">
+            <select id="calprofSelect"></select>
+            <button id="btnCalprofApply" class="btn btn-small btn-primary">適用(NVS書込)</button>
+            <button id="btnCalprofDelete" class="btn btn-small btn-danger">削除</button>
+          </div>
+          <div class="exp-msg" id="calprofMsg">--</div>
+        </div>
+
+        <div class="exp-card">
+          <h3>FFプロファイル(抽出・適用)</h3>
+          <div class="ff-quick-row">
+            <span class="mlabel">抽出元</span>
+            <select id="ffFolderSelect"></select>
+          </div>
+          <div class="ff-quick-row">
+            <input type="text" id="ffExtractName" placeholder="プロファイル名(空欄=フォルダ名)" maxlength="80">
+            <input type="text" id="ffExtractMemo" placeholder="メモ(任意)" maxlength="200">
+            <button id="btnFfExtract" class="btn btn-small">抽出実行</button>
+          </div>
+          <div class="exp-msg mono" id="ffExtractResult">--</div>
+          <hr class="exp-sep">
+          <div class="ff-quick-row">
+            <select id="ffProfileSelect"></select>
+            <button id="btnFfDelete" class="btn btn-small btn-danger">削除</button>
+          </div>
+          <div class="ff-quick-row">
+            <select id="ffModeSelect" title="FF補正方式">
+              <option value="0">FF補正 off</option>
+              <option value="1">方式A(総電流LUT)</option>
+              <option value="2" selected>方式B(LUT+差動)</option>
+            </select>
+            <select id="ffEstSelect" title="ヨー推定器">
+              <option value="0">相補フィルタ</option>
+              <option value="1" selected>EKF</option>
+            </select>
+            <button id="btnFfApply" class="btn btn-small btn-primary">適用</button>
+            <button id="btnFfMode" class="btn btn-small">モードのみ変更</button>
+            <button id="btnFfAnchor" class="btn btn-small">アンカー再取得</button>
+          </div>
+          <div class="ff-banner" id="ffAppliedExp">FF: 未適用</div>
+          <div class="exp-msg" id="ffApplyMsg">--</div>
+        </div>
+
       </div>
     </div>
   </section>
@@ -136,6 +412,24 @@
         <span class="gname">Yaw</span>
         <div class="bar bipolar"><div class="bar-fill yaw" id="attYawBar"></div><div class="center-line"></div></div>
         <span class="gval mono" id="attYawNum">--.-</span>
+      </div>
+    </div>
+
+    <!-- v2: ヨー推定モニタ+EKF健全性バッジ -->
+    <div class="mon-group">
+      <h3>ヨー推定 <span class="unit-h">deg</span> <span id="ekfBadge" class="badge hidden"></span></h3>
+      <div class="kv-list mono yaw-mon">
+        <span>Madgwick</span><span id="yawMadgwick">--.-</span>
+        <span>EKF</span><span id="yawEkf">--.-</span>
+        <span>ジャイロ積算</span><span id="yawGyroInt">--.-</span>
+        <span id="yawMocapLabel" class="hidden">MoCap</span><span id="yawMocap" class="hidden">--.-</span>
+        <span>目標(適用中)</span><span id="yawRefMon">--.-</span>
+      </div>
+      <div class="kv-list mono yaw-mon sub">
+        <span>NIS</span><span id="nisMon">--</span>
+        <span>ffg</span><span id="ffgMon">--</span>
+        <span>電流</span><span id="currentMon">-- A</span>
+        <span>FF状態</span><span id="ffModeMon">--</span>
       </div>
     </div>
 
@@ -178,7 +472,7 @@
 
 <!-- ======== フッタ: 緊急停止ヒント ======== -->
 <footer id="footer">
-  <span id="spaceHint"><kbd>SPACE</kbd> どこからでも緊急停止(STOP)</span>
+  <span id="spaceHint"><kbd>SPACE</kbd> どこからでも緊急停止(STOP。実験中はモーター停止も送信)</span>
 </footer>
 
 <!-- ======== 機体プロファイル編集モーダル ======== -->

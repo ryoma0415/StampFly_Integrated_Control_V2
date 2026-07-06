@@ -1,6 +1,6 @@
 """StampFly Integrated Control — 通信プロトコル(Python実装)。
 
-docs/PROTOCOL.md v1 が唯一の正(single source of truth)。
+docs/PROTOCOL.md v2 が唯一の正(single source of truth)。
 C++実装 ``stampfly_protocol.hpp`` とのバイト互換は ``test_vectors.json`` と
 ``tests/`` により強制される。
 
@@ -26,7 +26,7 @@ from typing import Callable, Optional
 # 定数(PROTOCOL.md 「論理フレーム」「トランスポート」)
 # ---------------------------------------------------------------------------
 
-PROTOCOL_VERSION = 0x01
+PROTOCOL_VERSION = 0x02
 
 FRAME_HEADER_SIZE = 7          # ver(1) + type(1) + seq(4) + len(1)
 FRAME_CRC_SIZE = 2
@@ -50,9 +50,28 @@ class MsgType(IntEnum):
     CMD_STOP = 0x11
     CMD_SETPOINT = 0x12
     CMD_RESET = 0x13
+    CMD_MODE = 0x14
+    CMD_MOTOR_RUN = 0x15
+    CMD_MOTOR_STOP = 0x16
+    CMD_CAL_GET = 0x17
+    CMD_MAG3D_SET = 0x18
+    CMD_ACCEL6_SET = 0x19
+    CMD_ATTMOUNT_SET = 0x1A
+    CMD_YAWZERO_SET = 0x1B
+    CMD_GEOMAG_SET = 0x1C
+    CMD_FF_BEGIN = 0x1D
+    CMD_FF_LUT = 0x1E
+    CMD_FF_MOT = 0x1F
+    CMD_FF_AUX = 0x20
+    CMD_FF_COMMIT = 0x21
+    CMD_FF_MODE = 0x22
+    CMD_FF_ANCHOR = 0x23
     # 下り(ドローン -> PC): 0x30–0x4F
     TLM_STATE = 0x30
     TLM_EVENT = 0x31
+    TLM_ACK = 0x32
+    TLM_EXP = 0x33
+    TLM_CAL_DATA = 0x34
     # ログ(リレー/ドローン -> PC)
     LOG_TEXT = 0x40
     # リレー宛/発: 0x50–0x5F
@@ -86,6 +105,7 @@ class FlightState(IntEnum):
     HOVER = 4
     LANDING = 5
     COMPLETE = 6
+    MOTOR_TEST = 7   # v2: モーターテストモード(AUTO_MOTOR_TEST)
 
 
 class Reason(IntEnum):
@@ -100,6 +120,7 @@ class Reason(IntEnum):
     LINK_LOSS = 8
     RESET_CMD = 9
     START_REJECTED_NOT_READY = 10
+    MODE_CHANGE = 11   # v2: CMD_MODE による WAIT<->MOTOR_TEST 遷移
 
 
 class ParseStatus(IntEnum):
@@ -227,7 +248,8 @@ def parse_frame(data: bytes) -> tuple[ParseStatus, Optional[Frame]]:
 
     判定順: 構造(BAD_LEN)→ CRC(BAD_CRC)→ バージョン(BAD_VER)。
     CRC を ver 判定より先に行うのは、CRC不一致フレームの ver バイト自体が
-    信用できないため(CRC を通過して ver!=1 のものだけが本当の別バージョン)。
+    信用できないため(CRC を通過して ver!=2 のものだけが本当の別バージョン。
+    v1 機器の混在は ver_errors として可視化される)。
     """
     data = bytes(data)
     if len(data) < FRAME_OVERHEAD:
@@ -261,9 +283,25 @@ def encode_wire(msg_type: int, seq: int, payload: bytes = b"") -> bytes:
 # 各 from_payload は長さを厳格に検証し、不一致は ValueError。
 # ---------------------------------------------------------------------------
 
-_CMD_SETPOINT_FMT = "<fffB"
+_CMD_SETPOINT_FMT = "<ffffB"
+_CMD_MODE_FMT = "<B"
+_CMD_MOTOR_RUN_FMT = "<fB"
+_CMD_MAG3D_SET_FMT = "<B3f9f"
+_CMD_ACCEL6_SET_FMT = "<B3f3f"
+_CMD_ATTMOUNT_SET_FMT = "<Bff"
+_CMD_YAWZERO_SET_FMT = "<Bf"
+_CMD_GEOMAG_SET_FMT = "<5f"
+_CMD_FF_BEGIN_FMT = "<B"
+_CMD_FF_LUT_FMT = "<B4f"
+_CMD_FF_MOT_FMT = "<B3f3f"
+_CMD_FF_AUX_FMT = "<f"
+_CMD_FF_COMMIT_FMT = "<I"
+_CMD_FF_MODE_FMT = "<BB"
 _TLM_EVENT_FMT = "<BBBBf"
-_TLM_STATE_FMT = "<IIBBB21fH"
+_TLM_STATE_FMT = "<IIBBB21fH9fBB"
+_TLM_ACK_FMT = "<BIB"
+_TLM_EXP_FMT = "<I20fBB"
+_TLM_CAL_DATA_FMT = "<B26fBIBB"
 _RLY_SET_TARGET_FMT = "<6sB"
 _RLY_TARGET_ACK_FMT = "<B6sB"
 _RLY_STATS_FMT = "<IIIIII"
@@ -271,9 +309,25 @@ _RLY_PONG_FMT = "<I"
 
 # PROTOCOL.md 記載のペイロードサイズと一致することを import 時に強制
 # (C++ 側の static_assert に対応)
-assert struct.calcsize(_CMD_SETPOINT_FMT) == 13
+assert struct.calcsize(_CMD_SETPOINT_FMT) == 17
+assert struct.calcsize(_CMD_MODE_FMT) == 1
+assert struct.calcsize(_CMD_MOTOR_RUN_FMT) == 5
+assert struct.calcsize(_CMD_MAG3D_SET_FMT) == 49
+assert struct.calcsize(_CMD_ACCEL6_SET_FMT) == 25
+assert struct.calcsize(_CMD_ATTMOUNT_SET_FMT) == 9
+assert struct.calcsize(_CMD_YAWZERO_SET_FMT) == 5
+assert struct.calcsize(_CMD_GEOMAG_SET_FMT) == 20
+assert struct.calcsize(_CMD_FF_BEGIN_FMT) == 1
+assert struct.calcsize(_CMD_FF_LUT_FMT) == 17
+assert struct.calcsize(_CMD_FF_MOT_FMT) == 25
+assert struct.calcsize(_CMD_FF_AUX_FMT) == 4
+assert struct.calcsize(_CMD_FF_COMMIT_FMT) == 4
+assert struct.calcsize(_CMD_FF_MODE_FMT) == 2
 assert struct.calcsize(_TLM_EVENT_FMT) == 8
-assert struct.calcsize(_TLM_STATE_FMT) == 97
+assert struct.calcsize(_TLM_STATE_FMT) == 135
+assert struct.calcsize(_TLM_ACK_FMT) == 6
+assert struct.calcsize(_TLM_EXP_FMT) == 86
+assert struct.calcsize(_TLM_CAL_DATA_FMT) == 112
 assert struct.calcsize(_RLY_SET_TARGET_FMT) == 7
 assert struct.calcsize(_RLY_TARGET_ACK_FMT) == 8
 assert struct.calcsize(_RLY_STATS_FMT) == 24
@@ -287,19 +341,24 @@ def _check_len(name: str, data: bytes, expected: int) -> None:
 
 @dataclass
 class CmdSetpoint:
-    """0x12 CMD_SETPOINT(13B)— 姿勢+高度目標。ハートビートを兼ねる(50Hz)。"""
+    """0x12 CMD_SETPOINT(17B)— 姿勢+高度+ヨー目標。ハートビートを兼ねる(50Hz)。
+
+    v2: yaw_ref(±π、機体ヨー角目標)と flags bit1(yaw_ref 有効)を追加。
+    """
     roll_ref: float = 0.0    # rad
     pitch_ref: float = 0.0   # rad
     alt_ref: float = 0.0     # m
-    flags: int = 0           # bit0 = alt_ref 有効(0なら現在の alt_ref 維持)
+    yaw_ref: float = 0.0     # rad(±π、機体ヨー角目標)
+    flags: int = 0           # bit0 = alt_ref 有効、bit1 = yaw_ref 有効(=ヨー角制御ON)
 
     TYPE = MsgType.CMD_SETPOINT
-    PAYLOAD_SIZE = 13
+    PAYLOAD_SIZE = 17
     FLAG_ALT_REF_VALID = 0x01
+    FLAG_YAW_REF_VALID = 0x02
 
     def to_payload(self) -> bytes:
         return struct.pack(_CMD_SETPOINT_FMT, self.roll_ref, self.pitch_ref,
-                           self.alt_ref, self.flags)
+                           self.alt_ref, self.yaw_ref, self.flags)
 
     @classmethod
     def from_payload(cls, data: bytes) -> "CmdSetpoint":
@@ -308,8 +367,298 @@ class CmdSetpoint:
 
 
 @dataclass
+class CmdMode:
+    """0x14 CMD_MODE(1B)— WAIT->MOTOR_TEST(mode=1)/ MOTOR_TEST->WAIT(mode=0)。
+
+    他状態では TLM_ACK status=bad_state。
+    """
+    mode: int = 0
+
+    TYPE = MsgType.CMD_MODE
+    PAYLOAD_SIZE = 1
+    MODE_FLIGHT = 0
+    MODE_MOTOR_TEST = 1
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_MODE_FMT, self.mode)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdMode":
+        _check_len("CMD_MODE", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_MODE_FMT, data))
+
+
+@dataclass
+class CmdMotorRun:
+    """0x15 CMD_MOTOR_RUN(5B)— MOTOR_TEST 状態のみ。0.4s 周期キープアライブ。
+
+    機体は 1.5s 途絶で自動停止。ソフトスタート 2.0duty/s。
+    """
+    duty: float = 0.0    # 0–1
+    mask: int = 0        # bit0=FL, bit1=FR, bit2=RL, bit3=RR
+
+    TYPE = MsgType.CMD_MOTOR_RUN
+    PAYLOAD_SIZE = 5
+    MASK_FL = 0x01
+    MASK_FR = 0x02
+    MASK_RL = 0x04
+    MASK_RR = 0x08
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_MOTOR_RUN_FMT, self.duty, self.mask)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdMotorRun":
+        _check_len("CMD_MOTOR_RUN", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_MOTOR_RUN_FMT, data))
+
+
+@dataclass
+class CmdMag3dSet:
+    """0x18 CMD_MAG3D_SET(49B)— 3D磁気キャリブ設定。valid=0 でクリア。
+
+    適用時: NVS 永続化+FF 自動無効(ff_mode=0)+アンカー破棄+ヨー推定器再シード。
+    """
+    valid: int = 0
+    offset: tuple = (0.0, 0.0, 0.0)   # µT
+    matrix: tuple = (0.0,) * 9        # 行優先
+
+    TYPE = MsgType.CMD_MAG3D_SET
+    PAYLOAD_SIZE = 49
+
+    def to_payload(self) -> bytes:
+        if len(self.offset) != 3 or len(self.matrix) != 9:
+            raise ValueError("CMD_MAG3D_SET: offset は 3 要素、matrix は 9 要素")
+        return struct.pack(_CMD_MAG3D_SET_FMT, self.valid,
+                           *self.offset, *self.matrix)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdMag3dSet":
+        _check_len("CMD_MAG3D_SET", data, cls.PAYLOAD_SIZE)
+        vals = struct.unpack(_CMD_MAG3D_SET_FMT, data)
+        return cls(valid=vals[0], offset=tuple(vals[1:4]), matrix=tuple(vals[4:13]))
+
+
+@dataclass
+class CmdAccel6Set:
+    """0x19 CMD_ACCEL6_SET(25B)— 加速度6面キャリブ設定。適用時に姿勢参照リセット。"""
+    valid: int = 0
+    offset: tuple = (0.0, 0.0, 0.0)   # g
+    scale: tuple = (0.0, 0.0, 0.0)
+
+    TYPE = MsgType.CMD_ACCEL6_SET
+    PAYLOAD_SIZE = 25
+
+    def to_payload(self) -> bytes:
+        if len(self.offset) != 3 or len(self.scale) != 3:
+            raise ValueError("CMD_ACCEL6_SET: offset / scale は各 3 要素")
+        return struct.pack(_CMD_ACCEL6_SET_FMT, self.valid,
+                           *self.offset, *self.scale)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdAccel6Set":
+        _check_len("CMD_ACCEL6_SET", data, cls.PAYLOAD_SIZE)
+        vals = struct.unpack(_CMD_ACCEL6_SET_FMT, data)
+        return cls(valid=vals[0], offset=tuple(vals[1:4]), scale=tuple(vals[4:7]))
+
+
+@dataclass
+class CmdAttmountSet:
+    """0x1A CMD_ATTMOUNT_SET(9B)— 姿勢マウントオフセット設定。"""
+    valid: int = 0
+    roll_rad: float = 0.0
+    pitch_rad: float = 0.0
+
+    TYPE = MsgType.CMD_ATTMOUNT_SET
+    PAYLOAD_SIZE = 9
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_ATTMOUNT_SET_FMT, self.valid,
+                           self.roll_rad, self.pitch_rad)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdAttmountSet":
+        _check_len("CMD_ATTMOUNT_SET", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_ATTMOUNT_SET_FMT, data))
+
+
+@dataclass
+class CmdYawzeroSet:
+    """0x1B CMD_YAWZERO_SET(5B)— ヨーゼロオフセット設定。valid=0 でクリア。"""
+    valid: int = 0
+    offset_rad: float = 0.0
+
+    TYPE = MsgType.CMD_YAWZERO_SET
+    PAYLOAD_SIZE = 5
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_YAWZERO_SET_FMT, self.valid, self.offset_rad)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdYawzeroSet":
+        _check_len("CMD_YAWZERO_SET", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_YAWZERO_SET_FMT, data))
+
+
+@dataclass
+class CmdGeomagSet:
+    """0x1C CMD_GEOMAG_SET(20B)— 地磁気プロファイル設定(NVS 永続化)。"""
+    declination_east_deg: float = 0.0   # 偏角(東向き正)[deg]
+    inclination_deg: float = 0.0        # 伏角 [deg]
+    horizontal_ut: float = 0.0          # 水平分力 [µT]
+    vertical_ut: float = 0.0            # 鉛直分力 [µT]
+    total_ut: float = 0.0               # 全磁力 [µT]
+
+    TYPE = MsgType.CMD_GEOMAG_SET
+    PAYLOAD_SIZE = 20
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_GEOMAG_SET_FMT,
+                           self.declination_east_deg, self.inclination_deg,
+                           self.horizontal_ut, self.vertical_ut, self.total_ut)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdGeomagSet":
+        _check_len("CMD_GEOMAG_SET", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_GEOMAG_SET_FMT, data))
+
+
+@dataclass
+class CmdFfBegin:
+    """0x1D CMD_FF_BEGIN(1B)— FF 係数ステージング開始(nlut は 4–24)。"""
+    nlut: int = 0
+
+    TYPE = MsgType.CMD_FF_BEGIN
+    PAYLOAD_SIZE = 1
+    NLUT_MIN = 4
+    NLUT_MAX = 24
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FF_BEGIN_FMT, self.nlut)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFfBegin":
+        _check_len("CMD_FF_BEGIN", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FF_BEGIN_FMT, data))
+
+
+@dataclass
+class CmdFfLut:
+    """0x1E CMD_FF_LUT(17B)— FF LUT 点(電流 → 磁気補正ベクトル)。"""
+    idx: int = 0         # LUT インデックス(0 <= idx < nlut)
+    i_a: float = 0.0     # 電流 [A]
+    db_x: float = 0.0    # 磁気補正 x [µT]
+    db_y: float = 0.0
+    db_z: float = 0.0
+
+    TYPE = MsgType.CMD_FF_LUT
+    PAYLOAD_SIZE = 17
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FF_LUT_FMT, self.idx, self.i_a,
+                           self.db_x, self.db_y, self.db_z)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFfLut":
+        _check_len("CMD_FF_LUT", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FF_LUT_FMT, data))
+
+
+@dataclass
+class CmdFfMot:
+    """0x1F CMD_FF_MOT(25B)— FF モーター係数(idx: 0=FL, 1=FR, 2=RL, 3=RR)。"""
+    idx: int = 0
+    a_tilde: tuple = (0.0, 0.0, 0.0)   # 単位差分磁気ベクトル
+    c2: float = 0.0                    # duty->電流 2次係数
+    c1: float = 0.0
+    c0: float = 0.0
+
+    TYPE = MsgType.CMD_FF_MOT
+    PAYLOAD_SIZE = 25
+    MOTOR_FL = 0
+    MOTOR_FR = 1
+    MOTOR_RL = 2
+    MOTOR_RR = 3
+
+    def to_payload(self) -> bytes:
+        if len(self.a_tilde) != 3:
+            raise ValueError("CMD_FF_MOT: a_tilde は 3 要素")
+        return struct.pack(_CMD_FF_MOT_FMT, self.idx, *self.a_tilde,
+                           self.c2, self.c1, self.c0)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFfMot":
+        _check_len("CMD_FF_MOT", data, cls.PAYLOAD_SIZE)
+        vals = struct.unpack(_CMD_FF_MOT_FMT, data)
+        return cls(idx=vals[0], a_tilde=tuple(vals[1:4]),
+                   c2=vals[4], c1=vals[5], c0=vals[6])
+
+
+@dataclass
+class CmdFfAux:
+    """0x20 CMD_FF_AUX(4B)— ベンチ参考アイドル電流。"""
+    iid_a: float = 0.0   # [A]
+
+    TYPE = MsgType.CMD_FF_AUX
+    PAYLOAD_SIZE = 4
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FF_AUX_FMT, self.iid_a)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFfAux":
+        _check_len("CMD_FF_AUX", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FF_AUX_FMT, data))
+
+
+@dataclass
+class CmdFfCommit:
+    """0x21 CMD_FF_COMMIT(4B)— CRC-32(IEEE, zlib 互換, float32 LE 連結)照合
+    → NVS 永続化。冪等。"""
+    crc32: int = 0
+
+    TYPE = MsgType.CMD_FF_COMMIT
+    PAYLOAD_SIZE = 4
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FF_COMMIT_FMT, self.crc32)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFfCommit":
+        _check_len("CMD_FF_COMMIT", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FF_COMMIT_FMT, data))
+
+
+@dataclass
+class CmdFfMode:
+    """0x22 CMD_FF_MODE(2B)— ff_mode / est_mode の実行時切替(NVS 永続化)。"""
+    ff_mode: int = 0    # 0=off, 1=A, 2=B
+    est_mode: int = 0   # 0=補正相補フィルタ, 1=EKF
+
+    TYPE = MsgType.CMD_FF_MODE
+    PAYLOAD_SIZE = 2
+    FF_MODE_OFF = 0
+    FF_MODE_A = 1
+    FF_MODE_B = 2
+    EST_MODE_COMPLEMENTARY = 0
+    EST_MODE_EKF = 1
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FF_MODE_FMT, self.ff_mode, self.est_mode)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFfMode":
+        _check_len("CMD_FF_MODE", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FF_MODE_FMT, data))
+
+
+@dataclass
 class TlmState:
-    """0x30 TLM_STATE(97B)— フル状態テレメトリ(25Hz)。"""
+    """0x30 TLM_STATE(135B)— フル状態テレメトリ(25Hz)。
+
+    v2: 末尾追加のみ(既存オフセット 0–96 は v1 と不変。serial_link.py が
+    seq_echo を先頭オフセット直読みするため末尾追加限定)。
+    """
     seq_echo: int = 0        # 最後に適用した CMD_SETPOINT の seq(未受信なら0)
     elapsed_ms: int = 0      # 起動からの経過 [ms]
     state: int = 0           # FlightState
@@ -337,12 +686,31 @@ class TlmState:
     ay: float = 0.0
     az: float = 0.0
     loop_dt_us: int = 0        # µs(直近の実測制御周期)
+    # --- v2 追加(オフセット 97 以降) ---
+    yaw_est_rad: float = 0.0       # rad(アクティブ推定器ヨー。est_mode=1 なら EKF ψ)
+    yaw_gyro_int_rad: float = 0.0  # rad(Z軸角速度の単純積算 400Hz、ahrs_reset でゼロ)
+    yaw_ref_rad: float = 0.0       # rad(適用中ヨー目標。ラッチ後含む。制御 off 時 0)
+    current_a: float = 0.0         # A(総電流、20Hz 更新)
+    db_hat_x_ut: float = 0.0       # µT(FF 補正ベクトル x)
+    db_hat_y_ut: float = 0.0       # µT(同 y)
+    bm_x_ut: float = 0.0           # µT(EKF 磁気バイアス状態 x)
+    bm_y_ut: float = 0.0           # µT(同 y)
+    nis: float = 0.0               # 直近 EKF 更新の NIS
+    ffg: int = 0                   # EKF ゲート/健全性ビット(yaw側 ffg 定義踏襲)
+    ff_status: int = 0             # FF_STATUS_* ビット
 
     TYPE = MsgType.TLM_STATE
-    PAYLOAD_SIZE = 97
+    PAYLOAD_SIZE = 135
     FLAG_LOW_VOLTAGE = 0x01
     FLAG_SETPOINT_FRESH = 0x02
     FLAG_FLYING = 0x04
+    # ff_status ビット定義(v2)
+    FF_STATUS_FF_MODE_MASK = 0x03     # bit0-1: ff_mode(0-2)
+    FF_STATUS_EST_EKF = 0x04          # bit2: est_mode(1=EKF)
+    FF_STATUS_ANCHOR_VALID = 0x08     # bit3
+    FF_STATUS_FFCAL_LOADED = 0x10     # bit4
+    FF_STATUS_YAW_CTRL_ACTIVE = 0x20  # bit5
+    FF_STATUS_MAG_FRESH = 0x40        # bit6
 
     def to_payload(self) -> bytes:
         return struct.pack(
@@ -355,7 +723,13 @@ class TlmState:
             self.alt_velocity, self.z_dot_ref, self.voltage,
             self.duty_fr, self.duty_fl, self.duty_rr, self.duty_rl,
             self.ax, self.ay, self.az,
-            self.loop_dt_us)
+            self.loop_dt_us,
+            self.yaw_est_rad, self.yaw_gyro_int_rad, self.yaw_ref_rad,
+            self.current_a,
+            self.db_hat_x_ut, self.db_hat_y_ut,
+            self.bm_x_ut, self.bm_y_ut,
+            self.nis,
+            self.ffg, self.ff_status)
 
     @classmethod
     def from_payload(cls, data: bytes) -> "TlmState":
@@ -383,6 +757,147 @@ class TlmEvent:
     def from_payload(cls, data: bytes) -> "TlmEvent":
         _check_len("TLM_EVENT", data, cls.PAYLOAD_SIZE)
         return cls(*struct.unpack(_TLM_EVENT_FMT, data))
+
+
+@dataclass
+class TlmAck:
+    """0x32 TLM_ACK(6B)— 0x14–0x23 コマンドへの応答。"""
+    acked_type: int = 0   # 応答対象のメッセージ型
+    acked_seq: int = 0    # 応答対象フレームの seq
+    status: int = 0       # STATUS_*
+
+    TYPE = MsgType.TLM_ACK
+    PAYLOAD_SIZE = 6
+    STATUS_OK = 0
+    STATUS_BAD_STATE = 1
+    STATUS_INVALID_ARG = 2
+    STATUS_CRC_MISMATCH = 3
+    STATUS_BUSY = 4
+    STATUS_INCOMPLETE = 5
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_TLM_ACK_FMT, self.acked_type, self.acked_seq,
+                           self.status)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "TlmAck":
+        _check_len("TLM_ACK", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_TLM_ACK_FMT, data))
+
+
+@dataclass
+class TlmExp:
+    """0x33 TLM_EXP(86B)— 実験テレメトリ。MOTOR_TEST 状態でのみ 25Hz 送出
+    (TLM_STATE と 8tick 位相をずらす)。"""
+    elapsed_ms: int = 0      # 起動からの経過 [ms]
+    current_a: float = 0.0   # A(INA3221 CH2 総電流)
+    vbat_v: float = 0.0      # V
+    shunt_uv: float = 0.0    # µV
+    bx_raw: float = 0.0      # µT(RHALL補償+軸変換後・mag3D 前)
+    by_raw: float = 0.0
+    bz_raw: float = 0.0
+    bx_cal: float = 0.0      # µT(mag3D 後)
+    by_cal: float = 0.0
+    bz_cal: float = 0.0
+    imu_temp_c: float = 0.0  # ℃
+    roll: float = 0.0        # rad(Madgwick)
+    pitch: float = 0.0
+    yaw: float = 0.0
+    p: float = 0.0           # rad/s
+    q: float = 0.0
+    r: float = 0.0
+    ax: float = 0.0          # g(フィルタ後)
+    ay: float = 0.0
+    az: float = 0.0
+    duty_cmd: float = 0.0    # モーターテスト指令 duty(0–1)
+    motors_mask: int = 0     # CmdMotorRun.MASK_* と同ビット割り
+    flags: int = 0           # FLAG_*
+
+    TYPE = MsgType.TLM_EXP
+    PAYLOAD_SIZE = 86
+    FLAG_CURRENT_VALID = 0x01
+    FLAG_MAG_FRESH = 0x02
+    FLAG_MOTORS_RUNNING = 0x04
+
+    def to_payload(self) -> bytes:
+        return struct.pack(
+            _TLM_EXP_FMT,
+            self.elapsed_ms,
+            self.current_a, self.vbat_v, self.shunt_uv,
+            self.bx_raw, self.by_raw, self.bz_raw,
+            self.bx_cal, self.by_cal, self.bz_cal,
+            self.imu_temp_c,
+            self.roll, self.pitch, self.yaw,
+            self.p, self.q, self.r,
+            self.ax, self.ay, self.az,
+            self.duty_cmd,
+            self.motors_mask, self.flags)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "TlmExp":
+        _check_len("TLM_EXP", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_TLM_EXP_FMT, data))
+
+
+@dataclass
+class TlmCalData:
+    """0x34 TLM_CAL_DATA(112B)— CMD_CAL_GET への応答(キャリブ一括データ)。"""
+    valid_flags: int = 0
+    mag3d_offset: tuple = (0.0, 0.0, 0.0)
+    mag3d_matrix: tuple = (0.0,) * 9   # 行優先
+    accel6_offset: tuple = (0.0, 0.0, 0.0)
+    accel6_scale: tuple = (0.0, 0.0, 0.0)
+    attmount_roll_rad: float = 0.0
+    attmount_pitch_rad: float = 0.0
+    yawzero_offset_rad: float = 0.0
+    geomag: tuple = (0.0,) * 5         # decl_east_deg, incl_deg, H_uT, V_uT, F_uT
+    ff_nlut: int = 0
+    ff_crc32: int = 0
+    ff_mode: int = 0
+    est_mode: int = 0
+
+    TYPE = MsgType.TLM_CAL_DATA
+    PAYLOAD_SIZE = 112
+    VALID_MAG3D = 0x01
+    VALID_ACCEL6 = 0x02
+    VALID_ATTMOUNT = 0x04
+    VALID_YAWZERO = 0x08
+    VALID_GEOMAG = 0x10
+    VALID_FFCAL = 0x20
+
+    def to_payload(self) -> bytes:
+        if (len(self.mag3d_offset) != 3 or len(self.mag3d_matrix) != 9 or
+                len(self.accel6_offset) != 3 or len(self.accel6_scale) != 3 or
+                len(self.geomag) != 5):
+            raise ValueError("TLM_CAL_DATA: 配列フィールドの要素数が不正")
+        return struct.pack(
+            _TLM_CAL_DATA_FMT,
+            self.valid_flags,
+            *self.mag3d_offset, *self.mag3d_matrix,
+            *self.accel6_offset, *self.accel6_scale,
+            self.attmount_roll_rad, self.attmount_pitch_rad,
+            self.yawzero_offset_rad,
+            *self.geomag,
+            self.ff_nlut, self.ff_crc32, self.ff_mode, self.est_mode)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "TlmCalData":
+        _check_len("TLM_CAL_DATA", data, cls.PAYLOAD_SIZE)
+        vals = struct.unpack(_TLM_CAL_DATA_FMT, data)
+        return cls(
+            valid_flags=vals[0],
+            mag3d_offset=tuple(vals[1:4]),
+            mag3d_matrix=tuple(vals[4:13]),
+            accel6_offset=tuple(vals[13:16]),
+            accel6_scale=tuple(vals[16:19]),
+            attmount_roll_rad=vals[19],
+            attmount_pitch_rad=vals[20],
+            yawzero_offset_rad=vals[21],
+            geomag=tuple(vals[22:27]),
+            ff_nlut=vals[27],
+            ff_crc32=vals[28],
+            ff_mode=vals[29],
+            est_mode=vals[30])
 
 
 @dataclass
@@ -529,14 +1044,32 @@ class RlyPong:
 
 # ペイロードを持たない型(len は常に 0)
 EMPTY_PAYLOAD_TYPES = frozenset({
-    MsgType.CMD_START, MsgType.CMD_STOP, MsgType.CMD_RESET, MsgType.RLY_PING,
+    MsgType.CMD_START, MsgType.CMD_STOP, MsgType.CMD_RESET,
+    MsgType.CMD_MOTOR_STOP, MsgType.CMD_CAL_GET, MsgType.CMD_FF_ANCHOR,
+    MsgType.RLY_PING,
 })
 
 # 型 -> ペイロードクラス(可変長 LOG_TEXT を含む)
 PAYLOAD_CLASSES = {
     MsgType.CMD_SETPOINT: CmdSetpoint,
+    MsgType.CMD_MODE: CmdMode,
+    MsgType.CMD_MOTOR_RUN: CmdMotorRun,
+    MsgType.CMD_MAG3D_SET: CmdMag3dSet,
+    MsgType.CMD_ACCEL6_SET: CmdAccel6Set,
+    MsgType.CMD_ATTMOUNT_SET: CmdAttmountSet,
+    MsgType.CMD_YAWZERO_SET: CmdYawzeroSet,
+    MsgType.CMD_GEOMAG_SET: CmdGeomagSet,
+    MsgType.CMD_FF_BEGIN: CmdFfBegin,
+    MsgType.CMD_FF_LUT: CmdFfLut,
+    MsgType.CMD_FF_MOT: CmdFfMot,
+    MsgType.CMD_FF_AUX: CmdFfAux,
+    MsgType.CMD_FF_COMMIT: CmdFfCommit,
+    MsgType.CMD_FF_MODE: CmdFfMode,
     MsgType.TLM_STATE: TlmState,
     MsgType.TLM_EVENT: TlmEvent,
+    MsgType.TLM_ACK: TlmAck,
+    MsgType.TLM_EXP: TlmExp,
+    MsgType.TLM_CAL_DATA: TlmCalData,
     MsgType.LOG_TEXT: LogText,
     MsgType.RLY_SET_TARGET: RlySetTarget,
     MsgType.RLY_TARGET_ACK: RlyTargetAck,
@@ -551,8 +1084,27 @@ EXPECTED_PAYLOAD_SIZE: dict[MsgType, Optional[int]] = {
     MsgType.CMD_STOP: 0,
     MsgType.CMD_SETPOINT: CmdSetpoint.PAYLOAD_SIZE,
     MsgType.CMD_RESET: 0,
+    MsgType.CMD_MODE: CmdMode.PAYLOAD_SIZE,
+    MsgType.CMD_MOTOR_RUN: CmdMotorRun.PAYLOAD_SIZE,
+    MsgType.CMD_MOTOR_STOP: 0,
+    MsgType.CMD_CAL_GET: 0,
+    MsgType.CMD_MAG3D_SET: CmdMag3dSet.PAYLOAD_SIZE,
+    MsgType.CMD_ACCEL6_SET: CmdAccel6Set.PAYLOAD_SIZE,
+    MsgType.CMD_ATTMOUNT_SET: CmdAttmountSet.PAYLOAD_SIZE,
+    MsgType.CMD_YAWZERO_SET: CmdYawzeroSet.PAYLOAD_SIZE,
+    MsgType.CMD_GEOMAG_SET: CmdGeomagSet.PAYLOAD_SIZE,
+    MsgType.CMD_FF_BEGIN: CmdFfBegin.PAYLOAD_SIZE,
+    MsgType.CMD_FF_LUT: CmdFfLut.PAYLOAD_SIZE,
+    MsgType.CMD_FF_MOT: CmdFfMot.PAYLOAD_SIZE,
+    MsgType.CMD_FF_AUX: CmdFfAux.PAYLOAD_SIZE,
+    MsgType.CMD_FF_COMMIT: CmdFfCommit.PAYLOAD_SIZE,
+    MsgType.CMD_FF_MODE: CmdFfMode.PAYLOAD_SIZE,
+    MsgType.CMD_FF_ANCHOR: 0,
     MsgType.TLM_STATE: TlmState.PAYLOAD_SIZE,
     MsgType.TLM_EVENT: TlmEvent.PAYLOAD_SIZE,
+    MsgType.TLM_ACK: TlmAck.PAYLOAD_SIZE,
+    MsgType.TLM_EXP: TlmExp.PAYLOAD_SIZE,
+    MsgType.TLM_CAL_DATA: TlmCalData.PAYLOAD_SIZE,
     MsgType.LOG_TEXT: None,
     MsgType.RLY_SET_TARGET: RlySetTarget.PAYLOAD_SIZE,
     MsgType.RLY_TARGET_ACK: RlyTargetAck.PAYLOAD_SIZE,

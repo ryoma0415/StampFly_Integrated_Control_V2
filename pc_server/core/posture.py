@@ -2,6 +2,7 @@
 
 安全クランプ(ARCHITECTURE.md「安全クランプ(多層)」の pc_server 層):
 roll/pitch ±10°(config) + スルーレート 30°/s、alt 0.1–1.2m + 0.3m/s。
+v2: ヨー角目標 ±180°(config) + 最短経路 wrap + スルーレート 45°/s。
 この層の整形(SetpointShaper)は Position モードの送信経路でも共用する。
 
 単位はすべて core 内部規約(rad / m)。deg⇔rad 変換は session 層が行う。
@@ -11,9 +12,22 @@ from __future__ import annotations
 
 import threading
 import time
+from math import pi
 from typing import Callable, Optional
 
 from .mocap import DEG_TO_RAD
+
+TWO_PI = 2.0 * pi
+
+
+def wrap_pi(angle_rad: float) -> float:
+    """角度を (-π, π] に正規化する(ヨー最短経路計算用)。"""
+    wrapped = (angle_rad + pi) % TWO_PI - pi
+    # Python の % は正の剰余を返すため wrapped ∈ [-π, π)。
+    # 境界 -π は +π 側に寄せて (-π, π] とする(±180° 指令の符号安定化)。
+    if wrapped == -pi:
+        return pi
+    return wrapped
 
 # スレッド一時停止などで dt が異常に伸びた場合の上限(スルー制限の暴走防止)
 MAX_STEP_DT_S = 0.1
@@ -55,11 +69,17 @@ class SetpointShaper:
         self._alt_min_m = clamps_config["alt_min_m"]
         self._alt_max_m = clamps_config["alt_max_m"]
         self._alt_rate_m_per_s = clamps_config["alt_rate_m_per_s"]
+        self._max_yaw_rad = clamps_config["max_yaw_deg"] * DEG_TO_RAD
+        self._yaw_slew_rad_per_s = clamps_config["yaw_slew_rate_deg_per_s"] * DEG_TO_RAD
 
         self._roll = 0.0
         self._pitch = 0.0
         self._alt: Optional[float] = None
         self._last_t: Optional[float] = None
+        # ヨーは独立した整形状態を持つ(shape() と別呼び出しでも dt が
+        # 二重計上されないよう、時刻も別管理する)
+        self._yaw = 0.0
+        self._yaw_last_t: Optional[float] = None
 
     @property
     def alt_limits(self) -> tuple[float, float]:
@@ -71,6 +91,8 @@ class SetpointShaper:
         self._pitch = 0.0
         self._alt = None
         self._last_t = None
+        self._yaw = 0.0
+        self._yaw_last_t = None
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -110,6 +132,27 @@ class SetpointShaper:
         self._alt = self._slew(self._alt, alt_target, max_alt_delta)
         return (self._roll, self._pitch, self._alt)
 
+    def shape_yaw(self, yaw_target: float, now: float) -> float:
+        """ヨー角目標の整形: 最短経路(±π wrap)+スルーレート制限。
+
+        roll/pitch と違い目標は円環上にあるため、誤差を wrap してから
+        スルー制限する(±180° 跨ぎで遠回りしない)。出力は (-π, π]。
+        """
+        yaw_target = wrap_pi(yaw_target)
+        yaw_target = self._clamp(yaw_target, -self._max_yaw_rad, self._max_yaw_rad)
+
+        if self._yaw_last_t is None:
+            dt = 0.0
+        else:
+            dt = self._clamp(now - self._yaw_last_t, 0.0, MAX_STEP_DT_S)
+        self._yaw_last_t = now
+
+        delta = wrap_pi(yaw_target - self._yaw)
+        max_delta = self._yaw_slew_rad_per_s * dt
+        delta = self._clamp(delta, -max_delta, max_delta)
+        self._yaw = wrap_pi(self._yaw + delta)
+        return self._yaw
+
 
 class PostureController:
     """UI スライダ由来のセットポイントを 50Hz で送信するコントローラ。
@@ -133,7 +176,10 @@ class PostureController:
         self._target_roll = 0.0
         self._target_pitch = 0.0
         self._target_alt = alt_min
+        self._target_yaw = 0.0
+        self._yaw_ctrl_on = False
         self._last_output = (0.0, 0.0, alt_min)
+        self._last_yaw_output = 0.0
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -142,11 +188,29 @@ class PostureController:
     # UI からの入力(session 層で deg→rad 変換済み)
     # ------------------------------------------------------------------
 
-    def set_setpoint(self, roll_rad: float, pitch_rad: float, alt_m: float) -> None:
+    def set_setpoint(self, roll_rad: float, pitch_rad: float, alt_m: float,
+                     yaw_rad: Optional[float] = None) -> None:
         with self._lock:
             self._target_roll = roll_rad
             self._target_pitch = pitch_rad
             self._target_alt = alt_m
+            if yaw_rad is not None:
+                self._target_yaw = yaw_rad
+
+    def set_setpoint_yaw_only(self, yaw_rad: float) -> None:
+        """ヨー角目標のみ更新する(共通ヨースライダ用)。"""
+        with self._lock:
+            self._target_yaw = yaw_rad
+
+    def set_yaw_control(self, enabled: bool) -> None:
+        """ヨー角制御トグル(ON: CMD_SETPOINT flags bit1 を立て yaw_ref を送る)。"""
+        with self._lock:
+            self._yaw_ctrl_on = bool(enabled)
+
+    def yaw_setpoint(self) -> tuple[float, bool]:
+        """直近に送信した整形済みヨー目標と制御 ON/OFF(スナップショット用)。"""
+        with self._lock:
+            return (self._last_yaw_output, self._yaw_ctrl_on)
 
     def set_default_alt(self, alt_m: float) -> None:
         """機体プロファイルの default_alt_m を初期目標高度として反映する。"""
@@ -202,7 +266,16 @@ class PostureController:
         """1周期ぶんの整形+送信(テストから直接呼べる)。"""
         with self._lock:
             targets = (self._target_roll, self._target_pitch, self._target_alt)
+            yaw_target = self._target_yaw
+            yaw_ctrl_on = self._yaw_ctrl_on
         roll, pitch, alt = self._shaper.shape(*targets, now)
+        yaw = self._shaper.shape_yaw(yaw_target, now)
         with self._lock:
             self._last_output = (roll, pitch, alt)
-        self._emit(roll, pitch, alt, {"mode": self.MODE_NAME})
+            self._last_yaw_output = yaw
+        # ヨーは meta 経由で session 層に渡す(emit の引数互換を保つ)
+        self._emit(roll, pitch, alt, {
+            "mode": self.MODE_NAME,
+            "yaw_ref_rad": yaw,
+            "yaw_ctrl_on": yaw_ctrl_on,
+        })

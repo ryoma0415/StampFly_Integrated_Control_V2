@@ -21,6 +21,7 @@
   --plot-current: #60a5fa;
   --plot-target: #f59e0b;
   --plot-stale: #6b7280;
+  --plot-circle: #a78bfa;
 
   /* 飛行状態バッジ配色 */
   --st-init: #6b7280;
@@ -30,6 +31,7 @@
   --st-hover: #34d399;
   --st-landing: #fb923c;
   --st-complete: #f87171;
+  --st-motortest: #818cf8;
 }
 
 * { box-sizing: border-box; }
@@ -338,6 +340,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
 .state-badge[data-state="4"] { background: var(--st-hover); color: #043325; }
 .state-badge[data-state="5"] { background: var(--st-landing); color: #3a1f06; }
 .state-badge[data-state="6"] { background: var(--st-complete); animation: blink 1s step-start infinite; }
+.state-badge[data-state="7"] { background: var(--st-motortest); color: #1e1b4b; }
 
 .phase { color: var(--text-dim); font-size: 12px; }
 
@@ -596,3 +599,259 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
   margin-bottom: 8px;
 }
 .overlay-msg { color: var(--text-dim); font-size: 13px; }
+
+/* ===================== v2: 共通バッジ ===================== */
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--off);
+  color: #fff;
+  vertical-align: middle;
+}
+.badge.b-ok   { background: #065f46; color: #a7f3d0; border: 1px solid var(--ok); }
+.badge.b-warn { background: #78350f; color: #fde68a; border: 1px solid var(--warn); }
+.badge.b-dim  { background: var(--bg-inset); color: var(--text-dim); border: 1px solid var(--border); }
+
+/* ===================== v2: ヨーブロック(Posture/Position 共通) ===================== */
+.yaw-block {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.yaw-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ff-quick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.ff-quick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ff-quick-row select { min-width: 160px; flex: 1; }
+.ff-quick-row input[type="text"] {
+  background: var(--bg-inset);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  flex: 1;
+  min-width: 120px;
+}
+.ff-banner {
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.ff-banner.applied {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+/* ===================== v2: 軌道ブロック(Position) ===================== */
+.traj-block {
+  margin: 10px 0;
+  padding: 10px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.traj-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.circle-params {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.circle-params .target-row { margin-bottom: 0; }
+.circle-params input[type="number"] { width: 70px; }
+
+/* ===================== v2: ヨー推定モニタ(key-value グリッド) ===================== */
+.kv-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  font-size: 12px;
+}
+.kv-list > span:nth-child(odd) { color: var(--text-dim); }
+.kv-list > span:nth-child(even) { text-align: right; }
+.yaw-mon { grid-template-columns: auto 1fr auto 1fr; }
+.yaw-mon.sub { padding-top: 4px; border-top: 1px dashed var(--border); margin-top: 4px; }
+
+/* ===================== v2: Experiment タブ ===================== */
+#main.mode-experiment {
+  grid-template-columns: 1fr minmax(320px, 400px);
+}
+/* 狭い画面では既存レイアウトと同様に1カラムへ畳む(基本則の media query は
+   セレクタ特異度で負けるため、mode-experiment 用にも明示する) */
+@media (max-width: 900px) {
+  #main.mode-experiment { grid-template-columns: 1fr; }
+}
+
+.exp-activate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.exp-warning { line-height: 1.6; }
+.exp-warning kbd {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 6px;
+}
+.fixture-check {
+  display: flex;
+  margin: 8px 0 12px;
+  padding: 8px 10px;
+  background: #3a2c0620;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.exp-section {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.exp-section h3, .exp-card h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.duty-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.duty-btn {
+  padding: 5px 10px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.duty-btn.selected {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
+}
+.duty-btn.duty-high:not(:disabled) { border-color: var(--warn); }
+
+.motor-status { color: var(--text-dim); font-size: 12px; margin-left: auto; }
+.motor-status.running { color: var(--crit); font-weight: 700; }
+.exp-live {
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.sweep-motors {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.sweep-motors label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.sweep-notes {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.sweep-notes input {
+  flex: 1;
+  min-width: 110px;
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.sweep-step { color: var(--text-dim); font-size: 12px; }
+
+.progress-bar {
+  position: relative;
+  height: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.progress-fill {
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+.progress-fill.err { background: var(--crit); }
+
+.exp-status-line { font-size: 12px; }
+.exp-msg {
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.exp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+}
+.exp-card {
+  padding: 10px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.exp-sep { border: none; border-top: 1px dashed var(--border); margin: 2px 0; }
+.preset-row.wrap { flex-wrap: wrap; }
+.accel6-face.done {
+  border-color: var(--ok);
+  color: var(--ok);
+}

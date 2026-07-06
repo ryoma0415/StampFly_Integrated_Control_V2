@@ -1,5 +1,5 @@
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "generator": "protocol/tests/generate_vectors.py (stampfly_protocol.py)",
   "crc16": {
     "input_ascii": "123456789",
@@ -15,11 +15,12 @@
         "roll_ref": 0.0524,
         "pitch_ref": -0.0349,
         "alt_ref": 0.3,
-        "flags": 1
+        "yaw_ref": 0.7854,
+        "flags": 3
       },
-      "payload_hex": "62a1563d4df30ebd9a99993e01",
-      "logical_hex": "0112444342410d62a1563d4df30ebd9a99993e015441",
-      "wire_hex": "170112444342410d62a1563d4df30ebd9a99993e01544100"
+      "payload_hex": "62a1563d4df30ebd9a99993ef90f493f03",
+      "logical_hex": "0212444342411162a1563d4df30ebd9a99993ef90f493f03757f",
+      "wire_hex": "1b0212444342411162a1563d4df30ebd9a99993ef90f493f03757f00"
     },
     {
       "name": "cmd_setpoint_all_zero_payload",
@@ -30,11 +31,28 @@
         "roll_ref": 0.0,
         "pitch_ref": 0.0,
         "alt_ref": 0.0,
+        "yaw_ref": 0.0,
         "flags": 0
       },
-      "payload_hex": "00000000000000000000000000",
-      "logical_hex": "0112010000000d00000000000000000000000000d7c2",
-      "wire_hex": "040112010101020d01010101010101010101010103d7c200"
+      "payload_hex": "0000000000000000000000000000000000",
+      "logical_hex": "021201000000110000000000000000000000000000000000fa14",
+      "wire_hex": "04021201010102110101010101010101010101010101010103fa1400"
+    },
+    {
+      "name": "cmd_setpoint_yaw_disabled",
+      "payload_kind": "CMD_SETPOINT",
+      "type": 18,
+      "seq": 2,
+      "fields": {
+        "roll_ref": 0.02,
+        "pitch_ref": 0.01,
+        "alt_ref": 0.4,
+        "yaw_ref": 0.0,
+        "flags": 1
+      },
+      "payload_hex": "0ad7a33c0ad7233ccdcccc3e0000000001",
+      "logical_hex": "021202000000110ad7a33c0ad7233ccdcccc3e000000000192c2",
+      "wire_hex": "0402120201010e110ad7a33c0ad7233ccdcccc3e010101040192c200"
     },
     {
       "name": "tlm_state_full",
@@ -68,11 +86,22 @@
         "ax": 0.01,
         "ay": -0.02,
         "az": 0.98,
-        "loop_dt_us": 2500
+        "loop_dt_us": 2500,
+        "yaw_est_rad": 1.5601,
+        "yaw_gyro_int_rad": 1.5432,
+        "yaw_ref_rad": 1.5708,
+        "current_a": 2.85,
+        "db_hat_x_ut": 3.2,
+        "db_hat_y_ut": -1.1,
+        "bm_x_ut": 0.6,
+        "bm_y_ut": -0.4,
+        "nis": 1.75,
+        "ffg": 5,
+        "ff_status": 126
       },
-      "payload_hex": "0403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc409",
-      "logical_hex": "0130e8030000610403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc409b6a3",
-      "wire_hex": "050130e8030109610403020140e20110040601f085493c11c73abdf90fc93f0103803e010102bf010b403f62a1563d4df30ebd0101363f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc409b6a300"
+      "payload_hex": "0403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0000e03f057e",
+      "logical_hex": "0230e8030000870403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0000e03f057e6ada",
+      "wire_hex": "050230e8030109870403020140e20110040601f085493c11c73abdf90fc93f0103803e010102bf010b403f62a1563d4df30ebd0101543f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0107e03f057e6ada00"
     },
     {
       "name": "tlm_event_link_loss",
@@ -87,8 +116,8 @@
         "voltage": 3.41
       },
       "payload_hex": "05040801713d5a40",
-      "logical_hex": "01312a0000000805040801713d5a408371",
-      "wire_hex": "0401312a01010c0805040801713d5a40837100"
+      "logical_hex": "02312a0000000805040801713d5a40a692",
+      "wire_hex": "0402312a01010c0805040801713d5a40a69200"
     },
     {
       "name": "log_text_relay",
@@ -100,8 +129,8 @@
         "text": "relay: peer set ch=6"
       },
       "payload_hex": "0072656c61793a2070656572207365742063683d36",
-      "logical_hex": "014007000000150072656c61793a2070656572207365742063683d367dc1",
-      "wire_hex": "04014007010102151772656c61793a2070656572207365742063683d367dc100"
+      "logical_hex": "024007000000150072656c61793a2070656572207365742063683d36c1ac",
+      "wire_hex": "04024007010102151772656c61793a2070656572207365742063683d36c1ac00"
     },
     {
       "name": "log_text_drone_utf8",
@@ -113,8 +142,8 @@
         "text": "\u6a5f\u4f53\ud83d\udef8: \u9ad8\u5ea60.50m\u306b\u5230\u9054"
       },
       "payload_hex": "01e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194",
-      "logical_hex": "0140080000002101e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194850a",
-      "wire_hex": "040140080101252101e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194850a00"
+      "logical_hex": "0240080000002101e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e981944829",
+      "wire_hex": "040240080101252101e6a99fe4bd93f09f9bb83a20e9ab98e5baa6302e35306de381abe588b0e98194482900"
     },
     {
       "name": "rly_set_target",
@@ -133,8 +162,8 @@
         "wifi_channel": 6
       },
       "payload_hex": "246f28aabbcc06",
-      "logical_hex": "01500200000007246f28aabbcc0603df",
-      "wire_hex": "0401500201010b07246f28aabbcc0603df00"
+      "logical_hex": "02500200000007246f28aabbcc06a052",
+      "wire_hex": "0402500201010b07246f28aabbcc06a05200"
     },
     {
       "name": "rly_target_ack_ok",
@@ -154,8 +183,8 @@
         "channel": 6
       },
       "payload_hex": "00246f28aabbcc06",
-      "logical_hex": "0151030000000800246f28aabbcc06d210",
-      "wire_hex": "04015103010102080a246f28aabbcc06d21000"
+      "logical_hex": "0251030000000800246f28aabbcc06f7f3",
+      "wire_hex": "04025103010102080a246f28aabbcc06f7f300"
     },
     {
       "name": "rly_stats",
@@ -171,8 +200,8 @@
         "overflow_drops": 0
       },
       "payload_hex": "e8030000c409000003000000010000000200000000000000",
-      "logical_hex": "01520b00000018e8030000c40900000300000001000000020000000000000067d5",
-      "wire_hex": "0401520b01010418e8030103c40901020301010201010102020101010101010367d500"
+      "logical_hex": "02520b00000018e8030000c4090000030000000100000002000000000000003d57",
+      "wire_hex": "0402520b01010418e8030103c4090102030101020101010202010101010101033d5700"
     },
     {
       "name": "rly_pong",
@@ -183,8 +212,8 @@
         "echo_seq": 77
       },
       "payload_hex": "4d000000",
-      "logical_hex": "01540c000000044d000000f32c",
-      "wire_hex": "0401540c010103044d010103f32c00"
+      "logical_hex": "02540c000000044d0000000954",
+      "wire_hex": "0402540c010103044d010103095400"
     },
     {
       "name": "cmd_start_empty_payload",
@@ -193,8 +222,341 @@
       "seq": 5,
       "fields": {},
       "payload_hex": "",
-      "logical_hex": "011005000000007c70",
-      "wire_hex": "04011005010101037c7000"
+      "logical_hex": "02100500000000fea8",
+      "wire_hex": "0402100501010103fea800"
+    },
+    {
+      "name": "cmd_mode_motor_test",
+      "payload_kind": "CMD_MODE",
+      "type": 20,
+      "seq": 20,
+      "fields": {
+        "mode": 1
+      },
+      "payload_hex": "01",
+      "logical_hex": "02141400000001011077",
+      "wire_hex": "040214140101050101107700"
+    },
+    {
+      "name": "cmd_motor_run_front_pair",
+      "payload_kind": "CMD_MOTOR_RUN",
+      "type": 21,
+      "seq": 21,
+      "fields": {
+        "duty": 0.35,
+        "mask": 3
+      },
+      "payload_hex": "3333b33e03",
+      "logical_hex": "021515000000053333b33e0398af",
+      "wire_hex": "04021515010109053333b33e0398af00"
+    },
+    {
+      "name": "cmd_motor_stop_empty_payload",
+      "payload_kind": "NONE",
+      "type": 22,
+      "seq": 22,
+      "fields": {},
+      "payload_hex": "",
+      "logical_hex": "0216160000000097cf",
+      "wire_hex": "040216160101010397cf00"
+    },
+    {
+      "name": "cmd_cal_get_empty_payload",
+      "payload_kind": "NONE",
+      "type": 23,
+      "seq": 23,
+      "fields": {},
+      "payload_hex": "",
+      "logical_hex": "021717000000006620",
+      "wire_hex": "0402171701010103662000"
+    },
+    {
+      "name": "cmd_mag3d_set_full",
+      "payload_kind": "CMD_MAG3D_SET",
+      "type": 24,
+      "seq": 24,
+      "fields": {
+        "valid": 1,
+        "offset": [
+          12.5,
+          -8.25,
+          3.75
+        ],
+        "matrix": [
+          1.02,
+          0.01,
+          -0.02,
+          0.01,
+          0.98,
+          0.03,
+          -0.02,
+          0.03,
+          1.05
+        ]
+      },
+      "payload_hex": "0100004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863f",
+      "logical_hex": "021818000000310100004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fb133",
+      "wire_hex": "04021818010103310101034841010304c1012970405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fb13300"
+    },
+    {
+      "name": "cmd_accel6_set_full",
+      "payload_kind": "CMD_ACCEL6_SET",
+      "type": 25,
+      "seq": 25,
+      "fields": {
+        "valid": 1,
+        "offset": [
+          0.012,
+          -0.008,
+          0.021
+        ],
+        "scale": [
+          0.998,
+          1.002,
+          0.995
+        ]
+      },
+      "payload_hex": "01a69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f",
+      "logical_hex": "0219190000001901a69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f4383",
+      "wire_hex": "0402191901011d1901a69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f438300"
+    },
+    {
+      "name": "cmd_attmount_set",
+      "payload_kind": "CMD_ATTMOUNT_SET",
+      "type": 26,
+      "seq": 26,
+      "fields": {
+        "valid": 1,
+        "roll_rad": 0.015,
+        "pitch_rad": -0.022
+      },
+      "payload_hex": "018fc2753c5839b4bc",
+      "logical_hex": "021a1a00000009018fc2753c5839b4bcb9b7",
+      "wire_hex": "04021a1a01010d09018fc2753c5839b4bcb9b700"
+    },
+    {
+      "name": "cmd_yawzero_set",
+      "payload_kind": "CMD_YAWZERO_SET",
+      "type": 27,
+      "seq": 27,
+      "fields": {
+        "valid": 1,
+        "offset_rad": -1.234
+      },
+      "payload_hex": "01b6f39dbf",
+      "logical_hex": "021b1b0000000501b6f39dbfd1df",
+      "wire_hex": "04021b1b0101090501b6f39dbfd1df00"
+    },
+    {
+      "name": "cmd_geomag_set",
+      "payload_kind": "CMD_GEOMAG_SET",
+      "type": 28,
+      "seq": 28,
+      "fields": {
+        "declination_east_deg": -7.5,
+        "inclination_deg": 49.5,
+        "horizontal_ut": 30.0,
+        "vertical_ut": 35.1,
+        "total_ut": 46.2
+      },
+      "payload_hex": "0000f0c0000046420000f04166660c42cdcc3842",
+      "logical_hex": "021c1c000000140000f0c0000046420000f04166660c42cdcc384268fe",
+      "wire_hex": "04021c1c010102140103f0c001034642010df04166660c42cdcc384268fe00"
+    },
+    {
+      "name": "cmd_ff_begin_nlut8",
+      "payload_kind": "CMD_FF_BEGIN",
+      "type": 29,
+      "seq": 29,
+      "fields": {
+        "nlut": 8
+      },
+      "payload_hex": "08",
+      "logical_hex": "021d1d00000001081785",
+      "wire_hex": "04021d1d0101050108178500"
+    },
+    {
+      "name": "cmd_ff_lut_point",
+      "payload_kind": "CMD_FF_LUT",
+      "type": 30,
+      "seq": 30,
+      "fields": {
+        "idx": 3,
+        "i_a": 1.25,
+        "db_x": 2.5,
+        "db_y": -1.75,
+        "db_z": 0.5
+      },
+      "payload_hex": "030000a03f000020400000e0bf0000003f",
+      "logical_hex": "021e1e00000011030000a03f000020400000e0bf0000003f8e1a",
+      "wire_hex": "04021e1e01010311030103a03f010320400103e0bf0101043f8e1a00"
+    },
+    {
+      "name": "cmd_ff_mot_fl",
+      "payload_kind": "CMD_FF_MOT",
+      "type": 31,
+      "seq": 31,
+      "fields": {
+        "idx": 0,
+        "a_tilde": [
+          0.8,
+          -0.6,
+          0.2
+        ],
+        "c2": 0.9,
+        "c1": 1.8,
+        "c0": 0.05
+      },
+      "payload_hex": "00cdcc4c3f9a9919bfcdcc4c3e6666663f6666e63fcdcc4c3d",
+      "logical_hex": "021f1f0000001900cdcc4c3f9a9919bfcdcc4c3e6666663f6666e63fcdcc4c3db3a5",
+      "wire_hex": "04021f1f010102191bcdcc4c3f9a9919bfcdcc4c3e6666663f6666e63fcdcc4c3db3a500"
+    },
+    {
+      "name": "cmd_ff_aux",
+      "payload_kind": "CMD_FF_AUX",
+      "type": 32,
+      "seq": 32,
+      "fields": {
+        "iid_a": 0.12
+      },
+      "payload_hex": "8fc2f53d",
+      "logical_hex": "022020000000048fc2f53dc029",
+      "wire_hex": "04022020010108048fc2f53dc02900"
+    },
+    {
+      "name": "cmd_ff_commit",
+      "payload_kind": "CMD_FF_COMMIT",
+      "type": 33,
+      "seq": 33,
+      "fields": {
+        "crc32": 3735928559
+      },
+      "payload_hex": "efbeadde",
+      "logical_hex": "02212100000004efbeadde4613",
+      "wire_hex": "0402212101010804efbeadde461300"
+    },
+    {
+      "name": "cmd_ff_mode_b_ekf",
+      "payload_kind": "CMD_FF_MODE",
+      "type": 34,
+      "seq": 34,
+      "fields": {
+        "ff_mode": 2,
+        "est_mode": 1
+      },
+      "payload_hex": "0201",
+      "logical_hex": "022222000000020201ed3c",
+      "wire_hex": "04022222010106020201ed3c00"
+    },
+    {
+      "name": "cmd_ff_anchor_empty_payload",
+      "payload_kind": "NONE",
+      "type": 35,
+      "seq": 35,
+      "fields": {},
+      "payload_hex": "",
+      "logical_hex": "02232300000000a38c",
+      "wire_hex": "0402232301010103a38c00"
+    },
+    {
+      "name": "tlm_ack_ff_commit_ok",
+      "payload_kind": "TLM_ACK",
+      "type": 50,
+      "seq": 200,
+      "fields": {
+        "acked_type": 33,
+        "acked_seq": 33,
+        "status": 0
+      },
+      "payload_hex": "212100000000",
+      "logical_hex": "0232c80000000621210000000049e1",
+      "wire_hex": "040232c80101040621210101010349e100"
+    },
+    {
+      "name": "tlm_exp_full",
+      "payload_kind": "TLM_EXP",
+      "type": 51,
+      "seq": 201,
+      "fields": {
+        "elapsed_ms": 654321,
+        "current_a": 3.15,
+        "vbat_v": 3.85,
+        "shunt_uv": 1250.0,
+        "bx_raw": 21.5,
+        "by_raw": -14.25,
+        "bz_raw": 38.75,
+        "bx_cal": 20.1,
+        "by_cal": -13.9,
+        "bz_cal": 37.6,
+        "imu_temp_c": 41.5,
+        "roll": 0.011,
+        "pitch": -0.024,
+        "yaw": 2.618,
+        "p": 0.05,
+        "q": -0.03,
+        "r": 0.02,
+        "ax": 0.015,
+        "ay": -0.01,
+        "az": 1.002,
+        "duty_cmd": 0.45,
+        "motors_mask": 15,
+        "flags": 7
+      },
+      "payload_hex": "f1fb09009a9949406666764000409c440000ac41000064c100001b42cdcca04166665ec166661642000026425839343ca69bc4bc508d2740cdcc4c3d8fc2f5bc0ad7a33c8fc2753c0ad723bc8941803f6666e63e0f07",
+      "logical_hex": "0233c900000056f1fb09009a9949406666764000409c440000ac41000064c100001b42cdcca04166665ec166661642000026425839343ca69bc4bc508d2740cdcc4c3d8fc2f5bc0ad7a33c8fc2753c0ad723bc8941803f6666e63e0f077145",
+      "wire_hex": "040233c901010556f1fb09099a9949406666764004409c440103ac41010364c1010f1b42cdcca04166665ec166661642012f26425839343ca69bc4bc508d2740cdcc4c3d8fc2f5bc0ad7a33c8fc2753c0ad723bc8941803f6666e63e0f07714500"
+    },
+    {
+      "name": "tlm_cal_data_full",
+      "payload_kind": "TLM_CAL_DATA",
+      "type": 52,
+      "seq": 202,
+      "fields": {
+        "valid_flags": 63,
+        "mag3d_offset": [
+          12.5,
+          -8.25,
+          3.75
+        ],
+        "mag3d_matrix": [
+          1.02,
+          0.01,
+          -0.02,
+          0.01,
+          0.98,
+          0.03,
+          -0.02,
+          0.03,
+          1.05
+        ],
+        "accel6_offset": [
+          0.012,
+          -0.008,
+          0.021
+        ],
+        "accel6_scale": [
+          0.998,
+          1.002,
+          0.995
+        ],
+        "attmount_roll_rad": 0.015,
+        "attmount_pitch_rad": -0.022,
+        "yawzero_offset_rad": -1.234,
+        "geomag": [
+          -7.5,
+          49.5,
+          30.0,
+          35.1,
+          46.2
+        ],
+        "ff_nlut": 8,
+        "ff_crc32": 3735928559,
+        "ff_mode": 2,
+        "est_mode": 1
+      },
+      "payload_hex": "3f00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde0201",
+      "logical_hex": "0234ca000000703f00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde02019537",
+      "wire_hex": "040234ca010103703f01034841010304c1014b70405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0103f0c0010346420114f04166660c42cdcc384208efbeadde0201953700"
     }
   ],
   "corruption": [
@@ -205,7 +567,7 @@
         "base_frame": "cmd_setpoint_seq_0x41424344",
         "xor_last_byte": 1
       },
-      "wire_hex": "170112444342410d62a1563d4df30ebd9a99993e01544000",
+      "wire_hex": "1b0212444342411162a1563d4df30ebd9a99993ef90f493f03757e00",
       "expect_frames": 0,
       "expect_counters": {
         "crc_errors": 1
@@ -220,7 +582,7 @@
           "cmd_setpoint_all_zero_payload"
         ]
       },
-      "wire_hex": "170112444342410d62a1563d4df30ebd9a99993e015441040112010101020d01010101010101010101010103d7c200",
+      "wire_hex": "1b0212444342411162a1563d4df30ebd9a99993ef90f493f03757f04021201010102110101010101010101010101010101010103fa1400",
       "expect_frames": 0,
       "expect_counters": {
         "len_errors": 1
@@ -234,14 +596,27 @@
         "junk_len": 300,
         "base_frame": "cmd_setpoint_seq_0x41424344"
       },
-      "wire_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00170112444342410d62a1563d4df30ebd9a99993e01544100",
+      "wire_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa001b0212444342411162a1563d4df30ebd9a99993ef90f493f03757f00",
       "expect_frames": 1,
       "expect_counters": {
         "overflow_drops": 1
       },
       "expect_frame_logical_hex": [
-        "0112444342410d62a1563d4df30ebd9a99993e015441"
+        "0212444342411162a1563d4df30ebd9a99993ef90f493f03757f"
       ]
+    },
+    {
+      "name": "stale_v1_version_frame",
+      "construct": {
+        "kind": "version_patch",
+        "base_frame": "cmd_setpoint_seq_0x41424344",
+        "ver": 1
+      },
+      "wire_hex": "1b0112444342411162a1563d4df30ebd9a99993ef90f493f03702600",
+      "expect_frames": 0,
+      "expect_counters": {
+        "ver_errors": 1
+      }
     }
   ],
   "utf8_truncate": {

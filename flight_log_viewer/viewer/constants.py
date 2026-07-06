@@ -1,0 +1,186 @@
+"""V2 フライトログの列定義・ビット定義・描画スタイル定数。
+
+列定義は docs/LOG_STRUCTURE.md(v2・94列)= pc_server/core/logger.py の
+COLUMNS と 1 対 1 で対応させること。ffg のビット定義は yaw 側
+(Yaw_Calibration_and_Estimation firmware/src/yaw_estimator_kf.hpp)を、
+ff_status のビット定義はプロトコル v2(TLM_STATE 末尾拡張)を踏襲する。
+"""
+
+from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# 列定義(94列 = V1 の 77列 + v2 追加 17列。順序も logger.py と同一)
+# ---------------------------------------------------------------------------
+
+# V1 から継承した 77 列
+BASE_COLUMNS: tuple[str, ...] = (
+    # --- セッション / タイミング ---
+    "timestamp", "elapsed_time", "mode", "phase",
+    "command_sequence", "send_success", "feedback_latency_ms",
+    # --- 指令(送信した CMD_SETPOINT、バイアス加算後) ---
+    "roll_ref_rad", "pitch_ref_rad", "roll_ref_deg", "pitch_ref_deg", "alt_ref_m",
+    "roll_bias_deg", "pitch_bias_deg",
+    # --- 位置と誤差(Position モードのみ。制御座標系 m) ---
+    "pos_x", "pos_y", "pos_z",
+    "raw_pos_x", "raw_pos_y", "raw_pos_z",
+    "error_x", "error_y",
+    "target_x", "target_y", "target_z",
+    # --- PID 成分(Position モードのみ) ---
+    "pid_x_p", "pid_x_i", "pid_x_d",
+    "pid_y_p", "pid_y_i", "pid_y_d",
+    # --- フィルタ状態とデータ由来(Position モードのみ) ---
+    "data_valid", "control_active", "mocap_dropout", "is_outlier", "used_prediction",
+    "confidence", "consecutive_outliers", "data_source",
+    "filter_threshold", "tracking_valid",
+    # --- リジッドボディ / フレーム診断 ---
+    "rb_error", "rb_marker_count",
+    "frame_number", "marker_count", "frame_dt_ms", "mocap_age_ms",
+    # --- 機体テレメトリ(最新 TLM_STATE のスナップショット) ---
+    "tlm_age_ms", "tlm_seq_echo", "tlm_elapsed_ms",
+    "tlm_state", "tlm_state_name", "tlm_flags", "tlm_reason", "tlm_reason_name",
+    "tlm_roll_rad", "tlm_pitch_rad", "tlm_yaw_rad",
+    "tlm_p_rad_s", "tlm_q_rad_s", "tlm_r_rad_s",
+    "tlm_roll_ref_rad", "tlm_pitch_ref_rad", "tlm_alt_ref_m",
+    "tlm_altitude_tof_m", "tlm_altitude_est_m",
+    "tlm_alt_velocity_m_s", "tlm_z_dot_ref_m_s",
+    "tlm_voltage_v",
+    "tlm_duty_fr", "tlm_duty_fl", "tlm_duty_rr", "tlm_duty_rl",
+    "tlm_ax_g", "tlm_ay_g", "tlm_az_g", "tlm_loop_dt_us",
+)
+
+# v2 で末尾に追加された 17 列(実装契約 §3.5 の順序どおり)
+V2_EXTRA_COLUMNS: tuple[str, ...] = (
+    "cmd_yaw_ref_rad", "cmd_yaw_ref_deg", "yaw_ctrl_on",
+    "tlm_yaw_est_rad", "tlm_yaw_gyro_int_rad", "tlm_yaw_ref_rad",
+    "tlm_current_a", "tlm_db_hat_x_ut", "tlm_db_hat_y_ut", "tlm_bm_x_ut", "tlm_bm_y_ut",
+    "tlm_nis", "tlm_ffg", "tlm_ff_status",
+    "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
+)
+
+V2_COLUMNS: tuple[str, ...] = BASE_COLUMNS + V2_EXTRA_COLUMNS
+N_COLUMNS = len(V2_COLUMNS)
+assert N_COLUMNS == 94, f"列数が契約(94列)と不一致: {N_COLUMNS}"
+
+# 数値変換しない(文字列のままにする)列
+TEXT_COLUMNS: frozenset[str] = frozenset(
+    {"timestamp", "mode", "phase", "tlm_state_name", "tlm_reason_name", "data_source"}
+)
+
+# ログの行レート [Hz](CMD_SETPOINT 送信ごとに1行)
+LOG_RATE_HZ = 50.0
+
+# ---------------------------------------------------------------------------
+# ビット定義
+# ---------------------------------------------------------------------------
+
+# tlm_flags(TLM_STATE flags)のビット
+TLM_FLAG_LOW_VOLTAGE = 1 << 0   # 低電圧
+TLM_FLAG_SETPOINT_FRESH = 1 << 1  # セットポイント新鮮
+TLM_FLAG_FLYING = 1 << 2        # 飛行中
+
+# tlm_ffg(EKF ゲート状態ビット。yaw 側 yaw_estimator_kf.hpp と一致)
+# (表示名, 説明, 描画色) を bit0 から順に並べる
+FFG_GATE_BITS: tuple[tuple[str, str, str], ...] = (
+    ("R膨張(soft)", "NIS>5.99 / norm 8-20µT → R膨張して採用", "#fbbf24"),
+    ("NIS棄却", "NIS>13.8 → 磁気更新スキップ→ジャイロ滑走", "#ef4444"),
+    ("norm棄却", "|‖B_corr‖−‖B0‖|>20µT → スキップ", "#f97316"),
+    ("z棄却", "|B_corr.z−B0.z|>12µT → スキップ", "#a855f7"),
+    ("tilt>25°", "傾き過大 → スキップ", "#64748b"),
+    ("b_m凍結", "‖b_m‖>20µT → 磁気更新凍結(要再アンカー)", "#dc2626"),
+    ("ドリフト警告", "|db_m/dt|>0.3µT/s 10s継続", "#0ea5e9"),
+)
+
+# tlm_ff_status(プロトコル v2 TLM_STATE offset134)のビット
+FF_STATUS_FF_MODE_MASK = 0x03     # bit0-1: ff_mode(0=off,1=A,2=B)
+FF_STATUS_EST_EKF = 1 << 2        # bit2: est_mode(1=EKF)
+FF_STATUS_ANCHOR_VALID = 1 << 3   # bit3: アンカー有効
+FF_STATUS_FFCAL_LOADED = 1 << 4   # bit4: FF 係数ロード済み
+FF_STATUS_YAW_CTRL_ACTIVE = 1 << 5  # bit5: ヨー角制御アクティブ
+FF_STATUS_MAG_FRESH = 1 << 6      # bit6: 磁気サンプル新鮮
+
+# ff_status のフラグビット(表示名, ビット位置, 描画色)。ff_mode は別途値表示。
+FF_STATUS_FLAG_BITS: tuple[tuple[str, int, str], ...] = (
+    ("est_mode=EKF", 2, "#0ea5e9"),
+    ("anchor_valid", 3, "#22c55e"),
+    ("ffcal_loaded", 4, "#a855f7"),
+    ("yaw_ctrl_active", 5, "#f59e0b"),
+    ("mag_fresh", 6, "#64748b"),
+)
+
+# ---------------------------------------------------------------------------
+# 解析しきい値(yaw 側 EKF ゲート・機体側フェイルセーフの定義値)
+# ---------------------------------------------------------------------------
+
+NIS_EXPECTED = 2.0            # NIS 期待値(2自由度)
+NIS_R_INFLATE_THRESHOLD = 5.99   # χ²(2) 95% → R 膨張
+NIS_REJECT_THRESHOLD = 13.8      # χ²(2) 99.9% → 棄却
+BM_FREEZE_THRESHOLD_UT = 20.0    # ‖b_m‖ 凍結しきい値 [µT]
+LOW_VOLTAGE_THRESHOLD_V = 3.34   # 機体の低電圧判定 [V]
+LOOP_DT_NOMINAL_US = 2500.0      # 400Hz 制御ループの公称周期 [µs]
+
+# ---------------------------------------------------------------------------
+# 描画スタイル(旧 Drone_Log_Viewer のダークテーマを踏襲)
+# ---------------------------------------------------------------------------
+
+FIG_BG = "#1e1e1e"   # Figure 背景色
+AX_BG = "#2e2e2e"    # Axes 背景色
+GRID_COLOR = "gray"
+GRID_ALPHA = 0.3
+FIG_DPI = 150        # 静止画の解像度
+ANIM_DPI = 100       # アニメーションの解像度
+
+COLORS: dict[str, str] = {
+    # PID 成分
+    "p": "#FF6B6B",
+    "i": "#4ECDC4",
+    "d": "#95E77E",
+    # 軌跡・位置
+    "trajectory": "#3498db",
+    "raw_trajectory": "#7f8c8d",
+    "target": "#f1c40f",
+    "start": "#2ecc71",
+    "end": "#e74c3c",
+    "current_pos": "#e74c3c",
+    # 姿勢(指令 vs 実測)
+    "cmd_roll": "#FF6B6B",
+    "cmd_pitch": "#4ECDC4",
+    "meas_roll": "#F1C40F",
+    "meas_pitch": "#9B59B6",
+    # ヨー4系統
+    "yaw_madgwick": "#f1c40f",   # Madgwick(tlm_yaw_rad)
+    "yaw_ekf": "#e74c3c",        # EKF(tlm_yaw_est_rad)
+    "yaw_gyro": "#3498db",       # ジャイロ積算(tlm_yaw_gyro_int_rad)
+    "yaw_mocap": "#2ecc71",      # MoCap 真値(mocap_yaw_deg)
+    "yaw_cmd": "#ffffff",        # PC ヨー指令(cmd_yaw_ref)
+    "yaw_ref_applied": "#fb923c",  # 機体適用ヨー目標(tlm_yaw_ref_rad)
+    # 高度
+    "alt_ref": "#ffffff",
+    "alt_tof": "#94a3b8",
+    "alt_est": "#38bdf8",
+    # duty(FL/FR/RL/RR)
+    "duty_fl": "#FF6B6B",
+    "duty_fr": "#4ECDC4",
+    "duty_rl": "#95E77E",
+    "duty_rr": "#c084fc",
+    # 電源
+    "voltage": "#0ea5e9",
+    "current": "#f97316",
+    # 診断
+    "nis": "#0ea5e9",
+    "bm_x": "#2563eb",
+    "bm_y": "#16a34a",
+    "bm_norm": "#7c3aed",
+    "dbhat_x": "#fbbf24",
+    "dbhat_y": "#f472b6",
+    "latency": "#38bdf8",
+    "loop_dt": "#f59e0b",
+    "marker": "#2ECC71",
+}
+
+# ヨー4系統の (キー名, 列名(rad or deg), 表示名, 色, 単位が deg か)
+YAW_SOURCES: tuple[tuple[str, str, str, str, bool], ...] = (
+    ("madgwick", "tlm_yaw_rad", "Madgwick", COLORS["yaw_madgwick"], False),
+    ("ekf", "tlm_yaw_est_rad", "EKF (アクティブ推定器)", COLORS["yaw_ekf"], False),
+    ("gyro_int", "tlm_yaw_gyro_int_rad", "ジャイロ積算", COLORS["yaw_gyro"], False),
+    ("mocap", "mocap_yaw_deg", "MoCap 真値", COLORS["yaw_mocap"], True),
+)

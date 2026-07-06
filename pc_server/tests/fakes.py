@@ -114,6 +114,127 @@ class FakeTransport:
         self.sent_frames.clear()
 
 
+class FakeDroneResponder:
+    """v2 上りコマンドに TLM_ACK / TLM_CAL_DATA を返すフェイク機体。
+
+    - リレー: RLY_SET_TARGET → RLY_TARGET_ACK(make_ack_responder 同等)
+    - 0x14–0x23: TLM_ACK(acked_type / acked_seq エコー、status は
+      ack_status_overrides で型ごとに上書き可)
+    - CMD_CAL_GET: TLM_CAL_DATA(self.cal_data)を返す
+    - CMD_MAG3D_SET / ACCEL6_SET / ATTMOUNT_SET / YAWZERO_SET / GEOMAG_SET /
+      FF_COMMIT / FF_BEGIN / FF_MODE は self.cal_data に反映する
+      (キャリブプロファイル適用の読み戻し検証・FF CRC 照合を模擬)
+    - drop_first_ack_types に入れた型は初回だけ ACK を落とす(リトライ試験)
+    """
+
+    def __init__(self) -> None:
+        self._relay = make_ack_responder()
+        self.cal_data = proto.TlmCalData()
+        self.ack_status_overrides: dict[int, int] = {}
+        self.drop_first_ack_types: set[int] = set()
+        # 状態は更新するが ACK を一切返さない型(commit の ACK ロスト救済試験)
+        self.silent_types: set[int] = set()
+        self._dropped_once: set[int] = set()
+        self._ff_nlut = 0
+
+    def _update_cal_state(self, frame: proto.Frame) -> None:
+        cal = self.cal_data
+        t = frame.type
+        if t == proto.MsgType.CMD_MAG3D_SET:
+            msg = proto.CmdMag3dSet.from_payload(frame.payload)
+            if msg.valid:
+                cal.valid_flags |= proto.TlmCalData.VALID_MAG3D
+                cal.mag3d_offset = tuple(msg.offset)
+                cal.mag3d_matrix = tuple(msg.matrix)
+            else:
+                cal.valid_flags &= ~proto.TlmCalData.VALID_MAG3D
+        elif t == proto.MsgType.CMD_ACCEL6_SET:
+            msg = proto.CmdAccel6Set.from_payload(frame.payload)
+            if msg.valid:
+                cal.valid_flags |= proto.TlmCalData.VALID_ACCEL6
+                cal.accel6_offset = tuple(msg.offset)
+                cal.accel6_scale = tuple(msg.scale)
+            else:
+                cal.valid_flags &= ~proto.TlmCalData.VALID_ACCEL6
+        elif t == proto.MsgType.CMD_ATTMOUNT_SET:
+            msg = proto.CmdAttmountSet.from_payload(frame.payload)
+            if msg.valid:
+                cal.valid_flags |= proto.TlmCalData.VALID_ATTMOUNT
+                cal.attmount_roll_rad = msg.roll_rad
+                cal.attmount_pitch_rad = msg.pitch_rad
+            else:
+                cal.valid_flags &= ~proto.TlmCalData.VALID_ATTMOUNT
+        elif t == proto.MsgType.CMD_YAWZERO_SET:
+            msg = proto.CmdYawzeroSet.from_payload(frame.payload)
+            if msg.valid:
+                cal.valid_flags |= proto.TlmCalData.VALID_YAWZERO
+                cal.yawzero_offset_rad = msg.offset_rad
+            else:
+                cal.valid_flags &= ~proto.TlmCalData.VALID_YAWZERO
+        elif t == proto.MsgType.CMD_GEOMAG_SET:
+            msg = proto.CmdGeomagSet.from_payload(frame.payload)
+            cal.valid_flags |= proto.TlmCalData.VALID_GEOMAG
+            cal.geomag = (msg.declination_east_deg, msg.inclination_deg,
+                          msg.horizontal_ut, msg.vertical_ut, msg.total_ut)
+        elif t == proto.MsgType.CMD_FF_BEGIN:
+            self._ff_nlut = proto.CmdFfBegin.from_payload(frame.payload).nlut
+        elif t == proto.MsgType.CMD_FF_COMMIT:
+            msg = proto.CmdFfCommit.from_payload(frame.payload)
+            cal.valid_flags |= proto.TlmCalData.VALID_FFCAL
+            cal.ff_crc32 = msg.crc32
+            cal.ff_nlut = self._ff_nlut
+        elif t == proto.MsgType.CMD_FF_MODE:
+            msg = proto.CmdFfMode.from_payload(frame.payload)
+            cal.ff_mode = msg.ff_mode
+            cal.est_mode = msg.est_mode
+
+    def __call__(self, frame: proto.Frame):
+        relay = self._relay(frame)
+        if relay:
+            return relay
+        t = frame.type
+        if not (0x14 <= t <= 0x23):
+            return None
+        if t in self.drop_first_ack_types and t not in self._dropped_once:
+            self._dropped_once.add(t)
+            return None
+        if t in self.silent_types:
+            self._update_cal_state(frame)
+            return None
+        status = self.ack_status_overrides.get(t, proto.TlmAck.STATUS_OK)
+        if status == proto.TlmAck.STATUS_OK:
+            self._update_cal_state(frame)
+        replies = [(proto.MsgType.TLM_ACK,
+                    proto.TlmAck(acked_type=t, acked_seq=frame.seq,
+                                 status=status).to_payload())]
+        if t == proto.MsgType.CMD_CAL_GET:
+            replies.append((proto.MsgType.TLM_CAL_DATA,
+                            self.cal_data.to_payload()))
+        return replies
+
+
+def make_tlm_exp(current_a: float = 0.2, vbat_v: float = 3.9,
+                 b_raw: tuple = (10.0, -5.0, 30.0),
+                 b_cal: tuple = (11.0, -4.0, 29.0),
+                 roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0,
+                 ax: float = 0.0, ay: float = 0.0, az: float = 1.0,
+                 duty_cmd: float = 0.0, motors_mask: int = 0,
+                 current_valid: bool = True) -> proto.TlmExp:
+    """TLM_EXP ペイロードの組み立てヘルパ。"""
+    flags = proto.TlmExp.FLAG_MAG_FRESH
+    if current_valid:
+        flags |= proto.TlmExp.FLAG_CURRENT_VALID
+    if duty_cmd > 0.0:
+        flags |= proto.TlmExp.FLAG_MOTORS_RUNNING
+    return proto.TlmExp(
+        elapsed_ms=0, current_a=current_a, vbat_v=vbat_v, shunt_uv=100.0,
+        bx_raw=b_raw[0], by_raw=b_raw[1], bz_raw=b_raw[2],
+        bx_cal=b_cal[0], by_cal=b_cal[1], bz_cal=b_cal[2],
+        imu_temp_c=32.5, roll=roll, pitch=pitch, yaw=yaw,
+        p=0.0, q=0.0, r=0.0, ax=ax, ay=ay, az=az,
+        duty_cmd=duty_cmd, motors_mask=motors_mask, flags=flags)
+
+
 def make_ack_responder(status: int = proto.RlyTargetAck.STATUS_OK,
                        channel_override: Optional[int] = None) -> Callable:
     """RLY_SET_TARGET に RLY_TARGET_ACK を返すレスポンダを作る。"""

@@ -6,6 +6,8 @@
 - 書き込みロック(単一ライタ規律: UART への書き込みは send() のみ)
 - RLY_TARGET_ACK 待ち合わせ(PROTOCOL.md: 1.0s 待ち、値一致まで最大3回再送
   = 初回送信+最大3回再送で計最大4回送信)
+- TLM_ACK 待ち合わせ(v2: 0x14–0x23 コマンド用。acked_type + acked_seq の
+  完全一致で対応付け、1.0s 待ち+最大2回再送 = RLY_SET_TARGET の前例踏襲)
 - CMD_SETPOINT seq → TLM_STATE seq_echo による往復レイテンシ計測
 - 統計(受信カウンタ + 送信フレーム数)
 
@@ -24,6 +26,11 @@ import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 class SerialLinkError(Exception):
     """シリアルリンクの送受信エラー。"""
+
+
+# TLM_ACK 保持辞書の上限(構造定数。エコーされない古い ACK の掃除用で、
+# チューニング値ではないため config には置かない)
+_CMD_ACK_CACHE_MAX = 32
 
 
 class SerialLink:
@@ -47,6 +54,8 @@ class SerialLink:
         self._read_chunk: int = serial_cfg["read_chunk_bytes"]
         self._target_ack_timeout_s: float = failsafe_cfg["target_ack_timeout_s"]
         self._target_ack_max_retries: int = failsafe_cfg["target_ack_max_retries"]
+        self._command_ack_timeout_s: float = failsafe_cfg["command_ack_timeout_s"]
+        self._command_ack_max_retries: int = failsafe_cfg["command_ack_max_retries"]
         self._pending_max_age_s: float = fresh_cfg["latency_pending_max_age_s"]
 
         self._transport_factory = transport_factory or self._open_pyserial
@@ -71,6 +80,15 @@ class SerialLink:
         self._ack_lock = threading.Lock()
         self._ack_event = threading.Event()
         self._last_ack: Optional[proto.RlyTargetAck] = None
+
+        # TLM_ACK 待ち合わせ(v2)。RX スレッドが (acked_type, acked_seq) を
+        # キーに格納し、send_with_ack が Condition で待つ。辞書は肥大化を
+        # 防ぐため上限を超えたら古いものから捨てる。
+        self._cmd_ack_cond = threading.Condition()
+        self._cmd_acks: dict[tuple[int, int], proto.TlmAck] = {}
+        # send_with_ack 全体を直列化する(呼び出し元はキャリブ/FF 操作で
+        # もともと排他だが、二重呼び出しでも ACK の取り違えを起こさないため)
+        self._cmd_ack_session_lock = threading.Lock()
 
         # レイテンシ計測(CMD_SETPOINT seq -> 送信時刻 monotonic)
         self._latency_lock = threading.Lock()
@@ -116,6 +134,8 @@ class SerialLink:
         with self._latency_lock:
             self._pending_setpoints.clear()
             self._latency_ms = None
+        with self._cmd_ack_cond:
+            self._cmd_acks.clear()
         self._stop_event.clear()
         self._reader_thread = threading.Thread(
             target=self._reader_loop, name="serial-reader", daemon=True)
@@ -179,6 +199,37 @@ class SerialLink:
             for s in stale:
                 del self._pending_setpoints[s]
         return seq
+
+    def send_with_ack(self, msg_type: int, payload: bytes = b"",
+                      timeout_s: Optional[float] = None,
+                      max_retries: Optional[int] = None
+                      ) -> Optional[proto.TlmAck]:
+        """フレームを送信し、対応する TLM_ACK を待つ(v2 コマンド用)。
+
+        acked_type == msg_type かつ acked_seq == 送信 seq の TLM_ACK を
+        timeout_s 待ち、届かなければ再送する(既定: 1.0s × 最大2回再送)。
+        戻り値は受信した TlmAck(status の判定は呼び出し側)。全試行
+        タイムアウトなら None。送信自体の失敗は SerialLinkError。
+        """
+        if timeout_s is None:
+            timeout_s = self._command_ack_timeout_s
+        if max_retries is None:
+            max_retries = self._command_ack_max_retries
+        with self._cmd_ack_session_lock:
+            for _attempt in range(1 + max_retries):
+                seq = self.send(msg_type, payload)
+                key = (int(msg_type), seq)
+                deadline = time.monotonic() + timeout_s
+                with self._cmd_ack_cond:
+                    while key not in self._cmd_acks:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._cmd_ack_cond.wait(remaining)
+                    ack = self._cmd_acks.pop(key, None)
+                if ack is not None:
+                    return ack
+            return None
 
     def set_relay_target(self, mac: bytes, wifi_channel: int
                          ) -> tuple[bool, Optional[proto.RlyTargetAck]]:
@@ -249,7 +300,19 @@ class SerialLink:
                 return
 
     def _route_frame(self, frame: proto.Frame) -> None:
-        if frame.type == proto.MsgType.RLY_TARGET_ACK:
+        if frame.type == proto.MsgType.TLM_ACK:
+            try:
+                cmd_ack = proto.TlmAck.from_payload(frame.payload)
+            except ValueError:
+                return
+            with self._cmd_ack_cond:
+                if len(self._cmd_acks) >= _CMD_ACK_CACHE_MAX:
+                    # 最古のエントリを捨てる(dict は挿入順を保持する)
+                    self._cmd_acks.pop(next(iter(self._cmd_acks)))
+                self._cmd_acks[(cmd_ack.acked_type, cmd_ack.acked_seq)] = cmd_ack
+                self._cmd_ack_cond.notify_all()
+            # 登録ハンドラ(あれば)にも届ける
+        elif frame.type == proto.MsgType.RLY_TARGET_ACK:
             try:
                 ack = proto.RlyTargetAck.from_payload(frame.payload)
             except ValueError:

@@ -92,6 +92,16 @@ float imu_get_gyro_z(void) {
     return lsb_to_rps(imu_data.gyr.z, DPS20002RAD, 16);
 }
 
+float imu_get_temperature(void) {
+    // yaw側 imu.cpp から移植: BMI270 ダイ温度 (raw/512 + 23) [℃]
+    uint16_t raw    = 0;
+    const int8_t st = bmi2_get_temperature_data(&raw, pBmi270);
+    if (st != BMI2_OK) {
+        return NAN;
+    }
+    return (float)((int16_t)raw) / 512.0f + 23.0f;
+}
+
 void imu_test(void) {
     u_long st, now, old, end;
     uint16_t count;

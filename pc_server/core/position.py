@@ -5,7 +5,14 @@
   有効性判定 → XY PID を更新し、最新指令(roll/pitch)をキャッシュする。
 - 50Hz 送信スレッドはキャッシュ指令を SetpointShaper(クランプ+スルーレート
   制限)に通して emit する。目標位置は UI から随時更新。
-- yaw は制御に使用しない(UI 表示専用、mocap.py が算出)。
+- v2 軌道モード: hover(固定目標)/ circle(円軌道)。円軌道は 50Hz 送信
+  ループ内で目標 (x, y) を時間更新し既存 XY PID に渡す(旧 Previous_Version の
+  circling_controller.py の軌道生成を参考。ゲイン・符号は流用しない)。
+  開始時は現在位置から円周最近傍点に位相を合わせ、既存のフィルタ+PID+
+  シェイパーで滑らかに合流する。
+- v2 ヨー指令: UI のヨー角スライダ(±180°)+「進行方向を向く」オプション
+  (円軌道中かつヨー角制御 ON のとき yaw_ref を接線方向に追従)。
+- MoCap の yaw_rad はログ列 mocap_yaw_deg として meta に載せる(制御には未使用)。
 
 フェイルセーフ(PROTOCOL.md):
 - MoCap 途絶 > mocap_dropout_level_s(300ms)→ roll/pitch を水平(0)に固定し
@@ -18,16 +25,23 @@ from __future__ import annotations
 
 import threading
 import time
+from math import atan2, cos, pi, sin
 from typing import Callable, Optional
 
 from .filter import PositionFilter
 from .mocap import RAD_TO_DEG
 from .pid import XYPIDController
-from .posture import SENDER_JOIN_TIMEOUT_S, SetpointShaper, run_paced_loop
+from .posture import (
+    SENDER_JOIN_TIMEOUT_S, SetpointShaper, run_paced_loop, wrap_pi,
+)
 
 # 異常解除に要する信頼度(legacy hovering_controller と同値)
 ANOMALY_CLEAR_CONFIDENCE = 0.5
 MS_PER_S = 1000.0
+
+# 軌道モード(ログ列 traj_mode の値。LOG_STRUCTURE v2 契約)
+TRAJ_MODE_HOVER = 0
+TRAJ_MODE_CIRCLE = 1
 
 
 class PositionController:
@@ -56,6 +70,12 @@ class PositionController:
         self._frame_hold_s: float = control_config["control"]["frame_hold_ms"] / MS_PER_S
 
         target_default = control_config["target_default"]
+        traj_cfg = control_config["trajectory"]
+        self._traj_radius_min: float = traj_cfg["radius_min_m"]
+        self._traj_radius_max: float = traj_cfg["radius_max_m"]
+        self._traj_period_min: float = traj_cfg["period_min_s"]
+        self._traj_period_max: float = traj_cfg["period_max_s"]
+        self._traj_center_abs_max: float = traj_cfg["center_abs_max_m"]
         self._lock = threading.Lock()
         # pid / position_filter は NatNet スレッド・50Hz 送信スレッド・
         # UI(executor)/supervisor スレッドから触られる共有状態のため、
@@ -76,6 +96,17 @@ class PositionController:
 
         # 直近の送信値(バイアス加算前)
         self._last_output = (0.0, 0.0, self._target[2])
+
+        # v2: ヨー指令(UI スライダ由来、rad)と制御トグル
+        self._target_yaw = 0.0
+        self._yaw_ctrl_on = False
+        self._last_yaw_output = 0.0
+
+        # v2: 円軌道状態(None = hover)。dict キー:
+        # center(x,y) / radius / period_s / clockwise / alt / face_tangent /
+        # phase0(合流点の位相 rad) / t0(開始時刻)
+        self._traj: Optional[dict] = None
+        self._traj_phase: Optional[float] = None
 
         # XY 閉ループの有効フラグ(legacy の control_active に相当)。
         # Start 受理後のみ session 層が True にする。False の間もフィルタは
@@ -101,6 +132,107 @@ class PositionController:
         """直近に送信した整形済みセットポイント(バイアス加算前)。"""
         with self._lock:
             return self._last_output
+
+    def set_yaw_setpoint(self, yaw_rad: float) -> None:
+        """UI ヨー角スライダ(session 層で deg→rad 変換済み)。"""
+        with self._lock:
+            self._target_yaw = yaw_rad
+
+    def set_yaw_control(self, enabled: bool) -> None:
+        with self._lock:
+            self._yaw_ctrl_on = bool(enabled)
+
+    def yaw_setpoint(self) -> tuple[float, bool]:
+        """直近に送信した整形済みヨー目標と制御 ON/OFF(スナップショット用)。"""
+        with self._lock:
+            return (self._last_yaw_output, self._yaw_ctrl_on)
+
+    # ------------------------------------------------------------------
+    # v2: 円軌道モード
+    # ------------------------------------------------------------------
+
+    def start_circle(self, center_x: float, center_y: float, radius_m: float,
+                     period_s: float, clockwise: bool, alt_m: float,
+                     face_tangent: bool,
+                     now: Optional[float] = None) -> tuple[bool, Optional[str]]:
+        """円軌道を開始する。現在位置から円周最近傍点に位相を合わせる。
+
+        戻り値は (ok, error)。error は UI 表示用の日本語メッセージ。
+        パラメータ検証は control.json の trajectory 節の制限に従う。
+        """
+        if now is None:
+            now = self._clock()
+        if not (self._traj_radius_min <= radius_m <= self._traj_radius_max):
+            return False, (f"半径は {self._traj_radius_min}–"
+                           f"{self._traj_radius_max} m で指定してください")
+        if not (self._traj_period_min <= period_s <= self._traj_period_max):
+            return False, (f"周期は {self._traj_period_min}–"
+                           f"{self._traj_period_max} s で指定してください")
+        if (abs(center_x) > self._traj_center_abs_max
+                or abs(center_y) > self._traj_center_abs_max):
+            return False, (f"中心座標は ±{self._traj_center_abs_max} m 以内で"
+                           "指定してください")
+
+        # 現在位置(フィルタ済み優先)→ 円周最近傍点の位相。位置が未取得の
+        # 場合は開始を拒否する(合流点を決められないため)。
+        with self._lock:
+            filter_result = self._last_filter_result
+            pose = self._last_pose
+            alt_lo, alt_hi = self._shaper.alt_limits
+        if not (alt_lo <= alt_m <= alt_hi):
+            return False, f"高度は {alt_lo}–{alt_hi} m で指定してください"
+        if filter_result is not None:
+            px, py, _ = filter_result["filtered_position"]
+        elif pose is not None:
+            px, py = pose["x"], pose["y"]
+        else:
+            return False, "MoCap 位置が取得できないため円軌道を開始できません"
+
+        dx, dy = px - center_x, py - center_y
+        # 機体が中心に一致している縮退ケースは位相 0 から開始する
+        phase0 = atan2(dy, dx) if (dx != 0.0 or dy != 0.0) else 0.0
+        with self._lock:
+            self._traj = {
+                "center": (center_x, center_y),
+                "radius": radius_m,
+                "period_s": period_s,
+                "clockwise": bool(clockwise),
+                "alt": alt_m,
+                "face_tangent": bool(face_tangent),
+                "phase0": phase0,
+                "t0": now,
+            }
+            self._traj_phase = wrap_pi(phase0)
+        return True, None
+
+    def stop_circle(self) -> None:
+        """円軌道を停止し、現在の軌道目標でホバリングに復帰する。
+
+        目標 (self._target) は step() が軌道値で毎周期更新しているため、
+        軌道を外すだけで「現在目標へのホバ復帰」になる。
+        """
+        with self._lock:
+            self._traj = None
+            self._traj_phase = None
+
+    def trajectory_snapshot(self) -> dict:
+        """WebSocket 配信用の軌道状態(UI 単位系)。"""
+        with self._lock:
+            traj = self._traj
+            phase = self._traj_phase
+        if traj is None:
+            return {"mode": "hover"}
+        return {
+            "mode": "circle",
+            "center_x": traj["center"][0],
+            "center_y": traj["center"][1],
+            "radius_m": traj["radius"],
+            "period_s": traj["period_s"],
+            "clockwise": traj["clockwise"],
+            "alt_m": traj["alt"],
+            "face_tangent": traj["face_tangent"],
+            "phase_rad": phase,
+        }
 
     def set_control_active(self, active: bool) -> None:
         """XY 閉ループの有効/無効を切り替える(有効化時に PID をリセット)。"""
@@ -241,13 +373,35 @@ class PositionController:
             self._last_errors = (0.0, 0.0)
             self._last_data_valid = False
             self._control_active = False
+            self._traj = None
+            self._traj_phase = None
+            self._last_yaw_output = 0.0
 
     def _sender_loop(self, stop_event: threading.Event) -> None:
         run_paced_loop(stop_event, self._clock, self._period_s, self.step)
 
     def step(self, now: float) -> None:
-        """1周期ぶんの途絶判定+整形+送信(テストから直接呼べる)。"""
+        """1周期ぶんの軌道更新+途絶判定+整形+送信(テストから直接呼べる)。"""
+        # --- 軌道更新(circle 中は目標 (x, y, z) を時間更新して PID に渡す) ---
+        traj_phase: Optional[float] = None
+        yaw_tangent: Optional[float] = None
         with self._lock:
+            traj = self._traj
+            if traj is not None:
+                omega = 2.0 * pi / traj["period_s"]
+                # 回転方向: CCW = 位相増加(制御座標系の数学正方向)、CW = 減少
+                sign = -1.0 if traj["clockwise"] else 1.0
+                phase = traj["phase0"] + sign * omega * (now - traj["t0"])
+                cx, cy = traj["center"]
+                radius = traj["radius"]
+                self._target = (cx + radius * cos(phase),
+                                cy + radius * sin(phase),
+                                traj["alt"])
+                traj_phase = wrap_pi(phase)
+                self._traj_phase = traj_phase
+                if traj["face_tangent"]:
+                    # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°
+                    yaw_tangent = wrap_pi(phase + sign * (pi / 2.0))
             pose_t = self._last_pose_t
             roll_cmd, pitch_cmd = self._last_cmd
             error_x, error_y = self._last_errors
@@ -257,6 +411,8 @@ class PositionController:
             frame_dt = self._last_frame_dt
             target = self._target
             control_active = self._control_active
+            yaw_target = self._target_yaw
+            yaw_ctrl_on = self._yaw_ctrl_on
 
         age = None if pose_t is None else (now - pose_t)
         dropped = age is None or age > self._dropout_level_s
@@ -270,8 +426,15 @@ class PositionController:
                     self.pid.set_anomaly_state(True)
 
         roll, pitch, alt = self._shaper.shape(roll_cmd, pitch_cmd, target[2], now)
+        # ヨー: 「進行方向を向く」ON かつヨー角制御 ON のときのみ接線追従、
+        # それ以外は UI スライダ目標。MoCap 途絶中も現在の整形値を維持して
+        # 送り続ける(機体側は途絶時に推定ヨーをラッチする契約)。
+        if yaw_tangent is not None and yaw_ctrl_on:
+            yaw_target = yaw_tangent
+        yaw = self._shaper.shape_yaw(yaw_target, now)
         with self._lock:
             self._last_output = (roll, pitch, alt)
+            self._last_yaw_output = yaw
 
         with self._pid_lock:
             pid_components = self.pid.get_all_components()
@@ -288,6 +451,11 @@ class PositionController:
             "target_z": target[2],
             "pid_components": pid_components,
             "frame_dt_ms": None if frame_dt is None else frame_dt * MS_PER_S,
+            "yaw_ref_rad": yaw,
+            "yaw_ctrl_on": yaw_ctrl_on,
+            "traj_mode": (TRAJ_MODE_CIRCLE if traj_phase is not None
+                          else TRAJ_MODE_HOVER),
+            "traj_phase_rad": traj_phase,
         }
         meta["data_source"] = "rigid_body" if pose is not None else "none"
         if pose is not None:
@@ -296,6 +464,7 @@ class PositionController:
             meta["rb_error"] = pose["error"]
             meta["tracking_valid"] = pose["tracking_valid"]
             meta["raw_pos"] = (pose["x"], pose["y"], pose["z"])
+            meta["mocap_yaw_deg"] = pose["yaw_rad"] * RAD_TO_DEG
         if filter_result is not None:
             meta["filtered_pos"] = tuple(filter_result["filtered_position"])
             meta["is_outlier"] = filter_result["is_outlier"]

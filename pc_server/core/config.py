@@ -21,6 +21,16 @@ SERVER_CONFIG_PATH = CONFIG_DIR / "server.json"
 CONTROL_CONFIG_PATH = CONFIG_DIR / "control.json"
 AIRFRAMES_CONFIG_PATH = CONFIG_DIR / "airframes.json"
 
+# v2: 生成データは pc_server/data/ 配下に集約(契約 §6)
+DATA_DIR = PC_SERVER_DIR / "data"
+SWEEP_RESULTS_DIR = DATA_DIR / "sweep_results"
+FF_PROFILES_DIR = DATA_DIR / "ff_profiles"
+CALPROFILES_DIR = DATA_DIR / "calibration_profiles"
+FF_STATE_PATH = DATA_DIR / "ff_state.json"
+MAG3D_CALIBRATION_PATH = CONFIG_DIR / "mag3d_calibration.json"
+GEOMAG_PROFILES_PATH = CONFIG_DIR / "geomagnetic_profiles.json"
+DATA_ANALYSIS_DIR = REPO_DIR / "data_analysis"
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as fp:

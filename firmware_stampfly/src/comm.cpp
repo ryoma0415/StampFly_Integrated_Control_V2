@@ -29,8 +29,34 @@ struct CommandMailbox {
     stampfly::CmdSetpoint setpoint{};
     uint32_t setpoint_seq = 0;
     uint32_t setpoint_rx_ms = 0;
+    // v2 コマンド(0x14-0x23)のリングバッファ。満杯時は新着を落とす
+    // (PC側の ACK タイムアウト+リトライで回復する)。
+    V2Command v2_ring[V2_COMMAND_QUEUE_CAPACITY]{};
+    size_t v2_head = 0;   // 次に取り出す位置
+    size_t v2_count = 0;  // 滞留件数
 };
 CommandMailbox mailbox;
+
+// V2Command::payload は 0x14-0x23 の最大 payload(CMD_MAG3D_SET 49B)で確保
+// している。他の v2 上り型がそれを超えないことをコンパイル時に固定する。
+static_assert(stampfly::CmdMode::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdMotorRun::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdAccel6Set::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdAttmountSet::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdYawzeroSet::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdGeomagSet::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdFfBegin::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdFfLut::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdFfMot::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdFfAux::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdFfCommit::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdFfMode::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+
+// v2 コマンド型(0x14-0x23)か。型レンジは stampfly_protocol.hpp の割り当てに一致。
+constexpr bool is_v2_command_type(uint8_t type) {
+    return type >= static_cast<uint8_t>(stampfly::MsgType::CMD_MODE) &&
+           type <= static_cast<uint8_t>(stampfly::MsgType::CMD_FF_ANCHOR);
+}
 
 // --- リレーピア(最初の有効上りフレームの送信元MACを学習、以後不変) ---
 portMUX_TYPE relay_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -121,7 +147,23 @@ void on_esp_now_recv(const EspNowRecvInfo* sender_info, const uint8_t* data, int
             break;
         }
         default:
-            break;  // 未対応の上り型は黙って破棄
+            // v2 コマンド(0x14-0x23)はリングへ積む(期待長は検証済み)。
+            // 満杯なら新着を落とす(PC側リトライで回復)。
+            if (is_v2_command_type(frame.type)) {
+                portENTER_CRITICAL(&command_mux);
+                if (mailbox.v2_count < V2_COMMAND_QUEUE_CAPACITY) {
+                    const size_t slot =
+                        (mailbox.v2_head + mailbox.v2_count) % V2_COMMAND_QUEUE_CAPACITY;
+                    V2Command& c = mailbox.v2_ring[slot];
+                    c.type = frame.type;
+                    c.seq = frame.seq;
+                    c.len = frame.len;
+                    if (frame.len > 0) std::memcpy(c.payload, frame.payload, frame.len);
+                    mailbox.v2_count++;
+                }
+                portEXIT_CRITICAL(&command_mux);
+            }
+            break;  // 上記以外の未対応上り型は黙って破棄
     }
 }
 
@@ -155,12 +197,20 @@ bool comm_consume_commands(CommandSnapshot* out) {
     out->setpoint = mailbox.setpoint;
     out->setpoint_seq = mailbox.setpoint_seq;
     out->setpoint_rx_ms = mailbox.setpoint_rx_ms;
+    // v2 コマンドリングを受信順に全件取り出す
+    out->v2_count = mailbox.v2_count;
+    for (size_t i = 0; i < mailbox.v2_count; i++) {
+        out->v2[i] = mailbox.v2_ring[(mailbox.v2_head + i) % V2_COMMAND_QUEUE_CAPACITY];
+    }
+    mailbox.v2_head = 0;
+    mailbox.v2_count = 0;
     mailbox.stop_pending = false;
     mailbox.start_pending = false;
     mailbox.reset_pending = false;
     mailbox.setpoint_pending = false;
     portEXIT_CRITICAL(&command_mux);
-    return out->stop_pending || out->start_pending || out->reset_pending || out->setpoint_pending;
+    return out->stop_pending || out->start_pending || out->reset_pending ||
+           out->setpoint_pending || out->v2_count > 0;
 }
 
 bool comm_relay_ready(void) {

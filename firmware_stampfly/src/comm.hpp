@@ -2,11 +2,13 @@
 // comm.hpp — ESP-NOW 送受信(機体側)
 //
 // PROTOCOL.md「ドローン側の受理規則」の実装:
-// - 受信フレームは len==期待値 / CRC一致 / ver==1 のもののみ受理
+// - 受信フレームは len==期待値 / CRC一致 / ver==PROTOCOL_VERSION のもののみ受理
 // - ブート後最初の有効上りフレームの送信元MACをリレーピアとして学習(以後不変)
 // - 受信コールバック(WiFiタスク)は検証+portMUXメールボックス格納のみ。
 //   出力・ブロッキングは行わない。400Hzループが comm_consume_commands() で消費。
 // - WiFiチャネルは FLIGHT_CONFIG.wifi_channel に esp_wifi_set_channel でピン留め
+// - v2: 上り 0x14-0x23(CMD_MODE〜CMD_FF_ANCHOR)はリングバッファに積み、
+//   400Hzループ側が型別に deserialize して処理・TLM_ACK 応答する
 // ===========================================================================
 #pragma once
 
@@ -14,6 +16,20 @@
 #include <stdint.h>
 
 #include "stampfly_protocol.hpp"
+
+// v2 コマンド(0x14-0x23)1件分。payload は parse_frame と型別期待長の検証を
+// 通過した生バイト列(消費側の flight_control が型別に deserialize する)。
+struct V2Command {
+    uint8_t type = 0;    // stampfly::MsgType の数値(0x14-0x23)
+    uint32_t seq = 0;    // 論理フレーム seq(TLM_ACK の acked_seq に使う)
+    uint8_t len = 0;     // payload 長
+    uint8_t payload[stampfly::CmdMag3dSet::PAYLOAD_SIZE] = {0};  // 49B = 0x14-0x23 の最大
+};
+
+// v2 コマンドリングの容量。キャリブ/FF系はPC側がACK待ち(1s+リトライ2回)で
+// 直列送信するため、実際の同時滞留は CMD_MOTOR_RUN キープアライブとの
+// 2〜3件程度。あふれた場合は新着を落とす(PC側リトライで回復する)。
+constexpr size_t V2_COMMAND_QUEUE_CAPACITY = 8;
 
 // 400Hzループが1tickごとに取り出すコマンドのスナップショット。
 // 優先度 STOP > START > RESET > SETPOINT は消費側(flight_control)が
@@ -26,6 +42,8 @@ struct CommandSnapshot {
     stampfly::CmdSetpoint setpoint{};       // 最新の setpoint(pending時のみ有効)
     uint32_t setpoint_seq = 0;              // その論理フレーム seq
     uint32_t setpoint_rx_ms = 0;            // 受信時刻 millis()
+    V2Command v2[V2_COMMAND_QUEUE_CAPACITY]{};  // v2 コマンド(受信順)
+    size_t v2_count = 0;                    // 取り出した v2 コマンド件数
 };
 
 // WiFi(STA)+チャネルピン留め+ESP-NOW初期化+受信コールバック登録。

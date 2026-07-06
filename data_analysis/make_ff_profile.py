@@ -6,17 +6,17 @@
 入力 (どちらか):
   --folder <path>   フォルダ内の sweep_*_{meta.json,samples.csv} ちょうど8ペア (主)
                     (パスが存在しない場合は --results-dir 直下のサブフォルダ名として解決)
-  --stems S1 .. S8  stem 8個指定 (従)。--results-dir (既定 ../pc_server/sweep_results)
+  --stems S1 .. S8  stem 8個指定 (従)。--results-dir (既定 ../pc_server/data/sweep_results)
 
 自動分類: meta.motors が FL+FR+RL+RR = 全機ラン(4本、notes.orientation 4種必須。
 表記ゆれ Yaw=+-180°/±180° 許容)、FL/FR/RL/RR 単独 = 単機ラン(各1本必須)。
 
-出力: -o/--out (既定 ../pc_server/ff_profiles/<name>.json)
+出力: -o/--out (既定 ../pc_server/data/ff_profiles/<name>.json)
   name 既定: フォルダ指定時=フォルダ名 / それ以外 ff_<最初の全機ランの日付YYYYMMDD>
   memo 既定: "<notes.locationの多数派> <acquired_span> 取得8本"
 
 使用例:
-  .venv/bin/python make_ff_profile.py --folder ../pc_server/sweep_results/DroneTest_20260629
+  .venv/bin/python make_ff_profile.py --folder ../pc_server/data/sweep_results/DroneTest_20260629
   .venv/bin/python make_ff_profile.py --stems sweep_20260629_141809 ... (8個) \
       --name Drone-test_20260629 --memo "..."
 """
@@ -33,8 +33,8 @@ sys.path.insert(0, str(HERE))
 
 from ff_params import core  # noqa: E402
 
-DEFAULT_RESULTS_DIR = HERE.parent / "pc_server" / "sweep_results"
-DEFAULT_OUT_DIR = HERE.parent / "pc_server" / "ff_profiles"
+DEFAULT_RESULTS_DIR = HERE.parent / "pc_server" / "data" / "sweep_results"
+DEFAULT_OUT_DIR = HERE.parent / "pc_server" / "data" / "ff_profiles"
 
 
 def _find_pairs(folder: Path) -> list[str]:
@@ -53,11 +53,11 @@ def main(argv=None) -> int:
     src.add_argument("--folder", help="8ペア(16ファイル)入りフォルダ (主)")
     src.add_argument("--stems", nargs="+", help="stem 8個 (従)")
     ap.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR),
-                    help="--stems 時の探索dir (既定 ../pc_server/sweep_results)")
+                    help="--stems 時の探索dir (既定 ../pc_server/data/sweep_results)")
     ap.add_argument("--name", help="プロファイル名 (既定: フォルダ名 or ff_<日付>)")
     ap.add_argument("--memo", help="1行メモ (既定: 自動生成)")
     ap.add_argument("-o", "--out",
-                    help="出力先 (.json ファイル or dir。既定 ../pc_server/ff_profiles/<name>.json)")
+                    help="出力先 (.json ファイル or dir。既定 ../pc_server/data/ff_profiles/<name>.json)")
     ap.add_argument("--plots", action="store_true", help="検証図PNGを出力 (既定off)")
     args = ap.parse_args(argv)
 

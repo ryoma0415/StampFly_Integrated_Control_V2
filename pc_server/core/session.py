@@ -35,6 +35,7 @@ from .experiment import ExperimentHub
 from .ffprofile import FfProfileManager
 from .logger import FlightLogger
 from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
+from .multi import MultiControlManager
 from .position import PositionController
 from .posture import PostureController, run_paced_loop
 from .serial_link import SerialLink, SerialLinkError
@@ -42,8 +43,9 @@ from .serial_link import SerialLink, SerialLinkError
 MODE_POSTURE = "posture"
 MODE_POSITION = "position"
 MODE_EXPERIMENT = "experiment"   # v2: モーターテスト/スイープ/キャリブ実験
+MODE_MULTI = "multi"             # 複数機同時位置制御(2〜4機、MoCap)
 
-_ALL_MODES = (MODE_POSTURE, MODE_POSITION, MODE_EXPERIMENT)
+_ALL_MODES = (MODE_POSTURE, MODE_POSITION, MODE_EXPERIMENT, MODE_MULTI)
 
 PHASE_IDLE = "idle"
 PHASE_CONNECTED = "connected"
@@ -129,6 +131,10 @@ class SessionManager:
         self.server_config = server_config or cfg.load_server_config()
         self.control_config = control_config or cfg.load_control_config()
         self.airframes = airframes if airframes is not None else cfg.load_airframes()
+        # 旧形式(rigid_body_id なし)のプロファイルをメモリ上で正規化する
+        # (update_airframes の同一性比較・複数機モードの参照を一貫させる)
+        for profile in self.airframes:
+            profile.setdefault("rigid_body_id", None)
 
         failsafe = self.server_config["failsafe"]
         self._stop_ack_timeout_s: float = failsafe["stop_ack_timeout_s"]
@@ -169,6 +175,14 @@ class SessionManager:
             tlm_state_provider=self._tlm_state_snapshot)
         self.ffprofile = FfProfileManager(self.serial, self.experiment,
                                           self.calibration, notify=self.warn)
+        # 複数機同時制御(MODE_MULTI)。ノード付き受信ハンドラは
+        # MultiControlManager 自身が serial に登録する。
+        self.multi = MultiControlManager(
+            self.server_config, self.control_config, self.serial, self.mocap,
+            notify_info=self.info, notify_warn=self.warn,
+            # WS 行きの dict は非有限 float を必ず None 化する(規約)
+            events_put=lambda event: self.events.put(_json_safe(event)),
+            clock=clock)
 
         # 受信ディスパッチ登録(ハンドラは RX スレッド上: ブロッキング禁止)
         self.serial.register_handler(proto.MsgType.TLM_STATE, self._on_tlm_state)
@@ -264,6 +278,8 @@ class SessionManager:
         if mode == MODE_EXPERIMENT:
             # 実験モードで接続: 50Hz 送信は開始せず CMD_MODE(1)+ACK
             self._enter_experiment()
+        elif mode == MODE_MULTI:
+            pass   # 複数機モード: multi_select(RLY_SET_PEERS)まで送信なし
         else:
             self._start_active_sender()
         if self._logging_enabled:
@@ -307,6 +323,12 @@ class SessionManager:
             if self._phase in (PHASE_ARMED, PHASE_FLYING):
                 self._warn_locked("飛行中は機体プロファイルを変更できません")
                 return False
+        if self.multi.active:
+            # RLY_SET_TARGET はリレーのマルチピア表をクリアするため、選択中は
+            # 地上でも拒否する(飛行中に許すと全機への上り経路が切断される)
+            self.warn("複数機モードの機体選択中は機体プロファイルを変更できません"
+                      "(先に複数機の選択を解除してください)")
+            return False
         self._apply_airframe(profile)
         if self.serial.is_connected:
             self._configure_relay_target(profile)
@@ -351,6 +373,15 @@ class SessionManager:
             if replacement != current:
                 return False, (f"飛行中のため、選択中の機体プロファイル"
                                f"「{current['name']}」の変更・削除はできません。"
+                               "着陸後にやり直してください")
+
+        # --- 飛行ガード(複数機): 飛行中スロットのプロファイル変更/削除を拒否 ---
+        for name, profile in self.multi.flying_profiles().items():
+            replacement = next(
+                (p for p in normalized if p["name"] == name), None)
+            if replacement != profile:
+                return False, (f"複数機制御で飛行中のため、機体プロファイル"
+                               f"「{name}」の変更・削除はできません。"
                                "着陸後にやり直してください")
 
         # --- 永続化(原子的書き込み)→ メモリ反映 ---
@@ -415,9 +446,10 @@ class SessionManager:
         """プロファイル配列を検証し、正規化済みリストを返す。
 
         正規化: キーを正準順(name, mac, wifi_channel, roll_bias_deg,
-        pitch_bias_deg, default_alt_m, notes)に揃え、数値型・MAC 表記
-        ("AA:BB:..." 大文字)を統一する。制限値は server.json
-        (clamps.max_roll_pitch_deg / airframe_limits)から取る。
+        pitch_bias_deg, default_alt_m, rigid_body_id, notes)に揃え、
+        数値型・MAC 表記("AA:BB:..." 大文字)を統一する。制限値は
+        server.json(clamps.max_roll_pitch_deg / airframe_limits)から取る。
+        rigid_body_id は任意(複数機モードで必須。null = 未設定)。
         """
         limits = self.server_config["airframe_limits"]
         ch_min, ch_max = limits["wifi_channel_min"], limits["wifi_channel_max"]
@@ -428,6 +460,7 @@ class SessionManager:
         bias_limit = self.server_config["clamps"]["max_roll_pitch_deg"]
         required_keys = ("name", "mac", "wifi_channel", "roll_bias_deg",
                          "pitch_bias_deg", "default_alt_m", "notes")
+        optional_keys = ("rigid_body_id",)   # 複数機モード用(null = 未設定)
 
         if not isinstance(new_airframes, list) or not new_airframes:
             return False, "機体プロファイルは1件以上の配列で指定してください", []
@@ -445,7 +478,8 @@ class SessionManager:
             missing = [k for k in required_keys if k not in entry]
             if missing:
                 return False, f"{label}: キーが不足しています: {', '.join(missing)}", []
-            unknown = [k for k in entry if k not in required_keys]
+            unknown = [k for k in entry
+                       if k not in required_keys and k not in optional_keys]
             if unknown:
                 return False, f"{label}: 不明なキーがあります: {', '.join(unknown)}", []
 
@@ -499,6 +533,14 @@ class SessionManager:
                 return False, (f"{label}: notes は {notes_max} 文字以内で"
                                "指定してください"), []
 
+            rigid_body_id = entry.get("rigid_body_id")
+            if rigid_body_id is not None:
+                if isinstance(rigid_body_id, bool) \
+                        or not isinstance(rigid_body_id, int) \
+                        or rigid_body_id < 1:
+                    return False, (f"{label}: rigid_body_id は 1 以上の整数"
+                                   "(未設定なら null)で指定してください"), []
+
             normalized.append({
                 "name": name,
                 "mac": mac,
@@ -506,6 +548,7 @@ class SessionManager:
                 "roll_bias_deg": numbers["roll_bias_deg"],
                 "pitch_bias_deg": numbers["pitch_bias_deg"],
                 "default_alt_m": numbers["default_alt_m"],
+                "rigid_body_id": rigid_body_id,
                 "notes": notes,
             })
         return True, None, normalized
@@ -529,9 +572,15 @@ class SessionManager:
             if self._mode == mode:
                 return True
             previous = self._mode
+        if self.multi.any_armed_or_flying():
+            self.warn("複数機制御中はモードを変更できません")
+            return False
         if previous == MODE_EXPERIMENT:
             # 実験モードからの離脱: モーター停止確認 → CMD_MODE(0)+ACK
             self._exit_experiment()
+        if previous == MODE_MULTI:
+            # 複数機モードからの離脱: スロット解放+単機ターゲットへ復帰
+            self._exit_multi()
         self._stop_active_sender()
         with self._lock:
             self._mode = mode
@@ -541,9 +590,11 @@ class SessionManager:
                     # 機体が MOTOR_TEST に入れなかった → 元のモードへ戻す
                     with self._lock:
                         self._mode = previous
-                    if previous != MODE_EXPERIMENT:
+                    if previous not in (MODE_EXPERIMENT, MODE_MULTI):
                         self._start_active_sender()
                     return False
+            elif mode == MODE_MULTI:
+                pass   # multi_select(RLY_SET_PEERS)まで送信なし
             else:
                 self._start_active_sender()
             if self._logging_enabled:
@@ -583,6 +634,18 @@ class SessionManager:
         self.info("実験モード開始(機体: MOTOR_TEST)")
         return True
 
+    def _exit_multi(self) -> None:
+        """複数機モードの離脱: スロット解放+リレーを単機ターゲットへ戻す。"""
+        with self._lock:
+            airframe = self._airframe
+        if self.serial.is_connected and airframe is not None \
+                and cfg.mac_is_set(airframe.get("mac")):
+            # ピア表は RLY_SET_TARGET が上書きクリアするため個別クリア不要
+            self.multi.deactivate(clear_peers=False)
+            self._configure_relay_target(airframe)
+        else:
+            self.multi.deactivate(clear_peers=True)
+
     def _exit_experiment(self) -> None:
         """実験機能を停止し、接続中なら CMD_MODE(0) で WAIT に戻す。"""
         self.experiment.deactivate()   # スイープ中断+モーター停止を含む
@@ -619,6 +682,10 @@ class SessionManager:
             # CMD_START を reason=10 で拒否する)
             self.warn("実験モード中は離陸できません")
             return False
+        if mode == MODE_MULTI:
+            # 複数機モードは専用の一斉開始(multi_start)を使う
+            self.warn("複数機モードでは「一斉スタート」を使用してください")
+            return False
         if airframe is None:
             # 接続後でも PUT /api/airframes で選択中プロファイルが削除/MAC 未設定化
             # されると選択は解除される(_refresh_selected_airframe)。プロファイル
@@ -653,6 +720,9 @@ class SessionManager:
         self.position.set_control_active(False)
         with self._lock:
             mode = self._mode
+        if mode == MODE_MULTI:
+            # 複数機モード: 全機へ CMD_STOP(スロットごとの再送監視つき)
+            return self.multi.stop_all()
         if mode == MODE_EXPERIMENT:
             # 緊急停止: スイープ/シーケンス中断+モーター停止(キープアライブ
             # が回し続けないよう PC 側状態も落とす)。CMD_STOP で機体は
@@ -691,12 +761,16 @@ class SessionManager:
         呼ばれる通常の stop() が _command_lock 下で行う)。
         """
         self.position.set_control_active(False)
+        # 複数機モード: 全機へ CMD_STOP を先行送出(状態管理は後続の stop())
+        self.multi.emergency_stop_all()
         # スイープ/シーケンス中断+モーター停止+キープアライブ停止
         # (CMD_MOTOR_STOP は飛行状態では機体側が bad_state で無害に破棄する)
         self.experiment.sequence.abort_if_running()
         self.experiment.sweep.abort_if_running()
         self.experiment.motor_stop()
-        if self.serial.is_connected:
+        if self.serial.is_connected and not self.multi.active:
+            # 単機経路の CMD_STOP(マルチ中は非エンベロープ上りをリレーが
+            # 拒否するため送らない — 全機分は emergency_stop_all が送出済み)
             self._send_stop()
 
     @_ui_command
@@ -778,6 +852,62 @@ class SessionManager:
     def circle_stop(self) -> None:
         self.position.stop_circle()
         self.info("円軌道停止: 現在目標でホバリングに復帰します")
+
+    # ------------------------------------------------------------------
+    # 複数機同時制御(Multi タブ)
+    # ------------------------------------------------------------------
+
+    @_ui_command
+    def multi_select(self, names: list[str]) -> bool:
+        """複数機モードの機体選択(RLY_SET_PEERS + スロット構築)。"""
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_MULTI:
+            self.warn("複数機モードではありません")
+            return False
+        ok, message = self.multi.select(names, self.airframes)
+        if not ok:
+            self.warn(f"機体選択不可: {message}")
+        return ok
+
+    @_ui_command
+    def multi_target(self, name: str, x: float, y: float, z: float) -> bool:
+        """機体別の目標位置(制御座標系 m)。
+
+        _command_lock で multi_start と直列化する(一斉開始の目標間隔検証と
+        目標変更の TOCTOU を防ぐ。UI はボタン押下時のみ送るため低頻度)。
+        """
+        ok, message = self.multi.set_target(name, x, y, z)
+        if not ok:
+            self.warn(f"目標設定不可: {message}")
+        return ok
+
+    @_ui_command
+    def multi_start(self) -> bool:
+        """選択済み全機の一斉離陸。"""
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_MULTI:
+            self.warn("複数機モードではありません")
+            return False
+        ok, message = self.multi.start_all()
+        if not ok:
+            self.warn(f"一斉開始不可: {message}")
+        return ok
+
+    def mocap_bodies(self) -> dict:
+        """現在観測中の全リジッドボディ一覧(紐付け確認 UI 用)。
+
+        NatNet 未接続なら接続を試みる(primary コールバックは単機 Position
+        モード専用のため no-op で起動する。既に起動済みなら何もしない)。
+        """
+        connected = self.mocap.connected()
+        if not connected:
+            connected = self.mocap.start()   # パッシブ起動(primary は触らない)
+        return {
+            "connected": bool(connected),
+            "bodies": _json_safe(self.mocap.bodies_snapshot()),
+        }
 
     # ------------------------------------------------------------------
     # v2: モーターテスト(Experiment タブ)
@@ -902,6 +1032,9 @@ class SessionManager:
 
     def _teardown_session(self, message: str) -> None:
         self._stop_active_sender()
+        # 複数機スロットを解放(シリアルはこの後閉じるためピア解除は送らない。
+        # 各機体はセットポイント 500ms 途絶で自動着陸する)
+        self.multi.deactivate(clear_peers=False)
         # 実験機能を停止(シリアルはこの後閉じるため CMD_MODE は送らない。
         # 機体側はモーターコマンド 1.5s 途絶で自動停止する)
         self.experiment.deactivate()
@@ -1249,6 +1382,9 @@ class SessionManager:
                 self.warn("MoCap 途絶 >2s: CMD_STOP を送信します(自動着陸)")
                 self.stop()
 
+        # --- 複数機モード(スロットごとの STOP 再送 / MoCap 途絶 / 猶予) ---
+        self.multi.supervise(now)
+
     def _send_stop(self) -> bool:
         try:
             self.serial.send(proto.MsgType.CMD_STOP)
@@ -1447,6 +1583,10 @@ class SessionManager:
                 },
             }
         session["experiment"] = experiment
+
+        # 複数機モードの状態(UI の複数機タブが 20Hz で参照)
+        session["multi"] = (self.multi.snapshot(now)
+                            if mode == MODE_MULTI else None)
 
         # TLM 由来の非有限 float を一括で None 化(WS の JSON を壊さない)
         return _json_safe({

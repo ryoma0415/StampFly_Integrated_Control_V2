@@ -2,10 +2,21 @@
   "host": "127.0.0.1",
   "port": 8000,
   "serial": {
-    "baudrate": 115200,
+    "baudrate": 460800,
     "read_timeout_s": 0.05,
     "write_timeout_s": 0.2,
     "read_chunk_bytes": 512
+  },
+  "multi": {
+    "min_drones": 2,
+    "max_drones": 4,
+    "tlm_state_div": 1,
+    "target_xy_abs_max_m": 2.0,
+    "min_target_separation_m": 0.5,
+    "tlm_timeout_s": 3.0,
+    "start_ground_z_max_m": 0.3,
+    "divergence_error_m": 1.0,
+    "divergence_hold_s": 1.0
   },
   "rates": {
     "setpoint_hz": 50,

@@ -204,6 +204,31 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
         return sp.RlyStats(*(rng.randrange(2**32) for _ in range(6)))
     if msg_type == sp.MsgType.RLY_PONG:
         return sp.RlyPong(echo_seq=rng.randrange(2**32))
+    if msg_type == sp.MsgType.RLY_SET_PEERS:
+        count = rng.randrange(sp.RLY_MAX_PEERS + 1)
+        return sp.RlySetPeers(
+            wifi_channel=rng.randrange(1, 14) if count else 0,
+            peers=tuple(
+                sp.RlyPeer(mac=bytes(rng.randrange(256) for _ in range(6)),
+                           tlm_state_div=rng.randrange(1, 5))
+                for _ in range(count)))
+    if msg_type == sp.MsgType.RLY_PEERS_ACK:
+        return sp.RlyPeersAck(
+            status=rng.randrange(5),
+            count=rng.randrange(sp.RLY_MAX_PEERS + 1),
+            wifi_channel=rng.randrange(1, 14),
+            failed_index=rng.choice(
+                [sp.RlyPeersAck.FAILED_NONE, rng.randrange(sp.RLY_MAX_PEERS)]))
+    if msg_type in (sp.MsgType.RLY_MUX_UP, sp.MsgType.RLY_MUX_DOWN):
+        # 内側フレームもランダム生成(上り/下りの代表型を包む)
+        inner_type = rng.choice([sp.MsgType.CMD_SETPOINT, sp.MsgType.CMD_STOP,
+                                 sp.MsgType.TLM_EVENT, sp.MsgType.TLM_STATE])
+        inner_msg = random_message(rng, inner_type)
+        inner_payload = b"" if inner_msg is None else inner_msg.to_payload()
+        inner = sp.pack_frame(inner_type, rng.randrange(2**32), inner_payload)
+        cls = (sp.RlyMuxUp if msg_type == sp.MsgType.RLY_MUX_UP
+               else sp.RlyMuxDown)
+        return cls(node_id=rng.randrange(sp.RLY_MAX_PEERS), inner=inner)
     raise AssertionError(f"unhandled type: {msg_type!r}")
 
 

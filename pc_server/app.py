@@ -168,6 +168,16 @@ async def api_config() -> dict:
     return {"server": session.server_config, "control": session.control_config}
 
 
+@app.get("/api/mocap/bodies")
+async def api_mocap_bodies() -> dict:
+    """観測中の全リジッドボディ一覧(複数機タブの紐付け確認用)。
+
+    NatNet 未接続なら接続を試みる。UI はこれをポーリングして ID と座標を
+    ライブ表示し、機体プロファイルの rigid_body_id 割り当てを支援する。
+    """
+    return await asyncio.to_thread(session.mocap_bodies)
+
+
 # ----------------------------------------------------------------------
 # v2 REST(Experiment タブ)。すべてブロッキングし得るため to_thread。
 # 失敗も HTTP 200 で {"ok": false, "message": ...} を返し UI が表示する。
@@ -382,6 +392,13 @@ async def _handle_command(message: dict) -> None:
                                 float(message.get("duty", 0.0)))
     elif action == "motor_stop":
         await asyncio.to_thread(session.motor_stop)
+    elif action == "multi_select":
+        names = message.get("names")
+        await asyncio.to_thread(
+            session.multi_select,
+            [str(n) for n in names] if isinstance(names, list) else [])
+    elif action == "multi_start":
+        await asyncio.to_thread(session.multi_start)
     else:
         session.warn(f"不明なコマンド: {action}")
 
@@ -426,6 +443,12 @@ async def _handle_message(message: dict) -> None:
             session.set_target(float(message["x"]),
                                float(message["y"]),
                                float(message["z"]))
+        elif msg_type == "multi_target":
+            # 複数機モード: 機体別の目標位置(非ブロッキング)
+            session.multi_target(str(message["name"]),
+                                 float(message["x"]),
+                                 float(message["y"]),
+                                 float(message["z"]))
         else:
             session.warn(f"不明なメッセージ型: {msg_type}")
     except (KeyError, TypeError, ValueError) as exc:

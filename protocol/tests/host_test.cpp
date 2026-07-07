@@ -562,6 +562,32 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.echo_seq = ju32(f, "echo_seq");
     ok = serialize(m, buf, sizeof(buf));
     n = RlyPong::PAYLOAD_SIZE;
+  } else if (kind == "RLY_SET_PEERS") {
+    RlySetPeers m;
+    const auto& peers = f.at("peers").arr;
+    m.count = static_cast<uint8_t>(peers.size());
+    m.wifi_channel = ju8(f, "wifi_channel");
+    for (size_t i = 0; i < peers.size(); ++i) {
+      const auto& mac = peers.at(i).at("mac").arr;
+      for (size_t j = 0; j < 6; ++j) {
+        m.peers[i].mac[j] = static_cast<uint8_t>(mac.at(j).num);
+      }
+      m.peers[i].tlm_state_div =
+          static_cast<uint8_t>(peers.at(i).at("tlm_state_div").num);
+    }
+    ok = serialize(m, buf, sizeof(buf), &n);
+  } else if (kind == "RLY_PEERS_ACK") {
+    RlyPeersAck m;
+    m.status = ju8(f, "status");
+    m.count = ju8(f, "count");
+    m.wifi_channel = ju8(f, "wifi_channel");
+    m.failed_index = ju8(f, "failed_index");
+    ok = serialize(m, buf, sizeof(buf));
+    n = RlyPeersAck::PAYLOAD_SIZE;
+  } else if (kind == "RLY_MUX_UP" || kind == "RLY_MUX_DOWN") {
+    const std::vector<uint8_t> inner = hex_to_bytes(f.at("inner_hex").str);
+    n = mux_wrap(ju8(f, "node_id"), inner.data(), inner.size(), buf, sizeof(buf));
+    ok = n != 0;
   } else {
     std::fprintf(stderr, "unknown payload_kind: %s\n", kind.c_str());
     std::exit(2);
@@ -675,6 +701,21 @@ std::vector<uint8_t> reserialize_payload(const std::string& kind,
     RlyPong m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
     n = RlyPong::PAYLOAD_SIZE;
+  } else if (kind == "RLY_SET_PEERS") {
+    RlySetPeers m;
+    ok = deserialize(payload.data(), payload.size(), &m) &&
+         serialize(m, buf, sizeof(buf), &n);
+  } else if (kind == "RLY_PEERS_ACK") {
+    RlyPeersAck m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = RlyPeersAck::PAYLOAD_SIZE;
+  } else if (kind == "RLY_MUX_UP" || kind == "RLY_MUX_DOWN") {
+    RlyMuxView mv;
+    ok = mux_unwrap(payload.data(), payload.size(), &mv);
+    if (ok) {
+      n = mux_wrap(mv.node_id, mv.inner, mv.inner_len, buf, sizeof(buf));
+      ok = n != 0;
+    }
   } else {
     std::fprintf(stderr, "reserialize: unknown payload_kind: %s\n", kind.c_str());
     std::exit(2);

@@ -7,7 +7,8 @@ import pytest
 from core.mocap import CoordinateTransformer, MocapSource
 from core.position import PositionController
 
-from fakes import FakeClock, FakeNatNetClient, make_mocap_frame, make_pose
+from fakes import (FakeClock, FakeNatNetClient, make_mocap_frame,
+                   make_mocap_frame_multi, make_pose)
 
 STEP_DT = 0.02
 FRAME_DT = 0.01   # mocap 100Hz 相当
@@ -181,4 +182,48 @@ class TestMocapSource:
         assert poses == []
         assert source.latest_pose() is None
         assert source.stats()["frames_without_rigid_body"] == 1
+        # インベントリ(紐付け確認)には対象外IDも記録される
+        bodies = source.bodies_snapshot()
+        assert [b["rigid_body_id"] for b in bodies] == [99]
+        source.shutdown()
+
+    def test_subscribe_dispatches_per_rigid_body(self, control_config):
+        """subscribe した ID には個別コールバック、primary は従来どおり。"""
+        FakeNatNetClient.instances.clear()
+        source = MocapSource(control_config["natnet"],
+                             control_config["coordinate_transform"],
+                             client_factory=FakeNatNetClient)
+        primary_poses: list[dict] = []
+        sub_poses: list[dict] = []
+        source.start(primary_poses.append)
+        source.subscribe(2, sub_poses.append)
+        client = FakeNatNetClient.instances[-1]
+
+        client.new_frame_with_data_listener(make_mocap_frame_multi([
+            {"rigid_body_id": 1, "pos": (0.1, 0.3, 0.2)},
+            {"rigid_body_id": 2, "pos": (0.5, 0.4, -0.2)},
+        ], frame_number=7))
+
+        # primary(control.json natnet.rigid_body_id=1)は従来経路
+        assert len(primary_poses) == 1
+        assert primary_poses[0]["rigid_body_id"] == 1
+        assert primary_poses[0]["x"] == pytest.approx(0.2)
+        # subscribe(2) には ID 2 の pose のみが届く
+        assert len(sub_poses) == 1
+        assert sub_poses[0]["rigid_body_id"] == 2
+        assert sub_poses[0]["x"] == pytest.approx(-0.2)   # ← Motive z
+        assert sub_poses[0]["y"] == pytest.approx(-0.5)   # ← −Motive x
+        assert sub_poses[0]["z"] == pytest.approx(0.4)    # ← Motive y
+
+        # インベントリには両方が ID 昇順で載り、age_s を持つ
+        bodies = source.bodies_snapshot()
+        assert [b["rigid_body_id"] for b in bodies] == [1, 2]
+        assert all(b["age_s"] >= 0.0 for b in bodies)
+
+        # unsubscribe 後は届かない
+        source.unsubscribe(2)
+        client.new_frame_with_data_listener(make_mocap_frame_multi([
+            {"rigid_body_id": 2, "pos": (0.5, 0.4, -0.2)},
+        ]))
+        assert len(sub_poses) == 1
         source.shutdown()

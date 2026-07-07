@@ -2,16 +2,18 @@
 
 StampFly(ESP32-S3 クアッドコプター)を PC のブラウザ UI から運用する統合制御システム。
 機体ファームウェアは1本のみで、**Posture(姿勢制御)/ Position(位置制御)/
-Experiment(ベンチ実験)の切替は PC 側だけ**で行う(ファーム書き換え・再起動は不要)。
+Experiment(ベンチ実験)/ Multi(複数機)の切替は PC 側だけ**で行う
+(ファーム書き換え・再起動は不要)。
 
 v2 では **ヨー推定・ヨー角制御**(BMM150 磁気+INA3221 電流によるモーター電流FF補正
 +4状態EKF)、**実験モード**(モーターテスト・電流×磁場スイープ・各種キャリブレーション)、
-**円軌道モード**、**飛行ログビューア**が追加された(プロトコルは v2 = 0x02)。
+**円軌道モード**、**複数機モード**(2〜4機の同時位置制御。リレーの多重化拡張のみで
+機体ファーム無改修)、**飛行ログビューア**が追加された(プロトコルは v2 = 0x02)。
 
 | 文書 | 内容 |
 |---|---|
 | 本書(README.md) | セットアップ・UI の使い方・トラブルシューティング |
-| [docs/OPERATION_GUIDE.md](docs/OPERATION_GUIDE.md) | 段階的な安全飛行手順・緊急時対応・機体プロファイル較正・v2 運用手順(実験モード/ヨー較正/ヨー制御飛行/円軌道/飛行後解析) |
+| [docs/OPERATION_GUIDE.md](docs/OPERATION_GUIDE.md) | 段階的な安全飛行手順・緊急時対応・機体プロファイル較正・v2 運用手順(実験モード/ヨー較正/ヨー制御飛行/円軌道/飛行後解析/複数機モード) |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | 通信ワイヤ仕様(正典) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | モジュール構成・API 契約・コーディング規約(正典) |
 | [docs/LOG_STRUCTURE.md](docs/LOG_STRUCTURE.md) | CSV フライトログの列定義(v2: 94列) |
@@ -31,18 +33,20 @@ OptiTrack カメラ群 ──> Motive(バージョン未確認 → §4.3。NatNe
 │  ・Posture:   UI スライダ → CMD_SETPOINT(roll/pitch/alt/yaw)  │
 │  ・Position:  NatNet → フィルタ → XY PID → CMD_SETPOINT         │
 │               (v2: 円軌道 = 目標XYを時間更新して同じPIDへ)     │
+│  ・Multi(v2): 2〜4機の同時位置制御(機体ごとに 50Hz 送信)      │
 │  ・Experiment(v2): モーターテスト/スイープ/キャリブ/FF 適用     │
 │  ・CSV ログ(logs/、ON 時のみ 50Hz・94列)                      │
 │  ・生成データ: pc_server/data/(sweep_results, ff_profiles,     │
 │    calibration_profiles, ff_state.json)                        │
 └───────────────┬─────────────────────────────────────────────────┘
-                │ USB シリアル 115200 8N1
+                │ USB シリアル 460800 8N1(v2 既定。フォールバック 115200)
                 │ (COBS フレーミング + CRC16-CCITT-FALSE、ver=0x02)
                 v
-        リレー(ESP32-WROOM-32E DevKitC)※v2 無改修
+        リレー(ESP32-WROOM-32E DevKitC)v2: 複数機対応(要再書き込み §3)
         型レンジでルーティング・統計(RLY_STATS 1Hz)
+        v2: 最大4機のピア管理+RLY_MUX 多重化(複数機モード)
                 │
-                │ ESP-NOW(WiFi ch1 既定、論理フレームそのまま)
+                │ ESP-NOW(WiFi ch1 既定、論理フレームそのまま — 単機時と同一)
                 v
         機体 StampFly(ESP32-S3, 400Hz 割り込み制御ループ)
         姿勢+高度+ヨー角のセットポイント追従・自律フェイルセーフ
@@ -54,7 +58,8 @@ OptiTrack カメラ群 ──> Motive(バージョン未確認 → §4.3。NatNe
 主なレート(PROTOCOL.md 規範): CMD_SETPOINT 50Hz(上り、ハートビート兼用。
 experiment モード中は停止)/ TLM_STATE 25Hz(下り、135B)/ TLM_EVENT 即時+2Hz /
 TLM_EXP 25Hz(MOTOR_TEST 中のみ)/ CMD_MOTOR_RUN 0.4s キープアライブ /
-RLY_STATS 1Hz。
+RLY_STATS 1Hz。複数機モードでは CMD_SETPOINT 50Hz・TLM_STATE 25Hz が
+**機体ごと**に流れる(このため v2 でシリアルは既定 460800 になった)。
 
 機体ごとの違い(MAC、角度バイアス)は `pc_server/config/airframes.json` の
 **機体プロファイル**で吸収する。ファームに機体固有定数は置かない。
@@ -66,7 +71,7 @@ RLY_STATS 1Hz。
 ```
 protocol/            通信プロトコルの単一真実(C++/Python 実装+テストベクタ)
 firmware_stampfly/   機体ファーム(src/yaw_estimation/ = v2 ヨー推定モジュール)
-firmware_relay/      リレーファーム(v2 無改修)
+firmware_relay/      リレーファーム(v2: 複数機多重化対応+UART 460800 化)
 pc_server/           FastAPI サーバ+ブラウザ UI+実験/キャリブ/FF 機能
   ├─ config/         設定(server/control/airframes/geomagnetic_profiles ほか)
   └─ data/           生成データ(sweep_results / ff_profiles /
@@ -128,8 +133,15 @@ Position モードでは追加で:
   (airframes.json)の `wifi_channel` と一致させること。
 - **v2 のプロトコルは ver=0x02**。v1 ファームと v2 サーバ(またはその逆)を
   混在させるとフレームは破棄され `ver_errors`(RLY_STATS では crc_errors に合算)
-  として現れる。機体・リレー・PC を揃えて更新すること(リレーはコード無改修
-  だが、プロトコルヘッダを含むため再ビルド・再書き込みが必要)。
+  として現れる。機体・リレー・PC を揃えて更新すること。
+- **リレーは v2 で複数機対応+UART 460800 化されたため再書き込み必須**
+  (機体ファームは複数機モードでも無改修)。既定 env(`release`)の UART は
+  **460800** で、PC 側 `pc_server/config/server.json` の `serial.baudrate`
+  (既定 460800)と一致させる。460800 が動かない USB シリアルブリッジ向けに
+  `release-115200` env がある:
+  `~/.platformio/penv/bin/pio run -d firmware_relay -e release-115200 -t upload`。
+  この場合は `serial.baudrate` を 115200 に戻す(複数機は帯域不足のため
+  2機まで+`multi.tlm_state_div` 間引き推奨。OPERATION_GUIDE.md §16)。
 
 ## 4. pc_server ほか Python 環境のセットアップ
 
@@ -179,6 +191,7 @@ cd ..
   "roll_bias_deg": -0.573,
   "pitch_bias_deg": -0.573,
   "default_alt_m": 0.3,
+  "rigid_body_id": null,
   "notes": "MAC未確認。..."
 }
 ```
@@ -189,6 +202,7 @@ cd ..
 | `wifi_channel` | ファームのチャネル(既定 1)と一致させる(1–13) |
 | `roll_bias_deg` / `pitch_bias_deg` | 機体差の角度バイアス(±10° 以内)。**PC 側で指令に加算**される。較正手順は OPERATION_GUIDE.md §7 |
 | `default_alt_m` | プロファイル選択時の初期目標高度(0.05–1.5m) |
+| `rigid_body_id` | MoCap リジッドボディの streaming ID(1 以上の整数。`null` = 未設定)。**複数機モード(Multi)で必須**。UI 編集モーダルの「RB ID」列で設定し、Multi タブの「リジッドボディ確認」で ID を照合できる(OPERATION_GUIDE.md §16)。単機 Position モードは従来どおり `control.json` の `natnet.rigid_body_id` を使う |
 | `notes` | メモ(UI のプルダウンにツールチップ表示) |
 
 **登録済み機体**(2026-06-11 の手書き記録で全5機のMAC対応を確定済み):
@@ -262,9 +276,9 @@ cd pc_server
 起動直後は「サーバー未接続」オーバーレイが出るが、WebSocket 接続が確立すると消える
 (切断時は 1 秒間隔で自動再接続)。
 
-タブは **Posture / Position / Experiment** の 3 つ。タブ切替 = モード切替で、
+タブは **Posture / Position / Experiment / Multi** の 4 つ。タブ切替 = モード切替で、
 飛行中は切り替えられない。**SPACE キーの緊急停止は全タブで有効**
-(Experiment 中は CMD_MOTOR_STOP も送出)。
+(Experiment 中は CMD_MOTOR_STOP も送出。Multi 中は全機一斉 STOP)。
 
 ### 5.1 ヘッダ(接続・機体・リンク状態)
 
@@ -376,7 +390,24 @@ Posture・Position 両タブの下部に共通のヨー操作欄がある:
 
 一連のヨー較正手順(どの順で何をやるか)は OPERATION_GUIDE.md §12。
 
-### 5.6 共通モニタ・緊急停止・ログ
+### 5.6 Multi タブ(複数機同時制御、v2)
+
+2〜4機を同時に MoCap 位置制御するタブ(静的目標のみ・ヨー角制御 OFF・
+CSV ログなし)。**リレーが複数機対応ファームであること**(§3)と、各機体
+プロファイルの `rigid_body_id` 設定(§4.2)が前提。
+
+- **機体選択(2〜4機)**: チェックボックスで選び「**選択適用**」。リレーへ
+  RLY_SET_PEERS が送られる(全機同一 `wifi_channel`・MAC/RB ID 設定済みが必要)。
+- **リジッドボディ確認**: 「確認開始」で観測中の全リジッドボディ
+  (`/api/mocap/bodies`、500ms ポーリング)の ID と座標をライブ表示。
+  機体を1機ずつ動かして ID を特定し、「編集」の RB ID 列へ設定する。
+- **機体別目標**: 機体ごとの X/Y/Z 入力(XY ±2m。目標同士の XY 間隔 0.5m 以上)。
+- **共有 XY プロット**: 全機の現在位置・目標を機体別の色で表示。
+- **一斉スタート**(確認ダイアログあり): 全機の目標設定・MoCap 鮮度・目標間隔を
+  検証してから全機へ CMD_START。**STOP / SPACE は全機一斉着陸**。
+- 運用手順と安全規則は OPERATION_GUIDE.md §16 を必ず読むこと。
+
+### 5.7 共通モニタ・緊急停止・ログ
 
 - **状態バッジ**: 機体の FlightState(INIT/CALIBRATION/WAIT/TAKEOFF/HOVER/LANDING/
   COMPLETE/**MOTOR_TEST**(v2))+ phase / mode / 機体名。
@@ -389,8 +420,9 @@ Posture・Position 両タブの下部に共通のヨー操作欄がある:
   「RLY_STATS のカウンタ集計規則」)。
 - **緊急停止**: **SPACE キー = どこからでも即 STOP**(フォーカス位置・タブに
   関わらず効く。Experiment 中は CMD_MOTOR_STOP も送出し、スイープ/シーケンスも
-  中断)。STOP は全飛行状態で受理され、600ms 以内に着陸イベントがなければ
-  自動再送(最大3回)される。エスカレーション手順は OPERATION_GUIDE.md §2。
+  中断。**Multi 中は全機へ一斉 CMD_STOP**)。STOP は全飛行状態で受理され、
+  600ms 以内に着陸イベントがなければ自動再送(最大3回)される。
+  エスカレーション手順は OPERATION_GUIDE.md §2。
 - **ログ保存**: トグル ON の間だけ `logs/YYYYMMDD_HHMMSS_<mode>.csv`
   (リポジトリ直下 `logs/`)に 50Hz で記録。ファイル名はトグル横に表示。
   モード切替時はファイルを開き直す。列定義は
@@ -446,3 +478,6 @@ cd flight_log_viewer && .venv/bin/python visualize.py ../logs/dummy_position.csv
 | **(v2)FF 適用で「mag3d が取得時と一致しません」** | スイープ取得後に 3D磁気較正をやり直した等。原則はスイープ再取得 → 再抽出。force 適用は係数の前提が崩れることを理解した上で |
 | **(v2)「Yaw 0」が拒否される** | FF 補正が有効(ff_mode≠0)。先に FF モードを off にする(FFプロファイルパネルの「モードのみ変更」) |
 | **(v2)円軌道が開始できない** | MoCap が新鮮か、パラメータが制限内か(半径 0.05–1.5m・周期 3–120s・中心 ±2m)。「進行方向を向く」ON の場合は周期 8s 以上が必要 |
+| **(v2)Multi の「選択適用」が失敗する** | リレーが旧ファーム(複数機非対応)の可能性 → §3 の手順で再書き込み。全機の `wifi_channel` 一致、MAC・`rigid_body_id` の設定・重複なしも確認(OPERATION_GUIDE.md §16) |
+| **(v2)一斉スタートが拒否される** | 全機の目標が設定済みか、全機の MoCap(RB)が新鮮か、目標同士の XY 間隔が 0.5m 以上か。コンソールの理由表示を確認 |
+| **(v2)接続後にフレームエラーが多発する(460800 化以降)** | リレーと PC のボーレート不一致。リレーの env(`release`=460800 / `release-115200`)と `server.json` の `serial.baudrate` を揃える(§3) |

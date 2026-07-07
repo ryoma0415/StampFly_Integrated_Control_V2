@@ -216,6 +216,96 @@
       "wire_hex": "0402540c010103044d010103095400"
     },
     {
+      "name": "rly_set_peers_two",
+      "payload_kind": "RLY_SET_PEERS",
+      "type": 85,
+      "seq": 13,
+      "fields": {
+        "wifi_channel": 1,
+        "peers": [
+          {
+            "mac": [
+              72,
+              202,
+              67,
+              58,
+              81,
+              48
+            ],
+            "tlm_state_div": 1
+          },
+          {
+            "mac": [
+              72,
+              202,
+              67,
+              56,
+              161,
+              204
+            ],
+            "tlm_state_div": 2
+          }
+        ]
+      },
+      "payload_hex": "020148ca433a51300148ca4338a1cc02",
+      "logical_hex": "02550d00000010020148ca433a51300148ca4338a1cc02db4b",
+      "wire_hex": "0402550d01011410020148ca433a51300148ca4338a1cc02db4b00"
+    },
+    {
+      "name": "rly_set_peers_clear",
+      "payload_kind": "RLY_SET_PEERS",
+      "type": 85,
+      "seq": 14,
+      "fields": {
+        "wifi_channel": 0,
+        "peers": []
+      },
+      "payload_hex": "0000",
+      "logical_hex": "02550e0000000200002701",
+      "wire_hex": "0402550e010102020103270100"
+    },
+    {
+      "name": "rly_peers_ack_ok",
+      "payload_kind": "RLY_PEERS_ACK",
+      "type": 86,
+      "seq": 15,
+      "fields": {
+        "status": 0,
+        "count": 2,
+        "wifi_channel": 1,
+        "failed_index": 255
+      },
+      "payload_hex": "000201ff",
+      "logical_hex": "02560f00000004000201ff7cb3",
+      "wire_hex": "0402560f01010204060201ff7cb300"
+    },
+    {
+      "name": "rly_mux_up_setpoint_node1",
+      "payload_kind": "RLY_MUX_UP",
+      "type": 87,
+      "seq": 16,
+      "fields": {
+        "node_id": 1,
+        "inner_hex": "0212444342411162a1563d4df30ebd9a99993ef90f493f03757f"
+      },
+      "payload_hex": "010212444342411162a1563d4df30ebd9a99993ef90f493f03757f",
+      "logical_hex": "0257100000001b010212444342411162a1563d4df30ebd9a99993ef90f493f03757f3eb0",
+      "wire_hex": "0402571001011f1b010212444342411162a1563d4df30ebd9a99993ef90f493f03757f3eb000"
+    },
+    {
+      "name": "rly_mux_down_event_node3",
+      "payload_kind": "RLY_MUX_DOWN",
+      "type": 88,
+      "seq": 17,
+      "fields": {
+        "node_id": 3,
+        "inner_hex": "02312a0000000805040801713d5a40a692"
+      },
+      "payload_hex": "0302312a0000000805040801713d5a40a692",
+      "logical_hex": "025811000000120302312a0000000805040801713d5a40a6928945",
+      "wire_hex": "04025811010106120302312a01010e0805040801713d5a40a692894500"
+    },
+    {
       "name": "cmd_start_empty_payload",
       "payload_kind": "NONE",
       "type": 16,

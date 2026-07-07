@@ -95,6 +95,25 @@ class TestUpdateValidation:
         ok, error = session.update_airframes([make_profile(name="  ")])
         assert ok is False and "機体名" in error
 
+    def test_rigid_body_id_optional_and_validated(self, session_factory):
+        """rigid_body_id は任意(null/省略可)、指定時は 1 以上の整数のみ。"""
+        session, _, _ = session_factory()
+        ok, error = session.update_airframes([
+            make_profile(name="a", rigid_body_id=3),
+            make_profile(name="b", mac="AA:BB:CC:DD:EE:11",
+                         rigid_body_id=None),
+            make_profile(name="c", mac="AA:BB:CC:DD:EE:12"),   # キー省略
+        ])
+        assert ok is True, error
+        by_name = {p["name"]: p for p in session.airframes}
+        assert by_name["a"]["rigid_body_id"] == 3
+        assert by_name["b"]["rigid_body_id"] is None
+        assert by_name["c"]["rigid_body_id"] is None
+        for bad in (0, -1, 1.5, "3", True):
+            ok, error = session.update_airframes(
+                [make_profile(rigid_body_id=bad)])
+            assert ok is False and "rigid_body_id" in error, bad
+
     def test_rejects_bad_mac(self, session_factory):
         session, _, _ = session_factory()
         for bad in ("AA:BB:CC:DD:EE", "GG:BB:CC:DD:EE:FF", "12345"):

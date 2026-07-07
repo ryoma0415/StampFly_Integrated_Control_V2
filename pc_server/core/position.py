@@ -517,6 +517,19 @@ class PositionController:
     # session 層向けスナップショット
     # ------------------------------------------------------------------
 
+    def xy_error_m(self) -> Optional[float]:
+        """直近の XY 位置誤差ノルム [m](mocap 未受信なら None)。
+
+        supervise 層の発散検知用。on_mocap_pose が更新した「目標 −
+        フィルタ済み位置」の誤差キャッシュに基づく(closed loop の
+        ON/OFF に関わらず更新される)。
+        """
+        with self._lock:
+            if self._last_filter_result is None:
+                return None
+            error_x, error_y = self._last_errors
+        return (error_x ** 2 + error_y ** 2) ** 0.5
+
     def mocap_age_s(self, now: Optional[float] = None) -> Optional[float]:
         """最後に有効な mocap pose を受けてからの経過秒(未受信なら None)。"""
         if now is None:

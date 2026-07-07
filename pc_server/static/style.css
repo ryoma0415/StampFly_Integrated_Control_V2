@@ -23,6 +23,12 @@
   --plot-stale: #6b7280;
   --plot-circle: #a78bfa;
 
+  /* 複数機モードの機体色(node_id 順。app.js が参照) */
+  --multi-c0: #3b82f6;
+  --multi-c1: #34d399;
+  --multi-c2: #f59e0b;
+  --multi-c3: #f87171;
+
   /* 飛行状態バッジ配色 */
   --st-init: #6b7280;
   --st-calib: #8b5cf6;
@@ -854,4 +860,76 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
 .accel6-face.done {
   border-color: var(--ok);
   color: var(--ok);
+}
+
+/* ===================== v2: 複数機(Multi)タブ ===================== */
+.multi-block {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.multi-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.multi-airframe-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 4px 12px;
+}
+.multi-af {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.multi-af .warn-text { color: var(--warn); }
+.multi-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.multi-target-row label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.multi-target-row input[type="number"] { width: 64px; }
+.multi-tag {
+  min-width: 72px;
+  padding: 1px 6px;
+  border: 1px solid;
+  border-radius: 4px;
+  font-size: 12px;
+  text-align: center;
+}
+.multi-status { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.multi-chip {
+  padding: 4px 8px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-inset);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+}
+.multi-chip.chip-warn { color: var(--warn); }
+.multi-chip.chip-flying { background: rgba(52, 211, 153, 0.08); }
+.rb-list { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+.rb-line.stale { color: var(--text-dim); }
+#multiCanvas {
+  display: block;
+  margin: 12px auto 0;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }

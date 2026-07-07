@@ -30,7 +30,7 @@ from .constants import (  # noqa: E402
     NIS_REJECT_THRESHOLD,
     YAW_SOURCES,
 )
-from .loader import YAW_ESTIMATOR_KEYS, FlightLog, unwrap_deg  # noqa: E402
+from .loader import YAW_ESTIMATOR_KEYS, FlightLog, unwrap_deg, wrap_deg  # noqa: E402
 from .style import legend_dark, new_fig, save_fig  # noqa: E402
 
 # 系統キー → (表示名, 色) の索引
@@ -179,8 +179,11 @@ def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
 
     ax = axes[1]
     for key, label, color in available:
-        ax.plot(t, df[f"yaw_{key}_deg"], color=color, linewidth=0.9, alpha=0.9,
-                label=label)
+        # ±180 パネルはここでラップして描く(生の deg 列はソース範囲を保持して
+        # いる — ジャイロ積算は無制限、旧ログの Madgwick は 0..-360 — ため、
+        # そのままでは軸外にクリップされて見えなくなる)
+        ax.plot(t, wrap_deg(df[f"yaw_{key}_deg"].to_numpy(dtype=float)),
+                color=color, linewidth=0.9, alpha=0.9, label=label)
     ax.set_ylim(-185.0, 185.0)
     ax.set_ylabel("ヨー角 [deg](±180)", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)

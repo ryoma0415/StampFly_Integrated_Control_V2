@@ -44,6 +44,7 @@
     <nav id="tabbar">
       <button id="tabPosture" class="tab active" data-mode="posture">Posture<span class="tab-jp">姿勢制御</span></button>
       <button id="tabPosition" class="tab" data-mode="position">Position<span class="tab-jp">位置制御</span></button>
+      <button id="tabMulti" class="tab" data-mode="multi">Multi<span class="tab-jp">複数機</span></button>
       <button id="tabExperiment" class="tab" data-mode="experiment">Experiment<span class="tab-jp">実験</span></button>
     </nav>
 
@@ -151,6 +152,39 @@
 
       <!-- 共通ヨーブロックの装着先(Position 表示時) -->
       <div id="yawSlotPosition"></div>
+    </div>
+
+    <!-- ---- Multi タブ(複数機同時制御 2〜4機) ---- -->
+    <div id="panelMulti" class="panel">
+      <div class="startstop">
+        <button id="btnMultiStart" class="btn btn-start" disabled>START<span class="btn-jp">一斉離陸</span></button>
+        <button class="btn btn-stop" data-action="stop">STOP<span class="btn-jp">全機着陸</span></button>
+      </div>
+
+      <div class="multi-block">
+        <div class="multi-head">
+          <span class="mlabel">機体選択(2〜4機)</span>
+          <button id="btnMultiApply" class="btn btn-small btn-primary" disabled>選択適用</button>
+        </div>
+        <div id="multiAirframeList" class="multi-airframe-list"></div>
+        <div class="exp-msg" id="multiSelectMsg">接続後に機体を選んで「選択適用」を押してください(全機同一チャネル・RB ID 設定必須)</div>
+      </div>
+
+      <div class="multi-block">
+        <div class="multi-head">
+          <span class="mlabel">リジッドボディ確認</span>
+          <button id="btnRbCheck" class="btn btn-small">確認開始</button>
+        </div>
+        <div id="rbList" class="rb-list mono"></div>
+        <p class="note">機体を1機ずつ動かすと、座標が変化する ID でどの機体か特定できます。
+          ID はヘッダの機体プロファイル「編集」の RB ID 列へ設定してください。</p>
+      </div>
+
+      <div id="multiTargets" class="multi-block"></div>
+
+      <canvas id="multiCanvas" width="360" height="360"></canvas>
+
+      <div id="multiStatus" class="multi-status"></div>
     </div>
 
     <!-- ---- 共通ヨーブロック(JS がアクティブなタブへ移設する) ---- -->
@@ -497,6 +531,7 @@
             <th>Roll bias [deg]</th>
             <th>Pitch bias [deg]</th>
             <th>初期高度 [m]</th>
+            <th title="MoCap リジッドボディの streaming ID(複数機モードで必須。空欄=未設定)">RB ID</th>
             <th>メモ</th>
             <th></th>
           </tr>

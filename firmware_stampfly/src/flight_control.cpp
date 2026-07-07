@@ -382,7 +382,9 @@ void update_thrust_and_attitude_command(void) {
         // >500ms は既存フェイルセーフで LANDING(auto_landing_step はヨー0)。
         if (!yaw_latch_active) {
             yaw_latch_active = true;
-            yaw_latched_ref = yaw_used;
+            // ±π を保証してからラッチする(値はそのまま TLM の yaw_ref_rad に
+            // 載るため。契約: yaw_ref は ±π)
+            yaw_latched_ref = wrapPi(yaw_used);
         }
         yaw_cmd = yaw_latched_ref;
         yaw_cmd_valid = true;

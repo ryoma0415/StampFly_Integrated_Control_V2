@@ -95,6 +95,20 @@ def _build_message(kind: str, fields: dict):
         return sp.RlyStats(**fields)
     if kind == "RLY_PONG":
         return sp.RlyPong(**fields)
+    if kind == "RLY_SET_PEERS":
+        return sp.RlySetPeers(
+            wifi_channel=fields["wifi_channel"],
+            peers=tuple(sp.RlyPeer(mac=bytes(p["mac"]),
+                                   tlm_state_div=p["tlm_state_div"])
+                        for p in fields["peers"]))
+    if kind == "RLY_PEERS_ACK":
+        return sp.RlyPeersAck(**fields)
+    if kind == "RLY_MUX_UP":
+        return sp.RlyMuxUp(node_id=fields["node_id"],
+                           inner=bytes.fromhex(fields["inner_hex"]))
+    if kind == "RLY_MUX_DOWN":
+        return sp.RlyMuxDown(node_id=fields["node_id"],
+                             inner=bytes.fromhex(fields["inner_hex"]))
     raise AssertionError(f"unknown payload_kind: {kind}")
 
 
@@ -124,6 +138,11 @@ def test_vector_file_metadata(vectors):
                      "cmd_ff_aux", "cmd_ff_commit", "cmd_ff_mode_b_ekf",
                      "cmd_ff_anchor_empty_payload",
                      "tlm_ack_ff_commit_ok", "tlm_exp_full", "tlm_cal_data_full"):
+        assert required in names, required
+    # マルチ機体拡張(0x55-0x58)のベクタが揃っていること
+    for required in ("rly_set_peers_two", "rly_set_peers_clear",
+                     "rly_peers_ack_ok",
+                     "rly_mux_up_setpoint_node1", "rly_mux_down_event_node3"):
         assert required in names, required
     corruption_names = [c["name"] for c in vectors["corruption"]]
     assert "crc_single_bit_flip" in corruption_names

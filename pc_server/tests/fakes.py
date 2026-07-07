@@ -309,6 +309,30 @@ def make_mocap_frame(rigid_body_id: int = 1,
     return {"mocap_data": mocap_data, "frame_number": frame_number}
 
 
+def make_mocap_frame_multi(bodies: list[dict], frame_number: int = 1) -> dict:
+    """複数リジッドボディ入り NatNet フレームの模擬(マルチ機体用)。
+
+    bodies の各要素は {rigid_body_id, pos, rot, tracking_valid, error,
+    marker_count} を任意指定(既定は make_mocap_frame と同じ)。
+    """
+    rigid_list = [
+        types.SimpleNamespace(
+            id_num=b.get("rigid_body_id", 1),
+            pos=b.get("pos", (0.0, 0.3, 0.0)),
+            rot=b.get("rot", (0.0, 0.0, 0.0, 1.0)),
+            tracking_valid=b.get("tracking_valid", True),
+            error=b.get("error", 0.001),
+            rb_marker_list=list(range(b.get("marker_count", 4))),
+        )
+        for b in bodies
+    ]
+    mocap_data = types.SimpleNamespace(
+        rigid_body_data=types.SimpleNamespace(rigid_body_list=rigid_list),
+        labeled_marker_data=types.SimpleNamespace(labeled_marker_list=[]),
+    )
+    return {"mocap_data": mocap_data, "frame_number": frame_number}
+
+
 def make_pose(x: float = 0.0, y: float = 0.0, z: float = 0.3,
               t: float = 0.0, yaw_rad: float = 0.0,
               tracking_valid: bool = True, error: float = 0.001,

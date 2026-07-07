@@ -166,6 +166,48 @@ def build_vectors() -> dict:
         {"echo_seq": 77},
         pong.to_payload()))
 
+    # --- マルチ機体拡張(0x55-0x58)---
+    peer_macs = [[0x48, 0xCA, 0x43, 0x3A, 0x51, 0x30],
+                 [0x48, 0xCA, 0x43, 0x38, 0xA1, 0xCC]]
+    set_peers = sp.RlySetPeers(wifi_channel=1, peers=(
+        sp.RlyPeer(mac=bytes(peer_macs[0]), tlm_state_div=1),
+        sp.RlyPeer(mac=bytes(peer_macs[1]), tlm_state_div=2),
+    ))
+    frames.append(frame_vector(
+        "rly_set_peers_two", "RLY_SET_PEERS", sp.MsgType.RLY_SET_PEERS, 13,
+        {"wifi_channel": 1,
+         "peers": [{"mac": peer_macs[0], "tlm_state_div": 1},
+                   {"mac": peer_macs[1], "tlm_state_div": 2}]},
+        set_peers.to_payload()))
+
+    frames.append(frame_vector(
+        "rly_set_peers_clear", "RLY_SET_PEERS", sp.MsgType.RLY_SET_PEERS, 14,
+        {"wifi_channel": 0, "peers": []},
+        sp.RlySetPeers(wifi_channel=0, peers=()).to_payload()))
+
+    peers_ack = sp.RlyPeersAck(status=sp.RlyPeersAck.STATUS_OK, count=2,
+                               wifi_channel=1,
+                               failed_index=sp.RlyPeersAck.FAILED_NONE)
+    frames.append(frame_vector(
+        "rly_peers_ack_ok", "RLY_PEERS_ACK", sp.MsgType.RLY_PEERS_ACK, 15,
+        {"status": 0, "count": 2, "wifi_channel": 1, "failed_index": 0xFF},
+        peers_ack.to_payload()))
+
+    # MUX_UP: node 1 宛の CMD_SETPOINT(内側フレームは既出ベクタと同一バイト)
+    mux_inner_up = sp.pack_frame(sp.MsgType.CMD_SETPOINT, 0x41424344,
+                                 sp1.to_payload())
+    frames.append(frame_vector(
+        "rly_mux_up_setpoint_node1", "RLY_MUX_UP", sp.MsgType.RLY_MUX_UP, 16,
+        {"node_id": 1, "inner_hex": mux_inner_up.hex()},
+        sp.RlyMuxUp(node_id=1, inner=mux_inner_up).to_payload()))
+
+    # MUX_DOWN: node 3 発の TLM_EVENT(内側フレームは既出ベクタと同一バイト)
+    mux_inner_down = sp.pack_frame(sp.MsgType.TLM_EVENT, 42, ev.to_payload())
+    frames.append(frame_vector(
+        "rly_mux_down_event_node3", "RLY_MUX_DOWN", sp.MsgType.RLY_MUX_DOWN, 17,
+        {"node_id": 3, "inner_hex": mux_inner_down.hex()},
+        sp.RlyMuxDown(node_id=3, inner=mux_inner_down).to_payload()))
+
     frames.append(frame_vector(
         "cmd_start_empty_payload", "NONE", sp.MsgType.CMD_START, 5, {}, b""))
 

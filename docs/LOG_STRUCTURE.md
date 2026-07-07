@@ -126,7 +126,7 @@ PROTOCOL.md の TLM_STATE(97B)全フィールドに `tlm_` 接頭辞を付けて
 | `tlm_flags` | u8 | - | bit0 low_voltage, bit1 setpoint_fresh, bit2 flying。 |
 | `tlm_reason` | u8 | - | 直近の遷移理由(Reason 数値)。 |
 | `tlm_reason_name` | string | - | 上記の名前表記。 |
-| `tlm_roll_rad`, `tlm_pitch_rad`, `tlm_yaw_rad` | float | rad | 実測姿勢(AHRS)。 |
+| `tlm_roll_rad`, `tlm_pitch_rad`, `tlm_yaw_rad` | float | rad | 実測姿勢(AHRS)。yaw は ±π・リセット時 0(旧ファームのログは [-2π, 0]。比較時は wrap_deg で正規化する)。 |
 | `tlm_p_rad_s`, `tlm_q_rad_s`, `tlm_r_rad_s` | float | rad/s | 実測角速度。 |
 | `tlm_roll_ref_rad`, `tlm_pitch_ref_rad` | float | rad | 機体側で適用中の角度指令(往復確認用)。 |
 | `tlm_alt_ref_m` | float | m | 機体側で適用中の目標高度。 |

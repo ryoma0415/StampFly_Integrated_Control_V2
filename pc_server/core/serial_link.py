@@ -95,6 +95,20 @@ class SerialLink:
         self._pending_setpoints: dict[int, float] = {}
         self._latency_ms: Optional[float] = None
 
+        # マルチ機体(RLY_MUX_UP/DOWN)。ノード付きハンドラは
+        # handler(node_id, frame) で RX スレッドから呼ばれる(ブロッキング禁止)。
+        self._node_handlers: dict[int, Callable[[int, proto.Frame], None]] = {}
+        self._rx_mux_errors = 0     # MUX_DOWN の内側フレーム不正(RXスレッドのみ更新)
+        self._rx_mux_unhandled = 0  # どのハンドラにも配送できなかった内側フレーム
+        # ノード別レイテンシ(_latency_lock で保護。node -> {seq: 送信時刻})
+        self._node_pending: dict[int, dict[int, float]] = {}
+        self._node_latency_ms: dict[int, float] = {}
+
+        # RLY_PEERS_ACK 待ち合わせ(RLY_TARGET_ACK と同じ1スロット方式)
+        self._peers_ack_lock = threading.Lock()
+        self._peers_ack_event = threading.Event()
+        self._last_peers_ack: Optional[proto.RlyPeersAck] = None
+
         # リンク断通知の一回性保証(RX/TX スレッドが同時に失敗しても
         # コールバックを一度しか呼ばないための test-and-set 用ロック)
         self._disconnect_lock = threading.Lock()
@@ -134,6 +148,10 @@ class SerialLink:
         with self._latency_lock:
             self._pending_setpoints.clear()
             self._latency_ms = None
+            self._node_pending.clear()
+            self._node_latency_ms.clear()
+        self._rx_mux_errors = 0
+        self._rx_mux_unhandled = 0
         with self._cmd_ack_cond:
             self._cmd_acks.clear()
         self._stop_event.clear()
@@ -200,6 +218,46 @@ class SerialLink:
                 del self._pending_setpoints[s]
         return seq
 
+    def send_to(self, node_id: int, msg_type: int, payload: bytes = b"") -> int:
+        """フレームを RLY_MUX_UP で包んで peers[node_id] 宛に送信する。
+
+        内側フレームと外側エンベロープは同じ seq を共有する(採番は1回。
+        機体がエコーする seq_echo / acked_seq は内側 seq)。戻り値は seq。
+        """
+        transport = self._transport
+        if transport is None:
+            raise SerialLinkError("not connected")
+        with self._tx_lock:
+            # u32 ラップ(1始まり、0 は seq_echo 番兵のため飛ばす — PROTOCOL.md)
+            self._tx_seq = (self._tx_seq % 0xFFFFFFFF) + 1
+            seq = self._tx_seq
+            inner = proto.pack_frame(msg_type, seq, payload)
+            wire = proto.encode_wire(proto.MsgType.RLY_MUX_UP, seq,
+                                     proto.mux_wrap(node_id, inner))
+            try:
+                transport.write(wire)
+            except Exception as exc:
+                self._handle_link_failure(f"write failed: {exc}")
+                raise SerialLinkError(f"write failed: {exc}") from exc
+            self._tx_frames += 1
+        return seq
+
+    def send_setpoint_to(self, node_id: int,
+                         setpoint: proto.CmdSetpoint) -> int:
+        """CMD_SETPOINT を node_id 宛に送信し、ノード別レイテンシ用に記録する。"""
+        seq = self.send_to(node_id, proto.MsgType.CMD_SETPOINT,
+                           setpoint.to_payload())
+        now = time.monotonic()
+        with self._latency_lock:
+            pending = self._node_pending.setdefault(node_id, {})
+            pending[seq] = now
+            # 古い未エコー分を破棄(無限成長防止)
+            cutoff = now - self._pending_max_age_s
+            stale = [s for s, t in pending.items() if t < cutoff]
+            for s in stale:
+                del pending[s]
+        return seq
+
     def send_with_ack(self, msg_type: int, payload: bytes = b"",
                       timeout_s: Optional[float] = None,
                       max_retries: Optional[int] = None
@@ -257,6 +315,36 @@ class SerialLink:
                 return True, last_ack
         return False, last_ack
 
+    def set_relay_peers(self, peers: list[tuple[bytes, int]], wifi_channel: int
+                        ) -> tuple[bool, Optional[proto.RlyPeersAck]]:
+        """RLY_SET_PEERS を送信し RLY_PEERS_ACK を待つ(マルチ機体モード)。
+
+        peers は (mac, tlm_state_div) の並び(index = node_id)。空でマルチ
+        モード解除。再送規律は RLY_SET_TARGET と同一(1.0s 待ち×最大3回再送)。
+        Returns: (成功フラグ, 最後に受信した ACK または None)。
+        """
+        request = proto.RlySetPeers(
+            wifi_channel=wifi_channel,
+            peers=tuple(proto.RlyPeer(mac=bytes(mac), tlm_state_div=div)
+                        for mac, div in peers))
+        payload = request.to_payload()
+        last_ack: Optional[proto.RlyPeersAck] = None
+        for _attempt in range(1 + self._target_ack_max_retries):
+            with self._peers_ack_lock:
+                self._last_peers_ack = None
+                self._peers_ack_event.clear()
+            self.send(proto.MsgType.RLY_SET_PEERS, payload)
+            if not self._peers_ack_event.wait(self._target_ack_timeout_s):
+                continue   # タイムアウト → 再送
+            with self._peers_ack_lock:
+                last_ack = self._last_peers_ack
+            if (last_ack is not None
+                    and last_ack.status == proto.RlyPeersAck.STATUS_OK
+                    and last_ack.count == len(peers)
+                    and last_ack.wifi_channel == wifi_channel):
+                return True, last_ack
+        return False, last_ack
+
     # ------------------------------------------------------------------
     # 受信ディスパッチ
     # ------------------------------------------------------------------
@@ -265,6 +353,15 @@ class SerialLink:
                          handler: Callable[[proto.Frame], None]) -> None:
         """型別ハンドラを登録する(RXスレッド上で呼ばれる。ブロッキング禁止)。"""
         self._handlers[int(msg_type)] = handler
+
+    def register_node_handler(self, msg_type: int,
+                              handler: Callable[[int, proto.Frame], None]
+                              ) -> None:
+        """RLY_MUX_DOWN の内側フレーム用ハンドラを登録する。
+
+        handler(node_id, frame) が RX スレッド上で呼ばれる(ブロッキング禁止)。
+        """
+        self._node_handlers[int(msg_type)] = handler
 
     def _reader_loop(self) -> None:
         """読み取りスレッド本体。受信→フレーム化→ディスパッチのみを行う。"""
@@ -320,6 +417,17 @@ class SerialLink:
             with self._ack_lock:
                 self._last_ack = ack
             self._ack_event.set()
+        elif frame.type == proto.MsgType.RLY_PEERS_ACK:
+            try:
+                peers_ack = proto.RlyPeersAck.from_payload(frame.payload)
+            except ValueError:
+                return
+            with self._peers_ack_lock:
+                self._last_peers_ack = peers_ack
+            self._peers_ack_event.set()
+        elif frame.type == proto.MsgType.RLY_MUX_DOWN:
+            self._route_mux_down(frame)
+            return
         elif frame.type == proto.MsgType.TLM_STATE and len(frame.payload) >= 4:
             # seq_echo(先頭4B)から往復レイテンシを計測
             (seq_echo,) = struct.unpack_from("<I", frame.payload, 0)
@@ -333,6 +441,42 @@ class SerialLink:
         handler = self._handlers.get(frame.type)
         if handler is not None:
             handler(frame)
+
+    def _route_mux_down(self, frame: proto.Frame) -> None:
+        """RLY_MUX_DOWN を展開し、内側フレームをノード付きで配送する。"""
+        try:
+            node_id, inner_bytes = proto.mux_unwrap(frame.payload)
+        except ValueError:
+            self._rx_mux_errors += 1
+            return
+        status, inner = proto.parse_frame(inner_bytes)
+        if status is not proto.ParseStatus.OK or inner is None:
+            self._rx_mux_errors += 1
+            return
+        if inner.type == proto.MsgType.TLM_STATE and len(inner.payload) >= 4:
+            # seq_echo(先頭4B)からノード別の往復レイテンシを計測
+            (seq_echo,) = struct.unpack_from("<I", inner.payload, 0)
+            if seq_echo != 0:
+                now = time.monotonic()
+                with self._latency_lock:
+                    pending = self._node_pending.get(node_id)
+                    sent_at = (pending.pop(seq_echo, None)
+                               if pending is not None else None)
+                    if sent_at is not None:
+                        self._node_latency_ms[node_id] = \
+                            (now - sent_at) * 1000.0
+        handler = self._node_handlers.get(inner.type)
+        if handler is not None:
+            handler(node_id, inner)
+            return
+        # ノードハンドラ未登録の内側フレームは単機ハンドラへフォールバック
+        # (LOG_TEXT / TLM_CAL_DATA など。ノード帰属は失われるが、機体発の
+        # 診断情報を黙って捨てない)
+        fallback = self._handlers.get(inner.type)
+        if fallback is not None:
+            fallback(inner)
+        else:
+            self._rx_mux_unhandled += 1
 
     def _handle_link_failure(self, reason: str) -> None:
         """リンク断を一度だけ通知する(RX/TX 双方から呼ばれうる)。"""
@@ -356,6 +500,11 @@ class SerialLink:
         with self._latency_lock:
             return self._latency_ms
 
+    def node_latency_ms(self, node_id: int) -> Optional[float]:
+        """ノード別の CMD_SETPOINT 往復レイテンシ(未計測は None)。"""
+        with self._latency_lock:
+            return self._node_latency_ms.get(node_id)
+
     def stats(self) -> dict:
         c = self._receiver.counters
         return {
@@ -367,4 +516,6 @@ class SerialLink:
             "rx_len_errors": c.len_errors,
             "rx_overflow_drops": c.overflow_drops,
             "rx_dispatch_errors": self._rx_dispatch_errors,
+            "rx_mux_errors": self._rx_mux_errors,
+            "rx_mux_unhandled": self._rx_mux_unhandled,
         }

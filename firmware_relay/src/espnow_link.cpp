@@ -17,16 +17,21 @@ namespace espnow_link {
 namespace {
 
 // 受信キューの1要素 = ESP-NOWペイロード(=検証済み論理フレーム)そのまま。
+// node は送信元ピアの node_id(単機モード受信は NODE_NONE)。
 struct RxItem {
   uint8_t len = 0;
+  uint8_t node = NODE_NONE;
   uint8_t data[stampfly::MAX_FRAME_SIZE] = {};
 };
 
-// s_mux 保護下の共有状態(loopの set_target / send_logical と
+// s_mux 保護下の共有状態(loopの set_target/set_peers/send と
 // WiFiタスクの受信・送信コールバックが競合する)
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 bool s_has_target = false;
 uint8_t s_target_mac[6] = {};
+uint8_t s_peer_count = 0;  // 0 = マルチ無効(単機 s_has_target と排他)
+uint8_t s_peer_macs[stampfly::RLY_MAX_PEERS][6] = {};
+uint8_t s_peer_tlm_div[stampfly::RLY_MAX_PEERS] = {};
 Counters s_counters;
 
 QueueHandle_t s_rx_queue = nullptr;
@@ -57,14 +62,34 @@ void on_recv(const EspNowRecvInfo* info, const uint8_t* data, int len) {
 
   uint8_t target[6];
   bool has_target;
+  uint8_t peer_count;
+  uint8_t peer_macs[stampfly::RLY_MAX_PEERS][6];
   portENTER_CRITICAL(&s_mux);
   has_target = s_has_target;
   std::memcpy(target, s_target_mac, sizeof(target));
+  peer_count = s_peer_count;
+  std::memcpy(peer_macs, s_peer_macs, sizeof(peer_macs));
   portEXIT_CRITICAL(&s_mux);
 
-  // 設定済みターゲット以外のフレームは転送しない(同チャネルの他機を遮断)
-  if (!has_target || src == nullptr ||
-      std::memcmp(src, target, sizeof(target)) != 0) {
+  // 登録済みピア以外のフレームは転送しない(同チャネルの他機を遮断)。
+  // マルチモードではピア表から node_id を逆引きして帰属させる。
+  uint8_t node = NODE_NONE;
+  if (src == nullptr) {
+    count(&Counters::rx_filtered);
+    return;
+  }
+  if (peer_count > 0) {
+    for (uint8_t i = 0; i < peer_count; ++i) {
+      if (std::memcmp(src, peer_macs[i], 6) == 0) {
+        node = i;
+        break;
+      }
+    }
+    if (node == NODE_NONE) {
+      count(&Counters::rx_filtered);
+      return;
+    }
+  } else if (!has_target || std::memcmp(src, target, sizeof(target)) != 0) {
     count(&Counters::rx_filtered);
     return;
   }
@@ -93,6 +118,7 @@ void on_recv(const EspNowRecvInfo* info, const uint8_t* data, int len) {
 
   RxItem item;
   item.len = static_cast<uint8_t>(len);
+  item.node = node;
   std::memcpy(item.data, data, static_cast<size_t>(len));
   // WiFiタスクコンテキストなので非ブロッキングの xQueueSend を使う
   if (xQueueSend(s_rx_queue, &item, 0) == pdTRUE) {
@@ -100,6 +126,32 @@ void on_recv(const EspNowRecvInfo* info, const uint8_t* data, int len) {
   } else {
     count(&Counters::rx_queue_drops);
   }
+}
+
+// 登録済みの全ESP-NOWピア(単機ターゲット+マルチピア)を削除して状態を
+// クリアする。モード切替(set_target⇔set_peers)の先頭で呼ぶ。
+// esp_now_del_peer の失敗(未登録等)は無視してよい。loopコンテキスト専用。
+void clear_all_peers() {
+  bool had_target;
+  uint8_t old_target[6];
+  uint8_t old_count;
+  uint8_t old_macs[stampfly::RLY_MAX_PEERS][6];
+  portENTER_CRITICAL(&s_mux);
+  had_target = s_has_target;
+  std::memcpy(old_target, s_target_mac, sizeof(old_target));
+  old_count = s_peer_count;
+  std::memcpy(old_macs, s_peer_macs, sizeof(old_macs));
+  s_has_target = false;
+  s_peer_count = 0;
+  portEXIT_CRITICAL(&s_mux);
+
+  if (had_target) esp_now_del_peer(old_target);
+  for (uint8_t i = 0; i < old_count; ++i) esp_now_del_peer(old_macs[i]);
+
+  // 旧ピア表で node 帰属済みの受信残存フレームを破棄する(切替後に旧帰属の
+  // まま転送されると PC 側で別機体へ誤帰属する)。この時点でフィルタは全拒否
+  // (has_target=false, peer_count=0)のため、リセット後の混入はない。
+  if (s_rx_queue != nullptr) xQueueReset(s_rx_queue);
 }
 
 // 送信結果コールバック(WiFiタスクコンテキスト)。カウンタ加算のみ。
@@ -144,16 +196,8 @@ uint8_t set_target(const stampfly::RlySetTarget& req) {
     return RlyTargetAck::STATUS_PEER_FAILED;
   }
 
-  // MACが変わる場合は旧ピアを削除(replace)。失敗は無視してよい(未登録等)。
-  uint8_t old_mac[6];
-  bool had_target;
-  portENTER_CRITICAL(&s_mux);
-  had_target = s_has_target;
-  std::memcpy(old_mac, s_target_mac, sizeof(old_mac));
-  portEXIT_CRITICAL(&s_mux);
-  if (had_target && std::memcmp(old_mac, req.mac, sizeof(old_mac)) != 0) {
-    esp_now_del_peer(old_mac);
-  }
+  // 旧ピア(単機/マルチ両方)を削除してから単機ターゲットを登録する
+  clear_all_peers();
 
   esp_now_peer_info_t peer = {};
   std::memcpy(peer.peer_addr, req.mac, sizeof(req.mac));
@@ -180,6 +224,98 @@ bool has_target() {
   return v;
 }
 
+uint8_t set_peers(const stampfly::RlySetPeers& req, uint8_t* failed_index) {
+  using stampfly::RlyPeersAck;
+  *failed_index = RlyPeersAck::FAILED_NONE;
+
+  if (!s_initialized) return RlyPeersAck::STATUS_PEER_FAILED;
+  if (req.count > stampfly::RLY_MAX_PEERS) return RlyPeersAck::STATUS_BAD_COUNT;
+
+  // count=0 = マルチモード解除(チャネルは触らない)
+  if (req.count == 0) {
+    clear_all_peers();
+    return RlyPeersAck::STATUS_OK;
+  }
+
+  if (req.wifi_channel < relay_config::WIFI_CHANNEL_MIN ||
+      req.wifi_channel > relay_config::WIFI_CHANNEL_MAX) {
+    return RlyPeersAck::STATUS_BAD_CHANNEL;
+  }
+
+  // 全エントリを先に検証(ユニキャストMAC・重複なし)。重複を許すと
+  // 受信フレームの node 帰属が曖昧になるため拒否する。
+  for (uint8_t i = 0; i < req.count; ++i) {
+    if (!mac_is_valid_unicast(req.peers[i].mac)) {
+      *failed_index = i;
+      return RlyPeersAck::STATUS_INVALID_MAC;
+    }
+    for (uint8_t j = 0; j < i; ++j) {
+      if (std::memcmp(req.peers[i].mac, req.peers[j].mac, 6) == 0) {
+        *failed_index = i;
+        return RlyPeersAck::STATUS_INVALID_MAC;
+      }
+    }
+  }
+
+  if (esp_wifi_set_channel(req.wifi_channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+    return RlyPeersAck::STATUS_PEER_FAILED;
+  }
+
+  // 旧ピア(単機/マルチ両方)を削除してから新ピア表を登録する
+  clear_all_peers();
+
+  for (uint8_t i = 0; i < req.count; ++i) {
+    esp_now_peer_info_t peer = {};
+    std::memcpy(peer.peer_addr, req.peers[i].mac, 6);
+    peer.channel = 0;  // 0 = インターフェースの現在チャネル(直前にピン留め済み)
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    const esp_err_t err = esp_now_is_peer_exist(req.peers[i].mac)
+                              ? esp_now_mod_peer(&peer)
+                              : esp_now_add_peer(&peer);
+    if (err != ESP_OK) {
+      // 途中失敗: 登録済み分を削除して無効状態へ戻す(PC がリトライする)
+      for (uint8_t j = 0; j < i; ++j) esp_now_del_peer(req.peers[j].mac);
+      *failed_index = i;
+      return RlyPeersAck::STATUS_PEER_FAILED;
+    }
+  }
+
+  // 共有状態の更新(受信cbのフィルタ/逆引きが新ピア表を参照するようになる)
+  portENTER_CRITICAL(&s_mux);
+  s_peer_count = req.count;
+  for (uint8_t i = 0; i < req.count; ++i) {
+    std::memcpy(s_peer_macs[i], req.peers[i].mac, 6);
+    // 0 は 1 扱い(PROTOCOL.md RLY_SET_PEERS)
+    s_peer_tlm_div[i] =
+        (req.peers[i].tlm_state_div == 0) ? 1 : req.peers[i].tlm_state_div;
+  }
+  portEXIT_CRITICAL(&s_mux);
+  return RlyPeersAck::STATUS_OK;
+}
+
+bool multi_active() {
+  portENTER_CRITICAL(&s_mux);
+  const bool v = s_peer_count > 0;
+  portEXIT_CRITICAL(&s_mux);
+  return v;
+}
+
+uint8_t peer_count() {
+  portENTER_CRITICAL(&s_mux);
+  const uint8_t v = s_peer_count;
+  portEXIT_CRITICAL(&s_mux);
+  return v;
+}
+
+uint8_t peer_tlm_div(uint8_t node) {
+  uint8_t div = 1;
+  portENTER_CRITICAL(&s_mux);
+  if (node < s_peer_count) div = s_peer_tlm_div[node];
+  portEXIT_CRITICAL(&s_mux);
+  return div;
+}
+
 bool send_logical(const uint8_t* frame, size_t len) {
   uint8_t mac[6];
   bool has_target;
@@ -201,13 +337,37 @@ bool send_logical(const uint8_t* frame, size_t len) {
   return true;
 }
 
-bool receive(uint8_t* out, size_t cap, size_t* out_len) {
-  if (out == nullptr || out_len == nullptr || s_rx_queue == nullptr) return false;
+bool send_logical_to(uint8_t node, const uint8_t* frame, size_t len) {
+  uint8_t mac[6];
+  bool valid;
+  portENTER_CRITICAL(&s_mux);
+  valid = node < s_peer_count;
+  if (valid) std::memcpy(mac, s_peer_macs[node], sizeof(mac));
+  portEXIT_CRITICAL(&s_mux);
+
+  if (!valid || frame == nullptr || len == 0 ||
+      len > stampfly::MAX_FRAME_SIZE) {
+    count(&Counters::send_fail);
+    return false;
+  }
+  if (esp_now_send(mac, frame, len) != ESP_OK) {
+    count(&Counters::send_fail);
+    return false;
+  }
+  return true;
+}
+
+bool receive(uint8_t* out, size_t cap, size_t* out_len, uint8_t* out_node) {
+  if (out == nullptr || out_len == nullptr || out_node == nullptr ||
+      s_rx_queue == nullptr) {
+    return false;
+  }
   RxItem item;
   if (xQueueReceive(s_rx_queue, &item, 0) != pdTRUE) return false;
   if (cap < item.len) return false;  // 呼び出し側バッファ不足(設計上発生しない)
   std::memcpy(out, item.data, item.len);
   *out_len = item.len;
+  *out_node = item.node;
   return true;
 }
 

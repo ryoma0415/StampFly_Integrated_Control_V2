@@ -27,6 +27,7 @@
 #include "imu.hpp"
 #include "tof.hpp"
 #include "flight_control.hpp"
+#include "yaw_estimation/angle_utils.hpp"
 #include "yaw_estimation/sensor_hub_ff.hpp"
 
 Madgwick Drone_ahrs;
@@ -241,7 +242,11 @@ float sensor_read(void) {
                              -(sensor_state.Yaw_rate) * (float)RAD_TO_DEG, sensor_state.Accel_y, sensor_state.Accel_x, -sensor_state.Accel_z);
         sensor_state.Roll_angle  = Drone_ahrs.getPitch() * (float)DEG_TO_RAD;
         sensor_state.Pitch_angle = Drone_ahrs.getRoll() * (float)DEG_TO_RAD;
-        sensor_state.Yaw_angle   = -Drone_ahrs.getYaw() * (float)DEG_TO_RAD;
+        // getYaw() は Arduino 版 Madgwick のコンパス方位規約(内部 atan2 値
+        // +180° の 0..360°)のため使わない。生の atan2 値(±π)を符号反転して
+        // ラップし、リセット直後 0(=離陸方位)・±π 範囲という他のヨー系統
+        // (ジャイロ積算・CF・EKF)と同じ規約に揃える。
+        sensor_state.Yaw_angle   = wrapPi(-Drone_ahrs.getYawRadians());
 
         // for debug
         // USBSerial.printf("%6.3f %7.4f %6.3f %6.3f %6.3f %6.3f %6.3f %6.3f\n\r",

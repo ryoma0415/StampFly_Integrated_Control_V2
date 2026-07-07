@@ -38,6 +38,7 @@ const UI = {
   CAL3D_TARGET_SAMPLES: 6000,   // 3D磁気収集の上限(進捗バー分母。サーバと同値)
   FF_POLL_MS: 5000,             // /api/ffprofile の定期ポーリング間隔
   EXP_FRESH_S: 0.5,             // TLM_EXP 表示の鮮度しきい値(UI表示用)
+  RB_POLL_MS: 500,              // リジッドボディ確認(/api/mocap/bodies)のポーリング間隔
 };
 
 /* 円軌道パラメータの既定制限(/api/config 取得失敗時のフォールバック。
@@ -85,7 +86,15 @@ const els = {
   linkSerial: $("linkSerial"), linkRelay: $("linkRelay"), linkDrone: $("linkDrone"),
   voltage: $("voltage"),
   tabPosture: $("tabPosture"), tabPosition: $("tabPosition"), tabExperiment: $("tabExperiment"),
+  tabMulti: $("tabMulti"),
   panelPosture: $("panelPosture"), panelPosition: $("panelPosition"), panelExperiment: $("panelExperiment"),
+  panelMulti: $("panelMulti"),
+  // 複数機タブ
+  btnMultiStart: $("btnMultiStart"), btnMultiApply: $("btnMultiApply"),
+  multiAirframeList: $("multiAirframeList"), multiSelectMsg: $("multiSelectMsg"),
+  btnRbCheck: $("btnRbCheck"), rbList: $("rbList"),
+  multiTargets: $("multiTargets"), multiCanvas: $("multiCanvas"),
+  multiStatus: $("multiStatus"),
   mainEl: $("main"),
   rollSlider: $("rollSlider"), pitchSlider: $("pitchSlider"), altSlider: $("altSlider"),
   rollValue: $("rollValue"), pitchValue: $("pitchValue"), altValue: $("altValue"),
@@ -166,7 +175,7 @@ let lastSession = null;            // 直近の session オブジェクト
 let lastDrone = null;              // 直近の drone オブジェクト
 let lastMocap = null;              // 直近の mocap オブジェクト
 let airframes = [];                // /api/airframes の配列
-let lastEventKey = null;           // TLM_EVENT 2Hz再送のコンソール重複抑制
+const lastEventKeys = new Map();   // TLM_EVENT 2Hz再送のコンソール重複抑制(機体別)
 const trail = [];                  // XYプロット軌跡 [{x,y}]
 
 // v2: Experiment / FF 関連の REST 状態キャッシュ
@@ -373,6 +382,7 @@ function renderAirframeOptions() {
   if (prev && airframes.some((a) => a.name === prev)) {
     els.airframeSelect.value = prev;
   }
+  renderMultiAirframeList();   // 複数機タブの選択候補も同じ一覧に追従させる
 }
 
 async function fetchAirframes() {
@@ -417,6 +427,7 @@ function afBlankRow() {
     roll_bias_deg: 0,
     pitch_bias_deg: 0,
     default_alt_m: UI.AF_DEFAULT_ALT_M,
+    rigid_body_id: null,   // 複数機モード用(null=未設定)
     notes: "",
   };
 }
@@ -457,6 +468,8 @@ function renderAfEditorRows() {
       { step: 0.001, className: "af-num" }));
     tr.appendChild(afMakeInput(row, "default_alt_m", "number",
       { step: 0.05, className: "af-num" }));
+    tr.appendChild(afMakeInput(row, "rigid_body_id", "number",
+      { step: 1, className: "af-ch", placeholder: "-" }));
     tr.appendChild(afMakeInput(row, "notes", "text", { className: "af-notes" }));
 
     const tdDel = document.createElement("td");
@@ -530,7 +543,9 @@ function onState(data) {
   renderYawMonitor();
   renderMocap();
   renderExperiment();
+  renderMulti();
   if (uiMode === "position") drawPlot();
+  if (uiMode === "multi") drawMultiPlot();
 }
 
 function onEvent(ev) {
@@ -539,14 +554,20 @@ function onEvent(ev) {
   const prev = pick(ev, "prev_state");
   const reason = pick(ev, "reason");
   const voltage = pick(ev, "voltage");
+  // 複数機イベントは機体名つき。重複抑制キーも機体別に持つ
+  // (別機体の同一遷移を取りこぼさない)
+  const drone = pick(ev, "drone");
+  const who = drone !== null && drone !== undefined ? String(drone) : "single";
   const key = `${prev}>${state}:${reason}`;
-  if (key === lastEventKey) return;
-  lastEventKey = key;
+  if (lastEventKeys.get(who) === key) return;
+  lastEventKeys.set(who, key);
 
   const sName = (i) => (FLIGHT_STATES[i] ? FLIGHT_STATES[i].name : `?${i}`);
   const rName = REASONS[reason] !== undefined ? REASONS[reason] : `?${reason}`;
   const vStr = typeof voltage === "number" ? ` ${voltage.toFixed(2)}V` : "";
-  appendConsole("event", `${sName(prev)} → ${sName(state)} (${rName})${vStr}`);
+  const tag = who === "single" ? "" : `[${who}] `;
+  appendConsole("event",
+    `${tag}${sName(prev)} → ${sName(state)} (${rName})${vStr}`);
 }
 
 function onLog(msg) {
@@ -605,18 +626,24 @@ function renderConnectivityLost() {
                     els.yawCtrlToggle, els.yawSlider, els.btnYawCenter,
                     els.btnMotorStart, els.btnMotorApply,
                     els.btnSweepStart, els.btnSweepAbort,
-                    els.btnSeqStart, els.btnSeqAbort]) {
+                    els.btnSeqStart, els.btnSeqAbort,
+                    els.btnMultiStart, els.btnMultiApply]) {
     el.disabled = true;
   }
   els.postureNote.textContent = "スライダはシリアル接続後に操作できます";
   els.postureNote.classList.remove("hidden");
+  stopRbCheck();                // WS 断で RB 確認ポーリングも停止
   updateExperimentControls();   // wsOpen=false で実験操作系も安全側へ
 }
 
 /* ===================== 描画: セッション/モニタ ===================== */
 function isFlying() {
   if (lastSession && lastSession.phase === "flying") return true;
-  if (lastDrone && typeof lastDrone.flags === "number") return !!(lastDrone.flags & FLAG_FLYING);
+  if (lastDrone && typeof lastDrone.flags === "number" &&
+      (lastDrone.flags & FLAG_FLYING)) return true;
+  // 複数機モード: いずれかのスロットが開始/飛行中なら「飛行中」扱い
+  const multi = lastSession && lastSession.multi;
+  if (multi && (multi.drones || []).some((d) => d.phase !== "idle")) return true;
   return false;
 }
 
@@ -761,7 +788,16 @@ function renderYawMonitor() {
   const d = lastDrone;
   els.yawMadgwick.textContent = fmtNum(pick(d, "yaw"), 1);
   els.yawEkf.textContent = fmtNum(pick(d, "yaw_est"), 1);
-  els.yawGyroInt.textContent = fmtNum(pick(d, "yaw_gyro_int"), 1);
+  // ジャイロ積算は無制限の連続角(ドリフト評価用)。表示は ±180° に折り返し、
+  // 一周を超えたぶんは回転数として併記する(値そのものは失わない)
+  const gyroInt = pick(d, "yaw_gyro_int");
+  if (typeof gyroInt === "number") {
+    const turns = Math.round((gyroInt - wrap180(gyroInt)) / 360);
+    els.yawGyroInt.textContent =
+      wrap180(gyroInt).toFixed(1) + (turns !== 0 ? `(${turns > 0 ? "+" : ""}${turns}周)` : "");
+  } else {
+    els.yawGyroInt.textContent = fmtNum(gyroInt, 1);
+  }
 
   // MoCap ヨーは Position タブのみ表示(契約 §3.6)
   const showMocap = uiMode === "position" && lastMocap
@@ -863,6 +899,11 @@ function setBipolarBar(el, value, range) {
 
 function fmtNum(v, digits) {
   return typeof v === "number" ? v.toFixed(digits) : "--." + "-".repeat(Math.max(digits, 1));
+}
+/* 連続角[deg]を (-180, 180] へ正規化(モジュロベース。無制限入力にも安全) */
+function wrap180(deg) {
+  const w = ((deg % 360) + 540) % 360 - 180;
+  return w === -180 ? 180 : w;
 }
 function fmtDeg(v) {
   return typeof v === "number" ? `${v >= 0 ? "+" : ""}${v.toFixed(1)}°` : "--.-°";
@@ -977,6 +1018,292 @@ function drawPlot() {
   }
 }
 
+/* ===================== 複数機(Multi)タブ ===================== */
+/* サーバ側 session.multi(20Hz WS)が正。node_id 順の色は CSS 変数
+   --multi-c0..c3(fallback は下記配列)で機体タグ・プロット共通。 */
+const MULTI_COLOR_FALLBACK = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444"];
+const multiTrails = new Map();   // name -> [{x,y}]
+let multiTargetNames = [];       // 目標入力行を構築済みの機体名リスト
+let rbPollTimer = null;          // リジッドボディ確認のポーリングタイマ
+
+const multiCtx = els.multiCanvas.getContext("2d");
+(function setupMultiCanvasDpr() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = els.multiCanvas.width, h = els.multiCanvas.height;
+  els.multiCanvas.style.width = `${w}px`;
+  els.multiCanvas.style.height = `${h}px`;
+  els.multiCanvas.width = w * dpr;
+  els.multiCanvas.height = h * dpr;
+  multiCtx.scale(dpr, dpr);
+})();
+
+function multiColor(i) {
+  const css = getComputedStyle(document.documentElement)
+    .getPropertyValue(`--multi-c${i % 4}`).trim();
+  return css || MULTI_COLOR_FALLBACK[i % MULTI_COLOR_FALLBACK.length];
+}
+
+function multiPlotToPx(x, y) {
+  const w = parseFloat(els.multiCanvas.style.width);
+  const h = parseFloat(els.multiCanvas.style.height);
+  const s = w / (2 * UI.PLOT_RANGE_M);
+  return [w / 2 + x * s, h / 2 - y * (h / (2 * UI.PLOT_RANGE_M))];
+}
+
+/* 機体選択チェックボックス一覧(MAC 設定済みプロファイルのみ) */
+function renderMultiAirframeList() {
+  const box = els.multiAirframeList;
+  const checked = new Set(
+    [...box.querySelectorAll("input:checked")].map((c) => c.value));
+  box.innerHTML = "";
+  for (const af of airframes) {
+    if (!(af.mac || "").trim()) continue;
+    const label = document.createElement("label");
+    label.className = "multi-af";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = af.name;
+    cb.checked = checked.has(af.name);
+    const rb = af.rigid_body_id ? `RB${af.rigid_body_id}` : "RB未設定";
+    const text = document.createElement("span");
+    text.textContent = `${af.name}(ch${af.wifi_channel} / ${rb})`;
+    text.classList.toggle("warn-text", !af.rigid_body_id);
+    label.append(cb, text);
+    box.appendChild(label);
+  }
+}
+
+function sendMultiSelect() {
+  const names = [...els.multiAirframeList.querySelectorAll("input:checked")]
+    .map((c) => c.value);
+  if (names.length < 2 || names.length > 4) {
+    els.multiSelectMsg.textContent = "2〜4機を選択してください";
+    return;
+  }
+  multiTrails.clear();
+  els.multiSelectMsg.textContent = `選択を送信しました: ${names.join(", ")}`;
+  sendCommand("multi_select", { names });
+  appendConsole("ui", `複数機選択を送信: ${names.join(", ")}`);
+}
+
+/* 機体別目標入力行(選択機体が変わったときだけ再構築) */
+function buildMultiTargetRows(drones) {
+  const names = drones.map((d) => d.name);
+  if (names.join("|") === multiTargetNames.join("|")) return;
+  multiTargetNames = names;
+  // 選択から外れた機体の軌跡を掃除する
+  for (const key of [...multiTrails.keys()]) {
+    if (!names.includes(key)) multiTrails.delete(key);
+  }
+  const box = els.multiTargets;
+  box.innerHTML = "";
+  if (!names.length) return;
+  const head = document.createElement("div");
+  head.className = "multi-head";
+  const title = document.createElement("span");
+  title.className = "mlabel";
+  title.textContent = "機体別目標位置 [m]";
+  head.appendChild(title);
+  box.appendChild(head);
+
+  drones.forEach((d, i) => {
+    const row = document.createElement("div");
+    row.className = "multi-target-row";
+    const tag = document.createElement("span");
+    tag.className = "multi-tag mono";
+    tag.textContent = d.name;
+    tag.style.borderColor = multiColor(i);
+    tag.style.color = multiColor(i);
+    row.appendChild(tag);
+
+    const inputs = {};
+    for (const [key, init] of [["x", "0.00"], ["y", "0.00"], ["z", "0.30"]]) {
+      const label = document.createElement("label");
+      label.textContent = key.toUpperCase();
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = "0.05";
+      input.value = init;
+      inputs[key] = input;
+      label.appendChild(input);
+      row.appendChild(label);
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-small";
+    btn.textContent = "設定";
+    btn.addEventListener("click", () => {
+      const x = parseFloat(inputs.x.value);
+      const y = parseFloat(inputs.y.value);
+      const z = clamp(parseFloat(inputs.z.value) || UI.ALT_MIN_M,
+                      UI.ALT_MIN_M, UI.ALT_MAX_M);
+      if ([x, y].some(Number.isNaN)) return;
+      wsSend({ type: "multi_target", name: d.name, x, y, z });
+      appendConsole("ui",
+        `目標設定(${d.name}): (${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`);
+    });
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+
+/* 機体別ステータスチップ+一斉スタート活性 */
+function renderMulti() {
+  const multi = lastSession ? lastSession.multi : null;
+  const drones = (multi && multi.drones) || [];
+  buildMultiTargetRows(drones);
+
+  const box = els.multiStatus;
+  box.innerHTML = "";
+  drones.forEach((d, i) => {
+    const chip = document.createElement("div");
+    chip.className = "multi-chip";
+    chip.style.borderLeftColor = multiColor(i);
+    const t = d.tlm;
+    const m = d.mocap;
+    const phaseJp = { idle: "待機", armed: "開始", flying: "飛行中" }[d.phase] || d.phase;
+    const volt = t && typeof t.voltage === "number" ? `${t.voltage.toFixed(2)}V` : "--V";
+    const stateName = t ? t.state_name : "--";
+    const link = t && t.fresh ? "TLM✓" : "TLM✗";
+    const mocapTxt = m && m.fresh
+      ? `RB✓ (${fmtNum(m.x, 2)}, ${fmtNum(m.y, 2)}, ${fmtNum(m.z, 2)})`
+      : "RB✗";
+    const lat = typeof d.latency_ms === "number"
+      ? ` ${d.latency_ms.toFixed(0)}ms` : "";
+    chip.textContent =
+      `[${d.node_id}] ${d.name}  ${phaseJp}/${stateName}  ${volt}  ${link}  ${mocapTxt}${lat}`;
+    chip.classList.toggle("chip-warn", !(t && t.fresh) || !(m && m.fresh));
+    chip.classList.toggle("chip-flying", d.phase === "flying");
+    box.appendChild(chip);
+
+    // 軌跡の蓄積(MoCap 座標)
+    if (m && typeof m.x === "number" && typeof m.y === "number") {
+      let tr = multiTrails.get(d.name);
+      if (!tr) { tr = []; multiTrails.set(d.name, tr); }
+      tr.push({ x: m.x, y: m.y });
+      if (tr.length > UI.TRAIL_MAX_POINTS) tr.shift();
+    }
+  });
+
+  // 一斉スタート: 選択済み+全機 idle+WS 接続時のみ
+  const anyActive = drones.some((d) => d.phase !== "idle");
+  els.btnMultiStart.disabled =
+    !(wsOpen && multi && multi.active && drones.length >= 2 && !anyActive);
+  els.btnMultiApply.disabled =
+    !(wsOpen && lastSession && lastSession.serial_connected && !anyActive);
+}
+
+function drawMultiPlot() {
+  const w = parseFloat(els.multiCanvas.style.width);
+  const h = parseFloat(els.multiCanvas.style.height);
+  const css = getComputedStyle(document.documentElement);
+  const cGrid = css.getPropertyValue("--plot-grid").trim() || "#2a3140";
+  const cAxis = css.getPropertyValue("--plot-axis").trim() || "#3d4860";
+  const cStale = css.getPropertyValue("--plot-stale").trim() || "#6b7280";
+
+  multiCtx.clearRect(0, 0, w, h);
+  multiCtx.lineWidth = 1;
+  multiCtx.strokeStyle = cGrid;
+  for (let g = -UI.PLOT_RANGE_M; g <= UI.PLOT_RANGE_M + 1e-9; g += UI.PLOT_GRID_M) {
+    const [gx] = multiPlotToPx(g, 0);
+    const [, gy] = multiPlotToPx(0, g);
+    multiCtx.beginPath(); multiCtx.moveTo(gx, 0); multiCtx.lineTo(gx, h); multiCtx.stroke();
+    multiCtx.beginPath(); multiCtx.moveTo(0, gy); multiCtx.lineTo(w, gy); multiCtx.stroke();
+  }
+  multiCtx.strokeStyle = cAxis;
+  const [ox, oy] = multiPlotToPx(0, 0);
+  multiCtx.beginPath(); multiCtx.moveTo(ox, 0); multiCtx.lineTo(ox, h); multiCtx.stroke();
+  multiCtx.beginPath(); multiCtx.moveTo(0, oy); multiCtx.lineTo(w, oy); multiCtx.stroke();
+
+  const multi = lastSession ? lastSession.multi : null;
+  const drones = (multi && multi.drones) || [];
+  drones.forEach((d, i) => {
+    const color = multiColor(i);
+    // 軌跡
+    const tr = multiTrails.get(d.name) || [];
+    if (tr.length > 1) {
+      multiCtx.strokeStyle = color;
+      multiCtx.globalAlpha = 0.4;
+      multiCtx.lineWidth = 1.5;
+      multiCtx.beginPath();
+      tr.forEach((p, k) => {
+        const [px, py] = multiPlotToPx(p.x, p.y);
+        if (k === 0) multiCtx.moveTo(px, py); else multiCtx.lineTo(px, py);
+      });
+      multiCtx.stroke();
+      multiCtx.globalAlpha = 1;
+    }
+    // 目標(◎十字)
+    if (d.target && typeof d.target.x === "number") {
+      const [tx, ty] = multiPlotToPx(d.target.x, d.target.y);
+      multiCtx.strokeStyle = color;
+      multiCtx.lineWidth = 1.5;
+      const r = 7;
+      multiCtx.beginPath(); multiCtx.moveTo(tx - r, ty); multiCtx.lineTo(tx + r, ty); multiCtx.stroke();
+      multiCtx.beginPath(); multiCtx.moveTo(tx, ty - r); multiCtx.lineTo(tx, ty + r); multiCtx.stroke();
+      multiCtx.beginPath(); multiCtx.arc(tx, ty, r - 2.5, 0, Math.PI * 2); multiCtx.stroke();
+    }
+    // 現在位置(●+ノード番号)
+    const m = d.mocap;
+    if (m && typeof m.x === "number" && typeof m.y === "number") {
+      const [cx, cy] = multiPlotToPx(m.x, m.y);
+      multiCtx.fillStyle = m.fresh ? color : cStale;
+      multiCtx.beginPath(); multiCtx.arc(cx, cy, 5, 0, Math.PI * 2); multiCtx.fill();
+      multiCtx.fillStyle = m.fresh ? color : cStale;
+      multiCtx.font = "10px sans-serif";
+      multiCtx.fillText(String(d.node_id), cx + 7, cy - 7);
+    }
+  });
+}
+
+/* リジッドボディ紐付け確認(500ms ポーリングのトグル) */
+function renderRbList(result) {
+  const box = els.rbList;
+  box.innerHTML = "";
+  if (!result || !result.connected) {
+    box.textContent = "NatNet 未接続(Motive の配信設定を確認してください)";
+    return;
+  }
+  const bodies = result.bodies || [];
+  if (!bodies.length) {
+    box.textContent = "リジッドボディ未検出(Motive 側で作成されているか確認)";
+    return;
+  }
+  for (const b of bodies) {
+    const line = document.createElement("div");
+    line.className = "rb-line";
+    const stale = typeof b.age_s === "number" && b.age_s > 1.0;
+    line.classList.toggle("stale", stale);
+    const assigned = airframes.find((a) => a.rigid_body_id === b.rigid_body_id);
+    const tag = assigned ? ` ← ${assigned.name}` : "";
+    line.textContent =
+      `RB ${b.rigid_body_id}: x${fmtNum(b.x, 2)} y${fmtNum(b.y, 2)} ` +
+      `z${fmtNum(b.z, 2)}${stale ? "(途絶)" : ""}${tag}`;
+    box.appendChild(line);
+  }
+}
+
+async function pollRbBodies() {
+  renderRbList(await apiGet("/api/mocap/bodies", true));
+}
+
+function stopRbCheck() {
+  if (rbPollTimer === null) return;
+  clearInterval(rbPollTimer);
+  rbPollTimer = null;
+  els.btnRbCheck.textContent = "確認開始";
+}
+
+function toggleRbCheck() {
+  if (rbPollTimer !== null) {
+    stopRbCheck();
+    return;
+  }
+  els.btnRbCheck.textContent = "確認停止";
+  pollRbBodies();
+  rbPollTimer = setInterval(pollRbBodies, UI.RB_POLL_MS);
+}
+
 /* ===================== コンソール ===================== */
 const CONSOLE_TAGS = {
   ui: "UI", relay: "RELAY", drone: "DRONE", event: "EVENT",
@@ -1012,8 +1339,10 @@ function appendConsole(tag, text) {
 /* ===================== モード(タブ)切替 ===================== */
 function applyMode(mode, sendToServer) {
   uiMode = mode;
-  const tabs = { posture: els.tabPosture, position: els.tabPosition, experiment: els.tabExperiment };
-  const panels = { posture: els.panelPosture, position: els.panelPosition, experiment: els.panelExperiment };
+  const tabs = { posture: els.tabPosture, position: els.tabPosition,
+                 multi: els.tabMulti, experiment: els.tabExperiment };
+  const panels = { posture: els.panelPosture, position: els.panelPosition,
+                   multi: els.panelMulti, experiment: els.panelExperiment };
   for (const m of Object.keys(tabs)) {
     tabs[m].classList.toggle("active", m === mode);
     panels[m].classList.toggle("active", m === mode);
@@ -1031,6 +1360,12 @@ function applyMode(mode, sendToServer) {
     sendCommand("set_mode", { mode });
   }
   if (mode === "position") drawPlot();
+  if (mode === "multi") {
+    renderMultiAirframeList();
+    drawMultiPlot();
+  } else {
+    stopRbCheck();   // タブ離脱時に RB 確認ポーリングを止める
+  }
   if (mode === "experiment") refreshExperimentPanels();
 }
 
@@ -1469,8 +1804,9 @@ function wireEvents() {
     }
   });
 
-  // タブ(3タブ: posture / position / experiment)
-  for (const tab of [els.tabPosture, els.tabPosition, els.tabExperiment]) {
+  // タブ(4タブ: posture / position / multi / experiment)
+  for (const tab of [els.tabPosture, els.tabPosition, els.tabMulti,
+                     els.tabExperiment]) {
     tab.addEventListener("click", () => {
       if (isFlying()) {
         appendConsole("ui", "飛行中はモードを切り替えできません");
@@ -1479,6 +1815,19 @@ function wireEvents() {
       if (tab.dataset.mode !== uiMode) applyMode(tab.dataset.mode, true);
     });
   }
+
+  // 複数機タブ: 選択適用 / 一斉スタート / リジッドボディ確認
+  els.btnMultiApply.addEventListener("click", sendMultiSelect);
+  els.btnMultiStart.addEventListener("click", () => {
+    const multi = lastSession && lastSession.multi;
+    const names = ((multi && multi.drones) || []).map((d) => d.name);
+    if (window.confirm(
+        `複数機モードで一斉離陸します(${names.join(", ")})。よろしいですか?`)) {
+      sendCommand("multi_start");
+      appendConsole("ui", "一斉スタート送信");
+    }
+  });
+  els.btnRbCheck.addEventListener("click", toggleRbCheck);
 
   // START / STOP / RESET(data-action で配線)
   for (const btn of document.querySelectorAll("[data-action=start]")) {

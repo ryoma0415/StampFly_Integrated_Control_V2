@@ -40,6 +40,15 @@ constexpr size_t SERIAL_RX_BUFFER_CAP = 256;  // 受信蓄積バッファ上限(
 
 constexpr size_t MAX_LOG_TEXT_SIZE = 180;  // LOG_TEXT の UTF-8 テキスト上限
 
+// --- マルチ機体(リレー多重化)関連 ---
+constexpr size_t RLY_MAX_PEERS = 4;        // RLY_SET_PEERS の最大登録数(=同時制御機体数上限)
+constexpr size_t RLY_PEER_ENTRY_SIZE = 7;  // mac(6) + tlm_state_div(1)
+constexpr size_t MUX_HEADER_SIZE = 1;      // RLY_MUX_UP/DOWN の node_id(1B)
+// エンベロープに収まる内側フレームの最大ペイロード長(= 200 - 1 - 9 = 190)。
+// 既存の全メッセージ(最大 TLM_STATE 135B)が収まる。
+constexpr size_t MAX_MUX_INNER_PAYLOAD =
+    MAX_PAYLOAD_SIZE - MUX_HEADER_SIZE - FRAME_OVERHEAD;
+
 // COBSエンコード後の最大長(本実装は満杯ブロック直後にも終端コード0x01を出す方式)
 constexpr size_t cobs_max_encoded_size(size_t n) { return n + n / 254 + 2; }
 // シリアルワイヤ上の1フレーム最大長(COBS + デリミタ1バイト)
@@ -85,6 +94,11 @@ enum class MsgType : uint8_t {
   RLY_STATS = 0x52,       // リレー統計(24B、1Hz)
   RLY_PING = 0x53,        // 疎通確認(payload 0B)
   RLY_PONG = 0x54,        // PING 応答(4B)
+  // マルチ機体拡張(追加のみ・ver=0x02 のまま。単機経路 0x50/0x51 とは排他)
+  RLY_SET_PEERS = 0x55,   // 複数ピア設定(可変長 2+7×N、N=0..4)
+  RLY_PEERS_ACK = 0x56,   // SET_PEERS 応答(4B)
+  RLY_MUX_UP = 0x57,      // PC→リレー: node_id + 内側フレーム(機体宛)
+  RLY_MUX_DOWN = 0x58,    // リレー→PC: node_id + 内側フレーム(機体発)
 };
 
 // 型レンジルーティング(リレーは中身を解釈せず型で転送先を決める)
@@ -1335,6 +1349,130 @@ inline bool deserialize(const uint8_t* in, size_t len, RlyPong* out) {
   return true;
 }
 
+// 0x55 RLY_SET_PEERS(可変長 2+7×N B、N=0..4)— マルチ機体ピア設定。
+// count=0 でマルチモード解除。全ピアで wifi_channel を共有する(無線は1チャネル)。
+struct RlyPeerEntry {
+  uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
+  uint8_t tlm_state_div = 1;  // TLM_STATE 間引き(1=全転送, n=1/n 転送。0 は 1 扱い)
+};
+
+struct RlySetPeers {
+  static constexpr MsgType TYPE = MsgType::RLY_SET_PEERS;
+  static constexpr size_t MIN_PAYLOAD_SIZE = 2;
+  static constexpr size_t MAX_PAYLOAD_SIZE_BYTES =
+      MIN_PAYLOAD_SIZE + RLY_PEER_ENTRY_SIZE * RLY_MAX_PEERS;  // = 30
+
+  uint8_t count = 0;         // 0..RLY_MAX_PEERS(index がそのまま node_id)
+  uint8_t wifi_channel = 0;  // 1-13(count=0 のときは 0 を許容)
+  RlyPeerEntry peers[RLY_MAX_PEERS] = {};
+};
+static_assert(RlySetPeers::MAX_PAYLOAD_SIZE_BYTES == 30,
+              "PROTOCOL.md: RLY_SET_PEERS payload = 2+7*N (max 30B)");
+
+inline bool serialize(const RlySetPeers& m, uint8_t* out, size_t cap, size_t* out_len) {
+  if (out == nullptr || out_len == nullptr) return false;
+  if (m.count > RLY_MAX_PEERS) return false;
+  const size_t need = RlySetPeers::MIN_PAYLOAD_SIZE + RLY_PEER_ENTRY_SIZE * m.count;
+  if (cap < need) return false;
+  wr_u8(out + 0, m.count);
+  wr_u8(out + 1, m.wifi_channel);
+  for (size_t i = 0; i < m.count; ++i) {
+    const size_t off = RlySetPeers::MIN_PAYLOAD_SIZE + RLY_PEER_ENTRY_SIZE * i;
+    for (size_t j = 0; j < 6; ++j) wr_u8(out + off + j, m.peers[i].mac[j]);
+    wr_u8(out + off + 6, m.peers[i].tlm_state_div);
+  }
+  *out_len = need;
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, RlySetPeers* out) {
+  if (in == nullptr || out == nullptr || len < RlySetPeers::MIN_PAYLOAD_SIZE) return false;
+  const uint8_t count = rd_u8(in + 0);
+  if (count > RLY_MAX_PEERS) return false;
+  if (len != RlySetPeers::MIN_PAYLOAD_SIZE + RLY_PEER_ENTRY_SIZE * count) return false;
+  out->count = count;
+  out->wifi_channel = rd_u8(in + 1);
+  for (size_t i = 0; i < count; ++i) {
+    const size_t off = RlySetPeers::MIN_PAYLOAD_SIZE + RLY_PEER_ENTRY_SIZE * i;
+    for (size_t j = 0; j < 6; ++j) out->peers[i].mac[j] = rd_u8(in + off + j);
+    out->peers[i].tlm_state_div = rd_u8(in + off + 6);
+  }
+  for (size_t i = count; i < RLY_MAX_PEERS; ++i) out->peers[i] = RlyPeerEntry{};
+  return true;
+}
+
+// 0x56 RLY_PEERS_ACK(4B)— SET_PEERS への応答。
+struct RlyPeersAck {
+  static constexpr MsgType TYPE = MsgType::RLY_PEERS_ACK;
+  static constexpr size_t PAYLOAD_SIZE = 4;
+  static constexpr uint8_t STATUS_OK = 0;
+  static constexpr uint8_t STATUS_INVALID_MAC = 1;
+  static constexpr uint8_t STATUS_PEER_FAILED = 2;
+  static constexpr uint8_t STATUS_BAD_COUNT = 3;
+  static constexpr uint8_t STATUS_BAD_CHANNEL = 4;
+  static constexpr uint8_t FAILED_NONE = 0xFF;
+
+  uint8_t status = 0;
+  uint8_t count = 0;          // 受理したピア数のエコー
+  uint8_t wifi_channel = 0;
+  uint8_t failed_index = FAILED_NONE;  // 失敗エントリの index(なければ 0xFF)
+};
+static_assert(RlyPeersAck::PAYLOAD_SIZE == 4, "PROTOCOL.md: RLY_PEERS_ACK payload = 4B");
+
+inline bool serialize(const RlyPeersAck& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < RlyPeersAck::PAYLOAD_SIZE) return false;
+  wr_u8(out + 0, m.status);
+  wr_u8(out + 1, m.count);
+  wr_u8(out + 2, m.wifi_channel);
+  wr_u8(out + 3, m.failed_index);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, RlyPeersAck* out) {
+  if (in == nullptr || out == nullptr || len != RlyPeersAck::PAYLOAD_SIZE) return false;
+  out->status = rd_u8(in + 0);
+  out->count = rd_u8(in + 1);
+  out->wifi_channel = rd_u8(in + 2);
+  out->failed_index = rd_u8(in + 3);
+  return true;
+}
+
+// 0x57/0x58 RLY_MUX_UP / RLY_MUX_DOWN(1+内側フレーム長)— シリアル区間の
+// 機体多重化エンベロープ。inner は完全な内側論理フレーム(ver..crc16)への
+// ゼロコピー参照(元ペイロードバッファが生きている間のみ有効)。
+struct RlyMuxView {
+  uint8_t node_id = 0;
+  const uint8_t* inner = nullptr;
+  size_t inner_len = 0;
+};
+
+// MUX ペイロードを (node_id, 内側フレーム参照) に分解する。
+// 内側フレームの CRC/構造検証は行わない(受信側が parse_frame で検証)。
+inline bool mux_unwrap(const uint8_t* payload, size_t len, RlyMuxView* out) {
+  if (payload == nullptr || out == nullptr) return false;
+  if (len < MUX_HEADER_SIZE + FRAME_OVERHEAD) return false;
+  const uint8_t node_id = rd_u8(payload);
+  if (node_id >= RLY_MAX_PEERS) return false;
+  out->node_id = node_id;
+  out->inner = payload + MUX_HEADER_SIZE;
+  out->inner_len = len - MUX_HEADER_SIZE;
+  return true;
+}
+
+// MUX ペイロード(node_id + 内側フレーム)を構築する。戻り値は書き込んだ
+// バイト数(失敗時 0)。
+inline size_t mux_wrap(uint8_t node_id, const uint8_t* inner, size_t inner_len,
+                       uint8_t* out, size_t cap) {
+  if (inner == nullptr || out == nullptr) return 0;
+  if (node_id >= RLY_MAX_PEERS) return 0;
+  if (inner_len < FRAME_OVERHEAD) return 0;
+  if (MUX_HEADER_SIZE + inner_len > MAX_PAYLOAD_SIZE) return 0;
+  if (cap < MUX_HEADER_SIZE + inner_len) return 0;
+  wr_u8(out, node_id);
+  for (size_t i = 0; i < inner_len; ++i) out[MUX_HEADER_SIZE + i] = inner[i];
+  return MUX_HEADER_SIZE + inner_len;
+}
+
 // 既知型の期待ペイロード長。固定長は値、可変長(LOG_TEXT)は -1、未知型は -2。
 // ドローン側受理規則「len==期待値」の判定に使用する。
 inline int expected_payload_size(uint8_t type) {
@@ -1395,6 +1533,12 @@ inline int expected_payload_size(uint8_t type) {
       return static_cast<int>(RlyStats::PAYLOAD_SIZE);
     case MsgType::RLY_PONG:
       return static_cast<int>(RlyPong::PAYLOAD_SIZE);
+    case MsgType::RLY_SET_PEERS:  // 可変長(2+7×N)
+    case MsgType::RLY_MUX_UP:     // 可変長(1+内側フレーム)
+    case MsgType::RLY_MUX_DOWN:   // 可変長(1+内側フレーム)
+      return -1;
+    case MsgType::RLY_PEERS_ACK:
+      return static_cast<int>(RlyPeersAck::PAYLOAD_SIZE);
     default:
       return -2;
   }

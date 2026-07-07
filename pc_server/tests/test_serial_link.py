@@ -164,3 +164,128 @@ def test_send_when_not_connected_raises(server_config):
     link = SerialLink(server_config, transport_factory=lambda p, b: FakeTransport())
     with pytest.raises(SerialLinkError):
         link.send(proto.MsgType.CMD_START)
+
+
+# ---------------------------------------------------------------------------
+# マルチ機体(RLY_MUX_UP/DOWN・RLY_SET_PEERS)
+# ---------------------------------------------------------------------------
+
+MAC2 = bytes.fromhex("48CA433A5130")
+
+
+def test_send_to_wraps_in_mux_up(link_env):
+    link, transport, _ = link_env
+    setpoint = proto.CmdSetpoint(alt_ref=0.3, flags=1)
+    seq = link.send_to(2, proto.MsgType.CMD_SETPOINT, setpoint.to_payload())
+
+    assert len(transport.sent_frames) == 1
+    outer = transport.sent_frames[0]
+    assert outer.type == proto.MsgType.RLY_MUX_UP
+    node_id, inner_bytes = proto.mux_unwrap(outer.payload)
+    assert node_id == 2
+    status, inner = proto.parse_frame(inner_bytes)
+    assert status is proto.ParseStatus.OK and inner is not None
+    assert inner.type == proto.MsgType.CMD_SETPOINT
+    # 内側と外側は同じ seq を共有する(採番は1回)
+    assert inner.seq == seq == outer.seq
+    assert inner.payload == setpoint.to_payload()
+
+
+def test_mux_down_dispatches_with_node(link_env):
+    link, transport, _ = link_env
+    received: list[tuple[int, proto.Frame]] = []
+    link.register_node_handler(
+        proto.MsgType.TLM_EVENT,
+        lambda node, frame: received.append((node, frame)))
+
+    event = proto.TlmEvent(state=proto.FlightState.HOVER,
+                           prev_state=proto.FlightState.TAKEOFF,
+                           reason=proto.Reason.NONE, flags=0, voltage=3.7)
+    inner = proto.pack_frame(proto.MsgType.TLM_EVENT, 5, event.to_payload())
+    transport.push(proto.MsgType.RLY_MUX_DOWN, proto.mux_wrap(1, inner))
+
+    assert wait_until(lambda: len(received) == 1)
+    node, frame = received[0]
+    assert node == 1
+    assert frame.seq == 5
+    assert frame.payload == event.to_payload()
+
+
+def test_node_latency_from_mux_down_seq_echo(link_env):
+    link, transport, _ = link_env
+    seq = link.send_setpoint_to(0, proto.CmdSetpoint(alt_ref=0.3, flags=1))
+    assert link.node_latency_ms(0) is None
+
+    inner = proto.pack_frame(proto.MsgType.TLM_STATE, 9,
+                             proto.TlmState(seq_echo=seq).to_payload())
+    transport.push(proto.MsgType.RLY_MUX_DOWN, proto.mux_wrap(0, inner))
+
+    assert wait_until(lambda: link.node_latency_ms(0) is not None)
+    assert 0.0 <= link.node_latency_ms(0) < 1000.0
+    # 他ノード・単機側のレイテンシには影響しない
+    assert link.node_latency_ms(1) is None
+    assert link.latency_ms is None
+
+
+def test_mux_down_bad_inner_is_counted(link_env):
+    link, transport, _ = link_env
+    # node_id=0 + 壊れた内側(長さは FRAME_OVERHEAD 以上だが CRC 不一致)
+    transport.push(proto.MsgType.RLY_MUX_DOWN, b"\x00" + b"\xaa" * 12)
+    assert wait_until(lambda: link.stats()["rx_mux_errors"] == 1)
+
+
+def make_peers_ack_responder(status: int = proto.RlyPeersAck.STATUS_OK):
+    """RLY_SET_PEERS に RLY_PEERS_ACK を返すレスポンダを作る。"""
+    def responder(frame: proto.Frame):
+        if frame.type != proto.MsgType.RLY_SET_PEERS:
+            return None
+        req = proto.RlySetPeers.from_payload(frame.payload)
+        ack = proto.RlyPeersAck(status=status, count=len(req.peers),
+                                wifi_channel=req.wifi_channel)
+        return [(proto.MsgType.RLY_PEERS_ACK, ack.to_payload())]
+    return responder
+
+
+def test_set_relay_peers_success_first_attempt(server_config):
+    transport = FakeTransport(auto_responder=make_peers_ack_responder())
+    link = SerialLink(server_config, transport_factory=lambda p, b: transport)
+    link.connect("FAKE")
+    try:
+        ok, ack = link.set_relay_peers([(MAC, 1), (MAC2, 2)], 1)
+    finally:
+        link.disconnect()
+    assert ok is True
+    assert ack is not None and ack.status == proto.RlyPeersAck.STATUS_OK
+    assert ack.count == 2 and ack.wifi_channel == 1
+    assert len(transport.frames_of_type(proto.MsgType.RLY_SET_PEERS)) == 1
+    # 送信された SET_PEERS の中身も確認(index = node_id、間引き設定含む)
+    sent = proto.RlySetPeers.from_payload(
+        transport.frames_of_type(proto.MsgType.RLY_SET_PEERS)[0].payload)
+    assert [bytes(p.mac) for p in sent.peers] == [MAC, MAC2]
+    assert [p.tlm_state_div for p in sent.peers] == [1, 2]
+
+
+def test_set_relay_peers_retries_on_timeout(fast_server_config):
+    transport = FakeTransport()   # 応答なし
+    link = SerialLink(fast_server_config, transport_factory=lambda p, b: transport)
+    link.connect("FAKE")
+    try:
+        ok, ack = link.set_relay_peers([(MAC, 1)], 1)
+    finally:
+        link.disconnect()
+    assert ok is False
+    assert ack is None
+    # RLY_SET_TARGET と同じ再送規律: 初回+最大3回再送=計4送信
+    assert len(transport.frames_of_type(proto.MsgType.RLY_SET_PEERS)) == 4
+
+
+def test_set_relay_peers_clear(server_config):
+    transport = FakeTransport(auto_responder=make_peers_ack_responder())
+    link = SerialLink(server_config, transport_factory=lambda p, b: transport)
+    link.connect("FAKE")
+    try:
+        ok, ack = link.set_relay_peers([], 0)   # count=0 = マルチ解除
+    finally:
+        link.disconnect()
+    assert ok is True
+    assert ack is not None and ack.count == 0

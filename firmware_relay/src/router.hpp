@@ -1,9 +1,12 @@
 // ===========================================================================
 // router.hpp — 型レンジルーティング(PROTOCOL.md「メッセージ型」)
 //
-//   0x10–0x2F: シリアル→ESP-NOW(ターゲット未設定時はLOG_TEXT警告つきで拒否)
-//   0x30–0x4F: ESP-NOW→シリアル
-//   0x50–0x5F: リレー自身で処理(SET_TARGET反映+ACK、PING→PONG)
+//   0x10–0x2F: シリアル→ESP-NOW(単機モードのみ。ターゲット未設定/マルチ
+//              モード中はLOG_TEXT警告つきで拒否)
+//   0x30–0x4F: ESP-NOW→シリアル(マルチモードでは RLY_MUX_DOWN で包み、
+//              TLM_STATE はピア設定 tlm_state_div に従い間引く)
+//   0x50–0x5F: リレー自身で処理(SET_TARGET/SET_PEERS反映+ACK、
+//              MUX_UP展開→ピア送信、PING→PONG)
 //
 // リレーはフレームの中身を解釈せず、型レンジだけで転送先を決める。
 // RLY_STATS を1Hzで自動発行。人間向け出力はすべて LOG_TEXT(origin=0)

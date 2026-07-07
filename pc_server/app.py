@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import queue
 from pathlib import Path
@@ -57,10 +58,24 @@ def _list_serial_ports() -> list[dict]:
             for p in list_ports.comports()]
 
 
-async def _send_safely(websocket: WebSocket, message: dict) -> bool:
+def _encode_ws(message: dict) -> str | None:
+    """WS 送信用 JSON 文字列化(全クライアント共通なので1回だけ)。
+
+    非有限 float は session 側(_json_safe)で None 化済みのはずだが、
+    取りこぼしがあると NaN トークン入りの不正 JSON になり、ブラウザ側は
+    JSON.parse 失敗でフレームを黙って捨てる(UI が固まって見える)。
+    allow_nan=False でサーバ側で止め、ログに残して1フレーム落とす。"""
+    try:
+        return json.dumps(message, allow_nan=False, separators=(",", ":"))
+    except ValueError:
+        _log.exception("WS メッセージに非有限 float が混入(フレーム破棄)")
+        return None
+
+
+async def _send_safely(websocket: WebSocket, text: str) -> bool:
     """1クライアントへの送信。失敗/タイムアウトで False(呼び出し元が除去)。"""
     try:
-        await asyncio.wait_for(websocket.send_json(message),
+        await asyncio.wait_for(websocket.send_text(text),
                                timeout=_WS_SEND_TIMEOUT_S)
         return True
     except Exception:
@@ -70,8 +85,11 @@ async def _send_safely(websocket: WebSocket, message: dict) -> bool:
 
 
 async def _broadcast(message: dict) -> None:
+    text = _encode_ws(message)
+    if text is None:
+        return
     dead = [ws for ws in list(_clients)
-            if not await _send_safely(ws, message)]
+            if not await _send_safely(ws, text)]
     for ws in dead:
         _clients.discard(ws)
 
@@ -436,8 +454,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     _clients.add(websocket)
     # 接続直後に現在状態を1回送る(UI 初期表示用)
-    await _send_safely(websocket,
-                       await asyncio.to_thread(session.get_state_snapshot))
+    text = _encode_ws(await asyncio.to_thread(session.get_state_snapshot))
+    if text is not None:
+        await _send_safely(websocket, text)
     pending: asyncio.Queue = asyncio.Queue()
     worker = asyncio.create_task(_client_message_worker(pending))
     try:

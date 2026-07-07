@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -181,6 +182,33 @@ class TestSnapshotContract:
         assert drone["state_name"] == "HOVER"
         assert drone["flying"] is True
 
+    def test_snapshot_drone_nonfinite_becomes_none_and_json_strict(
+            self, session_factory):
+        """TLM_STATE の非有限 float は None に落ち、スナップショット全体が
+        厳格 JSON(allow_nan=False)で直列化できる(NaN トークンを配ると
+        ブラウザ側 JSON.parse が state フレームごと捨てて UI が固まる)。"""
+        session, transport, clock = session_factory()
+        session.connect("FAKE")
+        halt_supervisor(session)
+
+        tlm = proto.TlmState(state=proto.FlightState.HOVER,
+                             roll=float("nan"), pitch=0.1,
+                             voltage=float("nan"),
+                             altitude_est=float("inf"),
+                             current_a=float("-inf"))
+        transport.push(proto.MsgType.TLM_STATE, tlm.to_payload())
+        assert wait_until(
+            lambda: session.get_state_snapshot()["data"]["drone"] is not None)
+
+        snapshot = session.get_state_snapshot()
+        drone = snapshot["data"]["drone"]
+        assert drone["roll"] is None          # NaN(deg 換算後も NaN)
+        assert drone["voltage"] is None       # NaN
+        assert drone["altitude_est"] is None  # +Inf
+        assert drone["current_a"] is None     # -Inf
+        assert drone["pitch"] == pytest.approx(math.degrees(0.1))
+        json.dumps(snapshot, allow_nan=False)   # 漏れがあれば ValueError
+
     def test_mocap_snapshot_in_position_mode(self, session_factory):
         session, transport, clock = session_factory()
         session.connect("FAKE")
@@ -261,6 +289,24 @@ class TestEventsAndLogText:
         assert data["state_name"] == "TAKEOFF"
         assert data["reason_name"] == "START_CMD"
         assert data["voltage"] == pytest.approx(3.9, abs=1e-4)
+
+    def test_tlm_event_nan_voltage_becomes_none(self, session_factory):
+        """イベント経路(TLM_EVENT)の voltage も非有限なら None に落ちる。"""
+        session, transport, clock = session_factory()
+        session.connect("FAKE")
+        halt_supervisor(session)
+        self._drain(session)
+
+        event = proto.TlmEvent(state=proto.FlightState.TAKEOFF,
+                               prev_state=proto.FlightState.WAIT,
+                               reason=proto.Reason.START_CMD,
+                               voltage=float("nan"))
+        transport.push(proto.MsgType.TLM_EVENT, event.to_payload())
+        assert wait_until(lambda: any(
+            m["type"] == "event" for m in self._drain(session, keep=True)))
+        message = [m for m in self._drained if m["type"] == "event"][-1]
+        assert message["data"]["voltage"] is None
+        json.dumps(message, allow_nan=False)   # 漏れがあれば ValueError
 
     def test_log_text_origin_mapping(self, session_factory):
         session, transport, clock = session_factory()

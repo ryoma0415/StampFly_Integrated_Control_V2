@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import threading
 import time
 
@@ -181,6 +183,57 @@ class TestTlmExpFlow:
         assert sample["current_a"] == pytest.approx(1.25)
         assert sample["vbat_v"] == pytest.approx(3.85)
         assert sample["cv"] == 1
+
+    def test_snapshot_exposes_accel(self, exp_session):
+        """WS スナップショットの exp に ax/ay/az [g] が載る(6面キャリブUIのライブ表示)。"""
+        session, transport, clock, responder = exp_session
+        transport.push(proto.MsgType.TLM_EXP,
+                       make_tlm_exp(ax=0.25, ay=-0.5, az=1.0).to_payload())
+        assert wait_until(
+            lambda: session.experiment.latest_sample()[0] is not None)
+        exp = session.get_state_snapshot()["data"]["session"]["experiment"]
+        assert exp is not None and exp["exp"] is not None
+        assert exp["exp"]["ax"] == pytest.approx(0.25)
+        assert exp["exp"]["ay"] == pytest.approx(-0.5)
+        assert exp["exp"]["az"] == pytest.approx(1.0)
+
+    def test_snapshot_accel_nan_becomes_none(self, exp_session):
+        """非有限の加速度は None に落ちる(WS の JSON を壊さない)。"""
+        session, transport, clock, responder = exp_session
+        transport.push(proto.MsgType.TLM_EXP,
+                       make_tlm_exp(ax=float("nan"), ay=float("inf"),
+                                    az=1.0).to_payload())
+        assert wait_until(
+            lambda: session.experiment.latest_sample()[0] is not None)
+        exp = session.get_state_snapshot()["data"]["session"]["experiment"]
+        assert exp["exp"]["ax"] is None
+        assert exp["exp"]["ay"] is None
+        assert exp["exp"]["az"] == pytest.approx(1.0)
+
+    def test_snapshot_exp_nonfinite_becomes_none_and_json_strict(
+            self, exp_session):
+        """exp dict の全 float(電流・電圧・磁気ベクトル・角度・duty)も
+        非有限なら None に落ち、スナップショット全体が厳格 JSON で通る。"""
+        session, transport, clock, responder = exp_session
+        transport.push(proto.MsgType.TLM_EXP,
+                       make_tlm_exp(current_a=float("nan"),
+                                    vbat_v=float("inf"),
+                                    b_raw=(float("nan"), -5.0, 30.0),
+                                    b_cal=(11.0, float("-inf"), 29.0),
+                                    roll=float("nan"), yaw=0.2,
+                                    duty_cmd=float("nan")).to_payload())
+        assert wait_until(
+            lambda: session.experiment.latest_sample()[0] is not None)
+        snapshot = session.get_state_snapshot()
+        exp = snapshot["data"]["session"]["experiment"]["exp"]
+        assert exp["current_a"] is None
+        assert exp["vbat_v"] is None
+        assert exp["b_raw"] == [None, pytest.approx(-5.0), pytest.approx(30.0)]
+        assert exp["b_cal"] == [pytest.approx(11.0), None, pytest.approx(29.0)]
+        assert exp["roll_deg"] is None
+        assert exp["yaw_deg"] == pytest.approx(math.degrees(0.2))
+        assert exp["duty_cmd"] is None
+        json.dumps(snapshot, allow_nan=False)   # 漏れがあれば ValueError
 
     def test_cal3d_collects_raw_field(self, exp_session):
         session, transport, clock, responder = exp_session

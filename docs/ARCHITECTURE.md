@@ -175,11 +175,18 @@ StampFly_Integrated_Control_V2/
 - サーバ→UI(20Hz): `{"type":"state","data":{
     "drone": {TLM_STATEの全フィールド(角度はdeg換算), "fresh": bool} | null(TLM_STATE未受信),
     "mocap": {"x","y","z","yaw_deg","confidence","fresh"} | null,
-    "session": {"mode":"posture"|"position", "phase":"idle"|"connected"|"flying"|...,
+    "session": {"mode":"posture"|"position"|"experiment", "phase":"idle"|"connected"|"flying"|...,
       "serial_connected":bool, "airframe":name, "logging":bool, "log_file":str|null,
       "target":{"x","y","z"}|null, "setpoint":{"roll_deg","pitch_deg","alt_m"},
       "latency_ms":float|null, "relay_stats":{...}|null,
-      "relay_fresh":bool(RLY_STATS受信時刻ベースの鮮度), "relay_target_ok":bool}}}`
+      "relay_fresh":bool(RLY_STATS受信時刻ベースの鮮度), "relay_target_ok":bool,
+      "experiment": {"active":bool, "motor":{...}, "sweep":{...}, "sequence":{...},
+        "cal3d":{...}, "exp_age_s":float|null,
+        "exp": {TLM_EXP由来: "current_a","vbat_v","cv","b_raw","b_cal","imu_temp_c",
+          "ax","ay","az"[g](フィルタ後・較正前。非有限はnull。6面キャリブのライブ表示),
+          "roll_deg","pitch_deg","yaw_deg","duty_cmd","motors_mask",
+          "mag_fresh","motors_running"} | null(TLM_EXP未受信)}
+        | null(Experimentモード以外)}}}`
 - サーバ→UI(即時): `{"type":"event", ...}`(TLM_EVENT)、`{"type":"log","origin","line"}`
 - UI→サーバ:
   - `{"type":"command","action":"connect","port":...}` / `"disconnect"`

@@ -137,6 +137,7 @@ const els = {
   cal3dProgressFill: $("cal3dProgressFill"), cal3dStatusText: $("cal3dStatusText"),
   cal3dSamples: $("cal3dSamples"), cal3dFit: $("cal3dFit"), cal3dSaved: $("cal3dSaved"),
   accel6Captured: $("accel6Captured"), accel6Msg: $("accel6Msg"),
+  accel6Accel: $("accel6Accel"), accel6Norm: $("accel6Norm"),
   quickcalMsg: $("quickcalMsg"),
   geomagSelect: $("geomagSelect"), btnGeomagApply: $("btnGeomagApply"),
   geomagInfo: $("geomagInfo"), geomagMsg: $("geomagMsg"),
@@ -1102,17 +1103,33 @@ function renderExperiment() {
   const sample = exp && exp.exp;
   const age = exp ? exp.exp_age_s : null;
   if (sample && typeof age === "number" && age <= UI.EXP_FRESH_S) {
+    // 非有限値はサーバ側で null 化される(WS の JSON 保護)ため、
+    // 各フィールドは null を "--" 表示に落とす(0.00 と誤認させない)
     const braw = Array.isArray(sample.b_raw)
-      ? sample.b_raw.map((v) => v.toFixed(1)).join("/") : "--";
-    const cur = sample.cv ? `${Number(sample.current_a).toFixed(2)}A` : "--A";
-    const vbat = sample.cv ? `${Number(sample.vbat_v).toFixed(2)}V` : "--V";
+      ? sample.b_raw.map((v) => fmtNum(v, 1)).join("/") : "--";
+    const cur = sample.cv ? `${fmtNum(sample.current_a, 2)}A` : "--A";
+    const vbat = sample.cv ? `${fmtNum(sample.vbat_v, 2)}V` : "--V";
     els.expLive.textContent =
       `TLM_EXP: I=${cur} V=${vbat} Braw=[${braw}]µT ` +
-      `T=${Number(sample.imu_temp_c).toFixed(1)}°C ` +
-      `duty=${Number(sample.duty_cmd).toFixed(2)}` +
+      `T=${fmtNum(sample.imu_temp_c, 1)}°C ` +
+      `duty=${fmtNum(sample.duty_cmd, 2)}` +
       `${sample.motors_running ? " 回転中" : ""}`;
   } else {
     els.expLive.textContent = "TLM_EXP: なし(実験モード有効時に 25Hz 受信)";
+  }
+
+  // 加速度6面キャリブのライブ加速度(expLive と同じ TLM_EXP 鮮度ゲート)
+  const accFresh = sample && typeof age === "number" && age <= UI.EXP_FRESH_S;
+  const accOk = accFresh && [sample.ax, sample.ay, sample.az]
+    .every((v) => typeof v === "number" && Number.isFinite(v));
+  if (accOk) {
+    els.accel6Accel.textContent =
+      `${sample.ax.toFixed(3)} / ${sample.ay.toFixed(3)} / ${sample.az.toFixed(3)}`;
+    els.accel6Norm.textContent =
+      Math.hypot(sample.ax, sample.ay, sample.az).toFixed(3);
+  } else {
+    els.accel6Accel.textContent = "--";
+    els.accel6Norm.textContent = "--";
   }
 
   // スイープ

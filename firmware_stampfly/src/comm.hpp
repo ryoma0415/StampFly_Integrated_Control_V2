@@ -42,6 +42,11 @@ struct CommandSnapshot {
     stampfly::CmdSetpoint setpoint{};       // 最新の setpoint(pending時のみ有効)
     uint32_t setpoint_seq = 0;              // その論理フレーム seq
     uint32_t setpoint_rx_ms = 0;            // 受信時刻 millis()
+    // --- CMD_POS_ERR(機上XY制御モード。setpoint と同じ「最新値上書き」規律) ---
+    bool pos_err_pending = false;           // 新しい CMD_POS_ERR が届いたか
+    stampfly::CmdPosErr pos_err{};          // 最新の pos_err(pending時のみ有効)
+    uint32_t pos_err_seq = 0;               // その論理フレーム seq
+    uint32_t pos_err_rx_ms = 0;             // 受信時刻 millis()
     V2Command v2[V2_COMMAND_QUEUE_CAPACITY]{};  // v2 コマンド(受信順)
     size_t v2_count = 0;                    // 取り出した v2 コマンド件数
 };

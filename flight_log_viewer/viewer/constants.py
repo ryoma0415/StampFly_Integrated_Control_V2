@@ -57,13 +57,21 @@ V2_EXTRA_COLUMNS: tuple[str, ...] = (
     "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
 )
 
-V2_COLUMNS: tuple[str, ...] = BASE_COLUMNS + V2_EXTRA_COLUMNS
+# v3 で末尾に追加された 6 列(機上XY制御 CMD_POS_ERR 診断)
+V3_EXTRA_COLUMNS: tuple[str, ...] = (
+    "xy_cmd_mode",
+    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid", "cmd_mocap_yaw_deg",
+    "mocap_heading_deg",
+)
+
+V2_COLUMNS: tuple[str, ...] = BASE_COLUMNS + V2_EXTRA_COLUMNS + V3_EXTRA_COLUMNS
 N_COLUMNS = len(V2_COLUMNS)
-assert N_COLUMNS == 94, f"列数が契約(94列)と不一致: {N_COLUMNS}"
+assert N_COLUMNS == 100, f"列数が契約(100列)と不一致: {N_COLUMNS}"
 
 # 数値変換しない(文字列のままにする)列
 TEXT_COLUMNS: frozenset[str] = frozenset(
-    {"timestamp", "mode", "phase", "tlm_state_name", "tlm_reason_name", "data_source"}
+    {"timestamp", "mode", "phase", "tlm_state_name", "tlm_reason_name",
+     "data_source", "xy_cmd_mode"}
 )
 
 # ログの行レート [Hz](CMD_SETPOINT 送信ごとに1行)

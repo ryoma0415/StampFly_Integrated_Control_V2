@@ -1,4 +1,4 @@
-# StampFly Integrated Control — フライトログ形式(v2・94列)
+# StampFly Integrated Control — フライトログ形式(v3・100列)
 
 本書は `pc_server/core/logger.py` が生成する CSV の列構成を定義する。
 列定義の実体は `logger.py` の `COLUMNS` であり、本書と1対1で対応させること。
@@ -9,8 +9,13 @@ v2 では v1(77列)の**末尾に 17 列を追加**した(既存 77 列の名前
 ヨー指令 3 列(`cmd_yaw_ref_rad` / `cmd_yaw_ref_deg` / `yaw_ctrl_on`)、
 TLM_STATE 末尾拡張のスナップショット 11 列(`tlm_yaw_est_rad` 〜 `tlm_ff_status`)、
 MoCap ヨーと軌道状態 3 列(`mocap_yaw_deg` / `traj_mode` / `traj_phase_rad`)。
-詳細は「v2 追加列」節を参照。flight_log_viewer(`viewer/constants.py` の
-`V2_COLUMNS`)はこの 94 列契約を正として読み込む。
+詳細は「v2 追加列」節を参照。
+
+v3 では v2(94列)の**末尾に 6 列を追加**した(既存 94 列の名前・順序は不変):
+機上XY制御(CMD_POS_ERR)診断 6 列(`xy_cmd_mode` / `cmd_err_x_m` /
+`cmd_err_y_m` / `cmd_xy_valid` / `cmd_mocap_yaw_deg` / `mocap_heading_deg`)。
+詳細は「v3 追加列」節を参照。flight_log_viewer(`viewer/constants.py` の
+`V2_COLUMNS`)はこの 100 列契約を正として読み込む。
 
 ## 出力先・行レート
 
@@ -22,8 +27,8 @@ MoCap ヨーと軌道状態 3 列(`mocap_yaw_deg` / `traj_mode` / `traj_phase_ra
 
 ## 書式と書き込み挙動(`logger.py` 実装)
 
-- 列数は 94(1行目がヘッダ)。順序は `COLUMNS` の宣言順(v1 の 77 列 →
-  v2 追加 17 列の順。本書の「v2 追加列」節はファイル上の末尾 17 列に対応)。
+- 列数は 100(1行目がヘッダ)。順序は `COLUMNS` の宣言順(v1 の 77 列 →
+  v2 追加 17 列 → v3 追加 6 列の順)。
 - float は小数 6 桁の固定表記(`FLOAT_DECIMALS = 6`)。bool は `"1"`/`"0"`、
   `None`(未取得)は空文字で出力される。
 - `timestamp` / `elapsed_time` は `log_row()` が自動付与する(呼び出し側が
@@ -170,6 +175,21 @@ PROTOCOL.md の TLM_STATE(97B)全フィールドに `tlm_` 接頭辞を付けて
 | `mocap_yaw_deg` | float | deg | MoCap リジッドボディのヨー真値(mocap.py の yaw_rad を deg 換算。制御には未使用・比較用)。 |
 | `traj_mode` | int | - | 軌道モード: hover=0 / circle=1。 |
 | `traj_phase_rad` | float | rad | 円軌道の現在位相(±π)。**hover 時は空欄**。MoCap 途絶中は位相凍結のため直近値のまま。 |
+
+## v3 追加列(ファイル上の末尾 6 列。機上XY制御 CMD_POS_ERR 診断)
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `xy_cmd_mode` | str | - | XY 指令モードの判別: `pc`(CMD_SETPOINT: PC 側 PID)/ `onboard`(CMD_POS_ERR: 機上XY PID)。 |
+| `cmd_err_x_m`, `cmd_err_y_m` | float | m | 送信した XY 位置誤差(制御座標系、クランプ後)。onboard モードのみ。bit2=0(無効)中も実誤差を送る。 |
+| `cmd_xy_valid` | 0/1 | - | flags bit2(FLAG_XY_ERR_VALID)を立てて送信したか(閉ループ有効+データ有効+MoCap 非途絶)。onboard モードのみ。 |
+| `cmd_mocap_yaw_deg` | float | deg | 送信した MoCap 実測ヨー(mocap_yaw、制御座標系)。heading 未取得時は空欄。onboard モードのみ。 |
+| `mocap_heading_deg` | float | deg | MoCap 実測の制御座標系ヨー(リジッドボディ前方軸の方位)。pc / onboard 両モードで記録され、機体推定ヨー(`tlm_yaw_est_rad`)とのフレーム整合検証に使う。 |
+
+onboard モードでは PC は roll/pitch 角度指令を計算しないため、
+`roll_ref_rad` / `pitch_ref_rad` 等の指令列は 0(バイアスも非加算)になる。
+機体側で計算された実際の姿勢指令は `tlm_roll_ref_rad` / `tlm_pitch_ref_rad`
+(TLM_STATE スナップショット)に現れる。
 
 ## 旧形式からの主な変更点
 

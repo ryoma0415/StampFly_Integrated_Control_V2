@@ -1,4 +1,4 @@
-"""v2 ログ列契約: 94 列(77 + 末尾 17 列、順序は LOG_STRUCTURE v2)。"""
+"""ログ列契約: 100 列(77 + v2 末尾 17 列 + v3 末尾 6 列、順序は LOG_STRUCTURE)。"""
 
 from __future__ import annotations
 
@@ -13,13 +13,23 @@ V2_TAIL_COLUMNS = (
     "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
 )
 
+V3_TAIL_COLUMNS = (
+    "xy_cmd_mode",
+    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid", "cmd_mocap_yaw_deg",
+    "mocap_heading_deg",
+)
 
-def test_column_count_is_94():
-    assert len(COLUMNS) == 94
+
+def test_column_count_is_100():
+    assert len(COLUMNS) == 100
 
 
-def test_v2_columns_appended_in_contract_order():
-    assert COLUMNS[-17:] == V2_TAIL_COLUMNS
+def test_v3_columns_appended_in_contract_order():
+    assert COLUMNS[-6:] == V3_TAIL_COLUMNS
+
+
+def test_v2_columns_precede_v3_in_contract_order():
+    assert COLUMNS[-23:-6] == V2_TAIL_COLUMNS
 
 
 def test_v1_prefix_unchanged():

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
 import stampfly_protocol as proto
@@ -9,7 +12,8 @@ import stampfly_protocol as proto
 from core.session import MODE_MULTI, MODE_POSTURE
 
 from conftest import halt_supervisor
-from fakes import make_ack_responder, make_pose, wait_until
+from fakes import (FakeDroneResponder, make_ack_responder, make_pose,
+                   wait_until)
 
 # 複数機テスト用プロファイル(全機 ch1、rigid_body_id 設定済み)
 MULTI_AIRFRAMES = [
@@ -32,12 +36,19 @@ MULTI_AIRFRAMES = [
 
 
 class FakeMultiRelay:
-    """複数機対応リレーのフェイク(RLY_SET_PEERS/MUX_UP を処理)。"""
+    """複数機対応リレーのフェイク(RLY_SET_PEERS/MUX_UP を処理)。
+
+    MUX_UP の内側コマンドはノード別の FakeDroneResponder(0x14–0x23 に
+    TLM_ACK、CMD_CAL_GET に TLM_CAL_DATA)へ渡し、応答を MUX_DOWN で
+    包んで返す(機体別 FF 操作の往復を模擬)。
+    """
 
     def __init__(self) -> None:
         self._single = make_ack_responder()
         self.peers: list[tuple[bytes, int]] = []
         self.mux_up: list[tuple[int, proto.Frame]] = []
+        self.drones = [FakeDroneResponder()
+                       for _ in range(proto.RLY_MAX_PEERS)]
 
     def __call__(self, frame: proto.Frame):
         if frame.type == proto.MsgType.RLY_SET_TARGET:
@@ -54,6 +65,12 @@ class FakeMultiRelay:
             status, inner = proto.parse_frame(inner_bytes)
             assert status is proto.ParseStatus.OK   # 不正な内側フレームは契約違反
             self.mux_up.append((node_id, inner))
+            replies = self.drones[node_id](inner)
+            if replies:
+                return [(proto.MsgType.RLY_MUX_DOWN,
+                         proto.mux_wrap(node_id,
+                                        proto.pack_frame(t, 1, payload)))
+                        for t, payload in replies]
         return None
 
     def uplinks(self, node_id: int, msg_type: int) -> list[proto.Frame]:
@@ -393,3 +410,126 @@ class TestMultiGuards:
                          positions={"drone 2": (-0.5, -0.5, 0.6)})
         assert session.multi_start() is False
         assert relay.uplinks(0, proto.MsgType.CMD_START) == []
+
+
+class TestMultiYawAndFf:
+    """機体別ヨー角制御と機体別 FF 操作(ノード宛 ACK 経由)。"""
+
+    MAC1 = "48:CA:43:3A:51:30"
+
+    def test_per_drone_yaw_control_flags(self, multi_session):
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        assert session.multi_yaw("drone 1", enabled=True, yaw_deg=25.0) is True
+
+        def yaw_flag_seen(node):
+            return any(
+                proto.CmdSetpoint.from_payload(f.payload).flags
+                & proto.CmdSetpoint.FLAG_YAW_REF_VALID
+                for f in relay.uplinks(node, proto.MsgType.CMD_SETPOINT))
+
+        # 50Hz 送信スレッドにステップを回させる(クロックを進めて実時間待ち)
+        for _ in range(20):
+            clock.advance(0.05)
+            time.sleep(0.03)
+            if yaw_flag_seen(0):
+                break
+        assert yaw_flag_seen(0)
+        # drone 2(ヨー制御 OFF)には bit1 が立たない
+        assert not yaw_flag_seen(1)
+
+        # スナップショットにも反映される。yaw_ref_deg は SetpointShaper
+        # 整形後の「適用中」値(単機の setpoint 表示と同じ意味論)なので、
+        # 目標 25° へ向けてスルーレート制限(45°/s)されながら増えていく。
+        # yaw_target_deg は UI 入力の生目標値
+        snap = session.get_state_snapshot()["data"]["session"]["multi"]
+        by_name = {d["name"]: d for d in snap["drones"]}
+        assert by_name["drone 1"]["yaw_ctrl_on"] is True
+        assert 0.0 < by_name["drone 1"]["yaw_ref_deg"] <= 25.0 + 1e-6
+        assert by_name["drone 1"]["yaw_target_deg"] == pytest.approx(25.0)
+        assert by_name["drone 2"]["yaw_ctrl_on"] is False
+
+        # OFF に戻すと以後のセットポイントは bit1 なし
+        assert session.multi_yaw("drone 1", enabled=False) is True
+
+    def test_multi_yaw_rejects_bad_inputs(self, multi_session):
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        assert session.multi_yaw("drone 9", enabled=True) is False
+        assert session.multi_yaw("drone 1", yaw_deg=270.0) is False
+        # ±max_yaw_ctrl_deg(既定30°)超は拒否(XYループが制御座標系固定のため)
+        assert session.multi_yaw("drone 1", yaw_deg=45.0) is False
+        assert session.multi_yaw("drone 1", yaw_deg=-30.0) is True
+
+    def test_multi_yaw_rejected_during_mocap_dropout(self, multi_session):
+        """飛行中に MoCap 途絶した機体へのヨー変更は拒否(盲目回頭の防止)。"""
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        session.multi_target("drone 1", 0.5, 0.5, 0.4)
+        session.multi_target("drone 2", -0.5, -0.5, 0.4)
+        feed_fresh_mocap(session, clock)
+        assert session.multi_start() is True
+        clock.advance(1.0)   # 全機の MoCap を途絶させる(>300ms)
+        assert session.multi_yaw("drone 1", enabled=True, yaw_deg=10.0) is False
+        # 復帰すれば受理される
+        feed_fresh_mocap(session, clock)
+        assert session.multi_yaw("drone 1", enabled=True, yaw_deg=10.0) is True
+
+    def test_multi_ff_mode_targets_node(self, multi_session):
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        result = session.multi_ff_mode("drone 1", 2, 1)
+        assert result["ok"] is True, result.get("message")
+        # CMD_FF_MODE は node 0 のみに届き、機体状態に反映される
+        assert len(relay.uplinks(0, proto.MsgType.CMD_FF_MODE)) == 1
+        assert relay.uplinks(1, proto.MsgType.CMD_FF_MODE) == []
+        assert relay.drones[0].cal_data.ff_mode == 2
+        assert relay.drones[0].cal_data.est_mode == 1
+
+    def test_multi_ff_rejected_while_not_idle(self, multi_session):
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        session.multi_target("drone 1", 0.5, 0.5, 0.4)
+        session.multi_target("drone 2", -0.5, -0.5, 0.4)
+        feed_fresh_mocap(session, clock)
+        assert session.multi_start() is True
+        result = session.multi_ff_mode("drone 1", 2, 1)
+        assert result["ok"] is False
+        assert relay.uplinks(0, proto.MsgType.CMD_FF_MODE) == []
+
+    def test_fetch_cal_data_by_node(self, multi_session):
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        relay.drones[1].cal_data.ff_mode = 2
+        cal = session.calibration.fetch_cal_data(node_id=1)
+        assert cal is not None
+        assert cal.ff_mode == 2
+        assert len(relay.uplinks(1, proto.MsgType.CMD_CAL_GET)) == 1
+
+    def test_ffprofile_applied_by_mac_state(self, multi_session, tmp_path):
+        """applied_by_mac の読み書き(mode の MAC 別既定値と永続化)。"""
+        from core.ffprofile import FfProfileManager
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        state_path = tmp_path / "ff_state.json"
+        mgr = FfProfileManager(
+            session.serial, session.experiment, session.calibration,
+            notify=lambda m: None, profile_dir=tmp_path,
+            state_path=state_path)
+        mgr._save_state({"applied_by_mac": {self.MAC1: {
+            "name": "prof-a", "ff": 1, "est": 0, "verified": True}}})
+
+        # ff/est 未指定 → MAC 別の保存値が既定になる
+        result = mgr.mode(None, None, node_id=0, mac=self.MAC1)
+        assert result["ok"] is True, result.get("message")
+        assert result["ff"] == 1 and result["est"] == 0
+        assert result["applied_by_mac"][self.MAC1]["name"] == "prof-a"
+
+        # 明示指定で更新され、MAC 別に永続化される
+        result = mgr.mode(2, 1, node_id=0, mac=self.MAC1)
+        assert result["ok"] is True
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["applied_by_mac"][self.MAC1]["ff"] == 2
+        assert state["applied_by_mac"][self.MAC1]["est"] == 1
+        # 単機の applied は作られない
+        assert "applied" not in state

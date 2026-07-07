@@ -80,6 +80,7 @@ enum class MsgType : uint8_t {
   CMD_FF_COMMIT = 0x21,    // FF 係数 CRC照合+NVS 永続化(4B)
   CMD_FF_MODE = 0x22,      // ff_mode / est_mode 実行時切替(2B)
   CMD_FF_ANCHOR = 0x23,    // アンカー再取得要求(payload 0B)
+  CMD_POS_ERR = 0x24,      // XY位置誤差+高度+ヨー目標(21B、機上XY制御。ハートビート兼用 50Hz)
   // 下り(ドローン -> PC): 0x30–0x4F
   TLM_STATE = 0x30,        // フル状態テレメトリ(135B、25Hz)
   TLM_EVENT = 0x31,        // 状態遷移イベント(8B、即時+2Hz)
@@ -407,6 +408,51 @@ inline bool deserialize(const uint8_t* in, size_t len, CmdSetpoint* out) {
   out->alt_ref = rd_f32(in + 8);
   out->yaw_ref = rd_f32(in + 12);
   out->flags = rd_u8(in + 16);
+  return true;
+}
+
+// 0x24 CMD_POS_ERR(21B)— XY 位置誤差+高度+ヨー目標(機上XY制御モード)。
+// CMD_SETPOINT の代替ストリーム(50Hz、ハートビート兼用)。PC は roll/pitch
+// 角度指令の代わりに制御座標系の位置誤差(目標 − フィルタ済み現在位置)を送り、
+// 機体側が自身のヨー推定で誤差を機体座標系へ回転(ヨー回転補償)してから
+// XY PID を回す。alt_ref / yaw_ref / flags bit0-1 の意味は CMD_SETPOINT と同一。
+// mocap_yaw は MoCap 実測の制御座標系ヨー(フレーム整合検証・ログ用。bit3 有効時のみ)。
+struct CmdPosErr {
+  static constexpr MsgType TYPE = MsgType::CMD_POS_ERR;
+  static constexpr size_t PAYLOAD_SIZE = 4 + 4 + 4 + 4 + 4 + 1;
+  static constexpr uint8_t FLAG_ALT_REF_VALID = 0x01;    // bit0(CMD_SETPOINT と同義)
+  static constexpr uint8_t FLAG_YAW_REF_VALID = 0x02;    // bit1(同上)
+  static constexpr uint8_t FLAG_XY_ERR_VALID = 0x04;     // bit2: err_x/err_y 有効
+  static constexpr uint8_t FLAG_MOCAP_YAW_VALID = 0x08;  // bit3: mocap_yaw 有効
+
+  float err_x = 0.0f;      // m(制御座標系。target - filtered)
+  float err_y = 0.0f;      // m
+  float alt_ref = 0.0f;    // m
+  float yaw_ref = 0.0f;    // rad(±π、機体ヨー角目標)
+  float mocap_yaw = 0.0f;  // rad(±π、MoCap 実測ヨー。bit3 有効時のみ)
+  uint8_t flags = 0;
+};
+static_assert(CmdPosErr::PAYLOAD_SIZE == 21, "PROTOCOL.md: CMD_POS_ERR payload = 21B");
+
+inline bool serialize(const CmdPosErr& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < CmdPosErr::PAYLOAD_SIZE) return false;
+  wr_f32(out + 0, m.err_x);
+  wr_f32(out + 4, m.err_y);
+  wr_f32(out + 8, m.alt_ref);
+  wr_f32(out + 12, m.yaw_ref);
+  wr_f32(out + 16, m.mocap_yaw);
+  wr_u8(out + 20, m.flags);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, CmdPosErr* out) {
+  if (in == nullptr || out == nullptr || len != CmdPosErr::PAYLOAD_SIZE) return false;
+  out->err_x = rd_f32(in + 0);
+  out->err_y = rd_f32(in + 4);
+  out->alt_ref = rd_f32(in + 8);
+  out->yaw_ref = rd_f32(in + 12);
+  out->mocap_yaw = rd_f32(in + 16);
+  out->flags = rd_u8(in + 20);
   return true;
 }
 
@@ -805,7 +851,7 @@ struct TlmState {
   static constexpr uint8_t FF_STATUS_YAW_CTRL_ACTIVE = 0x20; // bit5
   static constexpr uint8_t FF_STATUS_MAG_FRESH = 0x40;       // bit6
 
-  uint32_t seq_echo = 0;      // 最後に適用した CMD_SETPOINT の seq(未受信なら0)
+  uint32_t seq_echo = 0;      // 最後に適用した CMD_SETPOINT / CMD_POS_ERR の seq(未受信なら0)
   uint32_t elapsed_ms = 0;    // 起動からの経過 [ms]
   uint8_t state = 0;          // FlightState
   uint8_t flags = 0;
@@ -1487,6 +1533,8 @@ inline int expected_payload_size(uint8_t type) {
       return 0;
     case MsgType::CMD_SETPOINT:
       return static_cast<int>(CmdSetpoint::PAYLOAD_SIZE);
+    case MsgType::CMD_POS_ERR:
+      return static_cast<int>(CmdPosErr::PAYLOAD_SIZE);
     case MsgType::CMD_MODE:
       return static_cast<int>(CmdMode::PAYLOAD_SIZE);
     case MsgType::CMD_MOTOR_RUN:

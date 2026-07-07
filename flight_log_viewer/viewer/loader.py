@@ -1,4 +1,4 @@
-"""V2 フライトログ CSV(50Hz・94列)の読み込みと派生量の計算。
+"""V2/V3 フライトログ CSV(50Hz・100列)の読み込みと派生量の計算。
 
 - 破損した末尾(電源断などで途切れた行)は旧 Drone_Log_Viewer と同様に
   切り捨てて読む。
@@ -213,12 +213,12 @@ def load_log(csv_path: str | Path) -> FlightLog:
     if "elapsed_time" not in df.columns:
         raise ValueError(f"必須列 elapsed_time がありません: {csv_path}")
 
-    # 列の検証(過不足は警告のみ。94列契約は docs/LOG_STRUCTURE.md v2 を参照)
+    # 列の検証(過不足は警告のみ。100列契約は docs/LOG_STRUCTURE.md v3 を参照)
     missing = [c for c in V2_COLUMNS if c not in df.columns]
     extra = [c for c in df.columns if c not in V2_COLUMNS]
     if missing:
         warnings.append(
-            f"契約(94列)に対して欠けている列が {len(missing)} 個あります: "
+            f"契約(100列)に対して欠けている列が {len(missing)} 個あります: "
             + ", ".join(missing[:8]) + ("…" if len(missing) > 8 else "")
         )
     if extra:

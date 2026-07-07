@@ -29,6 +29,11 @@ struct CommandMailbox {
     stampfly::CmdSetpoint setpoint{};
     uint32_t setpoint_seq = 0;
     uint32_t setpoint_rx_ms = 0;
+    // CMD_POS_ERR(機上XY制御モード。setpoint と同じ「最新値上書き」規律)
+    bool pos_err_pending = false;
+    stampfly::CmdPosErr pos_err{};
+    uint32_t pos_err_seq = 0;
+    uint32_t pos_err_rx_ms = 0;
     // v2 コマンド(0x14-0x23)のリングバッファ。満杯時は新着を落とす
     // (PC側の ACK タイムアウト+リトライで回復する)。
     V2Command v2_ring[V2_COMMAND_QUEUE_CAPACITY]{};
@@ -146,6 +151,18 @@ void on_esp_now_recv(const EspNowRecvInfo* sender_info, const uint8_t* data, int
             portEXIT_CRITICAL(&command_mux);
             break;
         }
+        case stampfly::MsgType::CMD_POS_ERR: {
+            stampfly::CmdPosErr pe;
+            if (!stampfly::deserialize(frame.payload, frame.len, &pe)) return;
+            const uint32_t now_ms = millis();
+            portENTER_CRITICAL(&command_mux);
+            mailbox.pos_err = pe;           // 最新値で上書き(50Hzストリーム)
+            mailbox.pos_err_seq = frame.seq;
+            mailbox.pos_err_rx_ms = now_ms;
+            mailbox.pos_err_pending = true;
+            portEXIT_CRITICAL(&command_mux);
+            break;
+        }
         default:
             // v2 コマンド(0x14-0x23)はリングへ積む(期待長は検証済み)。
             // 満杯なら新着を落とす(PC側リトライで回復)。
@@ -197,6 +214,10 @@ bool comm_consume_commands(CommandSnapshot* out) {
     out->setpoint = mailbox.setpoint;
     out->setpoint_seq = mailbox.setpoint_seq;
     out->setpoint_rx_ms = mailbox.setpoint_rx_ms;
+    out->pos_err_pending = mailbox.pos_err_pending;
+    out->pos_err = mailbox.pos_err;
+    out->pos_err_seq = mailbox.pos_err_seq;
+    out->pos_err_rx_ms = mailbox.pos_err_rx_ms;
     // v2 コマンドリングを受信順に全件取り出す
     out->v2_count = mailbox.v2_count;
     for (size_t i = 0; i < mailbox.v2_count; i++) {
@@ -208,9 +229,10 @@ bool comm_consume_commands(CommandSnapshot* out) {
     mailbox.start_pending = false;
     mailbox.reset_pending = false;
     mailbox.setpoint_pending = false;
+    mailbox.pos_err_pending = false;
     portEXIT_CRITICAL(&command_mux);
     return out->stop_pending || out->start_pending || out->reset_pending ||
-           out->setpoint_pending || out->v2_count > 0;
+           out->setpoint_pending || out->pos_err_pending || out->v2_count > 0;
 }
 
 bool comm_relay_ready(void) {

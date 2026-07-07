@@ -39,6 +39,8 @@ const UI = {
   FF_POLL_MS: 5000,             // /api/ffprofile の定期ポーリング間隔
   EXP_FRESH_S: 0.5,             // TLM_EXP 表示の鮮度しきい値(UI表示用)
   RB_POLL_MS: 500,              // リジッドボディ確認(/api/mocap/bodies)のポーリング間隔
+  MULTI_YAW_LIMIT_DEG: 30,      // 複数機のヨー目標上限(server.json multi.max_yaw_ctrl_deg と同値。
+                                //  XY 位置ループが制御座標系固定のため大ヨー保持は位置保持を劣化させる)
 };
 
 /* 円軌道パラメータの既定制限(/api/config 取得失敗時のフォールバック。
@@ -1022,9 +1024,11 @@ function drawPlot() {
 /* サーバ側 session.multi(20Hz WS)が正。node_id 順の色は CSS 変数
    --multi-c0..c3(fallback は下記配列)で機体タグ・プロット共通。 */
 const MULTI_COLOR_FALLBACK = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444"];
-const multiTrails = new Map();   // name -> [{x,y}]
-let multiTargetNames = [];       // 目標入力行を構築済みの機体名リスト
-let rbPollTimer = null;          // リジッドボディ確認のポーリングタイマ
+const multiTrails = new Map();     // name -> [{x,y}]
+let multiTargetNames = [];         // 目標入力行を構築済みの機体名リスト
+let rbPollTimer = null;            // リジッドボディ確認のポーリングタイマ
+const multiYawWidgets = new Map(); // name -> {cb, input}(エコー同期用)
+const multiYawSentAt = new Map();  // name -> ユーザー操作の送信時刻(エコー抑制)
 
 const multiCtx = els.multiCanvas.getContext("2d");
 (function setupMultiCanvasDpr() {
@@ -1091,6 +1095,7 @@ function buildMultiTargetRows(drones) {
   const names = drones.map((d) => d.name);
   if (names.join("|") === multiTargetNames.join("|")) return;
   multiTargetNames = names;
+  multiYawWidgets.clear();
   // 選択から外れた機体の軌跡を掃除する
   for (const key of [...multiTrails.keys()]) {
     if (!names.includes(key)) multiTrails.delete(key);
@@ -1144,7 +1149,95 @@ function buildMultiTargetRows(drones) {
     });
     row.appendChild(btn);
     box.appendChild(row);
+
+    // 機体別サブ行: ヨー角制御 ON/OFF+目標、FF プロファイル適用
+    const sub = document.createElement("div");
+    sub.className = "multi-target-row multi-sub-row";
+
+    const yawLabel = document.createElement("label");
+    yawLabel.className = "switch-label";
+    const yawCb = document.createElement("input");
+    yawCb.type = "checkbox";
+    yawCb.checked = !!d.yaw_ctrl_on;   // サーバ状態からシード(再読込対策)
+    yawLabel.append(yawCb, document.createTextNode("ヨー制御"));
+    const yawInputLabel = document.createElement("label");
+    yawInputLabel.textContent = "ヨー°";
+    const yawInput = document.createElement("input");
+    yawInput.type = "number";
+    yawInput.step = "1";
+    yawInput.min = String(-UI.MULTI_YAW_LIMIT_DEG);
+    yawInput.max = String(UI.MULTI_YAW_LIMIT_DEG);
+    yawInput.value = typeof d.yaw_target_deg === "number"
+      ? String(Math.round(d.yaw_target_deg)) : "0";
+    yawInputLabel.appendChild(yawInput);
+    const sendYaw = () => {
+      const deg = clamp(parseFloat(yawInput.value) || 0,
+                        -UI.MULTI_YAW_LIMIT_DEG, UI.MULTI_YAW_LIMIT_DEG);
+      yawInput.value = String(deg);   // 実際に送る値を表示に反映
+      multiYawSentAt.set(d.name, now());
+      sendCommand("multi_yaw",
+                  { name: d.name, enabled: yawCb.checked, yaw_deg: deg });
+      appendConsole("ui", `ヨー設定(${d.name}): `
+        + `${yawCb.checked ? "ON" : "OFF"} 目標 ${deg.toFixed(0)}°`);
+    };
+    yawCb.addEventListener("change", sendYaw);
+    yawInput.addEventListener("change", () => {
+      if (yawCb.checked) sendYaw();   // OFF 中は目標だけ書き換えても送らない
+    });
+    multiYawWidgets.set(d.name, { cb: yawCb, input: yawInput });
+    sub.append(yawLabel, yawInputLabel);
+
+    const ffSel = document.createElement("select");
+    ffSel.className = "multi-ff-select";
+    ffSel.dataset.drone = d.name;
+    const ffBtn = document.createElement("button");
+    ffBtn.type = "button";
+    ffBtn.className = "btn btn-small";
+    ffBtn.textContent = "FF適用";
+    ffBtn.addEventListener("click", () => withBusy(ffBtn, () =>
+      doFfApply(ffSel.value, undefined, undefined, d.name)));
+    const ffStatusEl = document.createElement("span");
+    ffStatusEl.className = "multi-ff-status mono";
+    ffStatusEl.dataset.mac = d.mac;
+    ffStatusEl.textContent = "FF: --";
+    sub.append(ffSel, ffBtn, ffStatusEl);
+    box.appendChild(sub);
   });
+  updateMultiFfSelects();
+}
+
+/* 機体別 FF セレクタの選択肢を /api/ffprofile の一覧に追従させる。
+   一覧が不変なら再構築しない(5秒ポーリングごとに開いているドロップ
+   ダウンを壊さないため。新規行は optsSig 未設定なので必ず初回構築される) */
+function updateMultiFfSelects() {
+  const profiles = (ffStatus && ffStatus.profiles) || [];
+  const opts = profiles.map((p) => ({
+    value: p.name,
+    label: p.error ? `${p.name}(読込不可)` : p.name,
+    title: p.memo || "",
+  }));
+  const sig = JSON.stringify(opts);
+  for (const sel of els.multiTargets.querySelectorAll(".multi-ff-select")) {
+    if (sel.dataset.optsSig === sig) continue;
+    sel.dataset.optsSig = sig;
+    rebuildSelect(sel, opts);
+  }
+}
+
+/* 機体別 FF 適用状態のテキスト(PC側記録 applied_by_mac + 機体側 TLM) */
+function multiFfStatusText(d) {
+  const byMac = (ffStatus && ffStatus.applied_by_mac) || {};
+  const ap = byMac[d.mac];
+  const t = d.tlm;
+  const fw = t
+    ? ` 機体:ff=${ffModeLabel(t.ff_mode)}/${t.est_mode_ekf ? "EKF" : "CF"}`
+      + (t.ffcal_loaded ? "" : "(FF係数なし)")
+      + (t.yaw_ctrl_active ? " ヨー制御中" : "")
+    : "";
+  return ap
+    ? `FF: ${ap.name}(ff=${ffModeLabel(ap.ff)}, `
+      + `est=${ap.est === 1 ? "EKF" : "CF"})${fw}`
+    : `FF: 未適用${fw}`;
 }
 
 /* 機体別ステータスチップ+一斉スタート活性 */
@@ -1170,8 +1263,10 @@ function renderMulti() {
       : "RB✗";
     const lat = typeof d.latency_ms === "number"
       ? ` ${d.latency_ms.toFixed(0)}ms` : "";
+    const yawTxt = d.yaw_ctrl_on
+      ? `  ヨー${fmtNum(d.yaw_ref_deg, 0)}°` : "";
     chip.textContent =
-      `[${d.node_id}] ${d.name}  ${phaseJp}/${stateName}  ${volt}  ${link}  ${mocapTxt}${lat}`;
+      `[${d.node_id}] ${d.name}  ${phaseJp}/${stateName}  ${volt}  ${link}  ${mocapTxt}${lat}${yawTxt}`;
     chip.classList.toggle("chip-warn", !(t && t.fresh) || !(m && m.fresh));
     chip.classList.toggle("chip-flying", d.phase === "flying");
     box.appendChild(chip);
@@ -1184,6 +1279,27 @@ function renderMulti() {
       if (tr.length > UI.TRAIL_MAX_POINTS) tr.shift();
     }
   });
+
+  // 機体別 FF 適用状態(PC側記録+機体側 TLM)を持続行へ反映
+  for (const el of els.multiTargets.querySelectorAll(".multi-ff-status")) {
+    const d = drones.find((x) => x.mac === el.dataset.mac);
+    if (d) el.textContent = multiFfStatusText(d);
+  }
+
+  // ヨー制御ウィジェットのサーバエコー同期(ユーザー操作直後は抑制。
+  // 入力欄はフォーカス中を避けて生目標値 yaw_target_deg を反映)
+  for (const d of drones) {
+    const w = multiYawWidgets.get(d.name);
+    if (!w) continue;
+    if (now() - (multiYawSentAt.get(d.name) ?? -Infinity)
+        <= UI.ECHO_SUPPRESS_MS) continue;
+    w.cb.checked = !!d.yaw_ctrl_on;
+    if (document.activeElement !== w.input
+        && typeof d.yaw_target_deg === "number") {
+      const v = String(Math.round(d.yaw_target_deg));
+      if (w.input.value !== v) w.input.value = v;
+    }
+  }
 
   // 一斉スタート: 選択済み+全機 idle+WS 接続時のみ
   const anyActive = drones.some((d) => d.phase !== "idle");
@@ -1613,6 +1729,7 @@ async function fetchFfStatus() {
   if (body) {
     ffStatus = body;
     renderFfStatus();
+    updateMultiFfSelects();   // 複数機タブの機体別 FF セレクタも追従
   }
 }
 
@@ -1621,6 +1738,7 @@ function setFfStatus(resp) {
   if (resp && Array.isArray(resp.profiles)) {
     ffStatus = resp;
     renderFfStatus();
+    updateMultiFfSelects();
   }
 }
 
@@ -1742,7 +1860,7 @@ function refreshExperimentPanels() {
 }
 
 /* ---- FF 適用(共通: mag3d 不一致時は confirm で force 再適用) ---- */
-async function doFfApply(name, ff, est) {
+async function doFfApply(name, ff, est, drone) {
   if (!name) {
     appendConsole("ui", "FFプロファイルが選択されていません");
     return;
@@ -1750,6 +1868,7 @@ async function doFfApply(name, ff, est) {
   const body = { action: "apply", name };
   if (ff !== undefined) body.ff = ff;
   if (est !== undefined) body.est = est;
+  if (drone) body.drone = drone;   // 複数機モード: 機体別適用(ノード宛)
   let resp = await apiPost("/api/ffprofile", body);
   if (resp && !resp.ok && resp.mag3d_mismatch && Array.isArray(resp.diffs)) {
     const detail = resp.diffs.slice(0, 4).join("\n");
@@ -1758,9 +1877,10 @@ async function doFfApply(name, ff, est) {
     }
   }
   if (resp) {
+    const target = drone ? `(${drone})` : "";
     appendConsole("ui", resp.ok
-      ? `FFプロファイルを適用しました: ${name}`
-      : `FF適用失敗: ${resp.message || "不明なエラー"}`);
+      ? `FFプロファイルを適用しました: ${name}${target}`
+      : `FF適用失敗${target}: ${resp.message || "不明なエラー"}`);
     setFfStatus(resp);
   }
 }

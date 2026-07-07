@@ -53,6 +53,154 @@ bool wait_ready = false;           // WAITでの静定+AHRSリセット完了
 bool yaw_latch_active = false;     // ラッチ保持中か
 float yaw_latched_ref = 0.0f;      // ラッチしたヨー角目標 [rad]
 
+// ---------------------------------------------------------------------------
+// v2.1: 機上XY位置制御(CMD_POS_ERR)
+//
+// PC 側 core/pid.py(飛行実績あり)と同一アルゴリズムの1軸PID:
+// D項LPF / I項条件付き更新 / 異常時減衰 / 動的アンチワインドアップ。
+// 更新は CMD_POS_ERR の新サンプル到着時のみ(≈50Hz、dt は受信間隔)。
+// PC 側との違いは、誤差を機体ヨー推定で機体座標系へ回転(ヨー回転補償)
+// してから PID に入れる点のみ(update_pos_control 参照)。
+// ---------------------------------------------------------------------------
+
+// 注: PC 側 pid.py との既知の(意図的な)相違点 — PC は途絶中 calculate を
+// 呼ばず I 項が凍結、異常解除に confidence>0.5 のヒステリシスがあるのに対し、
+// 本実装は bit2(データ有効)のみで判定し、無効中は I 項を微減衰させる。
+// いずれも安全側(I 項が育たない方向)の簡略化。
+struct PosAxisPid {
+    float integral = 0.0f;
+    float prev_error = 0.0f;
+    bool has_prev = false;
+    bool prev_valid = true;
+    float filtered_derivative = 0.0f;
+    float last_output = 0.0f;
+    bool i_update_suspended = false;
+    bool anomaly_detected = false;
+    uint8_t anomaly_recovery_count = 0;
+
+    void reset(void) {
+        integral = 0.0f;
+        prev_error = 0.0f;
+        has_prev = false;
+        prev_valid = true;
+        filtered_derivative = 0.0f;
+        last_output = 0.0f;
+        i_update_suspended = false;
+        anomaly_detected = false;
+        anomaly_recovery_count = 0;
+    }
+
+    // D 項の履歴を再シードする(受信ギャップ明けの復帰1サンプル目に、
+    // ギャップをまたいだ誤差差分で D 項が暴れるのを防ぐ。I 項は保持)。
+    void reseed_derivative(void) {
+        has_prev = false;
+        filtered_derivative = 0.0f;
+    }
+
+    // 異常中は I 項更新を停止、回復後は pos_anomaly_recovery_ticks 回の減衰期間
+    void set_anomaly(bool is_anomaly) {
+        if (is_anomaly && !anomaly_detected) {
+            anomaly_detected = true;
+            i_update_suspended = true;
+            anomaly_recovery_count = 0;
+        } else if (!is_anomaly && anomaly_detected) {
+            anomaly_detected = false;
+            anomaly_recovery_count = FLIGHT_CONFIG.pos_anomaly_recovery_ticks;
+        }
+    }
+
+    float update(float error, float dt, bool data_valid) {
+        const FlightConfig& cfg = FLIGHT_CONFIG;
+        if (!has_prev) {
+            has_prev = true;
+            prev_error = error;
+            dt = cfg.pos_initial_dt_s;
+        }
+        if (dt < cfg.pos_min_dt_s) return last_output;
+        // 無効区間明けの復帰1サンプル目も D を再シード(防御。PC 側は
+        // 実誤差を送り続ける規約だが、誤差ストリームの不連続に頑健にする)
+        if (data_valid && !prev_valid) {
+            prev_error = error;
+            filtered_derivative = 0.0f;
+        }
+        prev_valid = data_valid;
+
+        const float p_term = cfg.pos_kp * error;
+
+        if (anomaly_recovery_count > 0) {
+            integral *= cfg.pos_i_decay_rate;
+            anomaly_recovery_count--;
+            if (anomaly_recovery_count == 0) i_update_suspended = false;
+        }
+        const bool should_update_i = !i_update_suspended && data_valid &&
+                                     fabsf(error) < cfg.pos_i_update_threshold_m;
+        if (should_update_i) {
+            integral += error * dt;
+            if (cfg.pos_ki != 0.0f) {
+                // 動的アンチワインドアップ(誤差が大きいほど上限を絞る)
+                const float error_factor =
+                    expf(-fabsf(error) * cfg.pos_integral_error_factor_gain);
+                const float max_integral =
+                    fabsf(cfg.pos_output_limit_rad / cfg.pos_ki) * error_factor;
+                if (integral > max_integral) integral = max_integral;
+                if (integral < -max_integral) integral = -max_integral;
+            }
+        } else if (!data_valid) {
+            integral *= cfg.pos_invalid_i_decay;
+        }
+        const float i_term = cfg.pos_ki * integral;
+
+        // D 項の dt はバースト受信(ESP-NOW rx 時刻の密集)によるスパイクを
+        // 防ぐため下限を設ける(誤差サンプルは PC 側 50Hz クロックで生成
+        // されており、受信間隔の縮みは情報の増加ではない)
+        const float dt_d = (dt < cfg.pos_dt_floor_s) ? cfg.pos_dt_floor_s : dt;
+        const float raw_derivative = (error - prev_error) / dt_d;
+        filtered_derivative = cfg.pos_d_filter_alpha * raw_derivative +
+                              (1.0f - cfg.pos_d_filter_alpha) * filtered_derivative;
+        float derivative = filtered_derivative;
+        if (!data_valid) derivative *= cfg.pos_invalid_d_scale;
+        const float d_term = cfg.pos_kd * derivative;
+
+        float output = p_term + i_term + d_term;
+        if (output > cfg.pos_output_limit_rad) output = cfg.pos_output_limit_rad;
+        if (output < -cfg.pos_output_limit_rad) output = -cfg.pos_output_limit_rad;
+
+        prev_error = error;
+        last_output = output;
+        return output;
+    }
+};
+
+PosAxisPid pos_pid_x;   // 機体座標系 前後軸誤差 → roll 指令(既存の x誤差→roll 対応を踏襲)
+PosAxisPid pos_pid_y;   // 機体座標系 左右軸誤差 → pitch 指令(同 y誤差→pitch)
+float pos_target_roll_rad = 0.0f;   // XY PID 出力(スルー制限前の目標)
+float pos_target_pitch_rad = 0.0f;
+float pos_cmd_roll_rad = 0.0f;      // スルー制限後の適用値(400Hz で前進)
+float pos_cmd_pitch_rad = 0.0f;
+// XY回転補償ヨーの EKF→Madgwick 縮退用フレーム差ラッチ(EKF 不健全遷移の
+// 瞬間に両推定のフレーム差を保持し、回転補償ヨーに段差を作らない)
+bool pos_yaw_fallback_prev_ok = true;
+float pos_yaw_fallback_offset = 0.0f;
+
+float slew_toward(float current, float target, float max_delta) {
+    const float delta = target - current;
+    if (delta > max_delta) return current + max_delta;
+    if (delta < -max_delta) return current - max_delta;
+    return target;
+}
+
+void reset_pos_control(void) {
+    pos_pid_x.reset();
+    pos_pid_y.reset();
+    pos_target_roll_rad = 0.0f;
+    pos_target_pitch_rad = 0.0f;
+    pos_cmd_roll_rad = 0.0f;
+    pos_cmd_pitch_rad = 0.0f;
+    pos_yaw_fallback_prev_ok = true;
+    pos_yaw_fallback_offset = 0.0f;
+    flight_control_state.command.pos_err_fresh_sample = false;
+}
+
 // --- v2: モーターテストサービス内部状態(yaw側 motor.cpp のソフトスタート/
 //     フェイルセーフを移植。PWM の書き手は MOTOR_TEST 状態の本サービスのみ) ---
 float mt_target_duty = 0.0f;    // 指令 duty(ソフトスタートランプの目標)
@@ -295,19 +443,128 @@ void apply_setpoint(const CommandSnapshot& cmd) {
     cs.setpoint_received = true;
     cs.last_setpoint_ms = cmd.setpoint_rx_ms;
     cs.applied_setpoint_seq = cmd.setpoint_seq;
-    cs.target_roll_rad = cmd.setpoint.roll_ref;
-    cs.target_pitch_rad = cmd.setpoint.pitch_ref;
+    cs.xy_source = XY_SOURCE_ATTITUDE;
+    // 非有限値は入口で無害化する(NaN はクランプ比較をすり抜けて
+    // 姿勢/高度 PID を汚染するため)
+    cs.target_roll_rad = isfinite(cmd.setpoint.roll_ref) ? cmd.setpoint.roll_ref : 0.0f;
+    cs.target_pitch_rad = isfinite(cmd.setpoint.pitch_ref) ? cmd.setpoint.pitch_ref : 0.0f;
     // v2: ヨー角目標(flags bit1 有効時のみ制御に使う。無効時は V1 同一動作)
     cs.target_yaw_rad = cmd.setpoint.yaw_ref;
-    cs.target_yaw_valid = (cmd.setpoint.flags & stampfly::CmdSetpoint::FLAG_YAW_REF_VALID) != 0;
+    cs.target_yaw_valid = (cmd.setpoint.flags & stampfly::CmdSetpoint::FLAG_YAW_REF_VALID) != 0 &&
+                          isfinite(cmd.setpoint.yaw_ref);
 
     if ((cmd.setpoint.flags & stampfly::CmdSetpoint::FLAG_ALT_REF_VALID) != 0 &&
+        isfinite(cmd.setpoint.alt_ref) &&
         (st == AUTO_WAIT || st == AUTO_TAKEOFF || st == AUTO_HOVER)) {
         float alt = cmd.setpoint.alt_ref;
         if (alt < cfg.alt_ref_min_m) alt = cfg.alt_ref_min_m;
         if (alt > cfg.alt_ref_max_m) alt = cfg.alt_ref_max_m;
         out.Alt_ref = alt;
     }
+}
+
+// 受信した CMD_POS_ERR を適用する(v2.1 機上XY制御)。ハートビート
+// (last_setpoint_ms / seq_echo)は CMD_SETPOINT と共有し、既存フェイル
+// セーフ(>200ms 水平保持 / >500ms 自動着陸)がそのまま効く。
+void apply_pos_err(const CommandSnapshot& cmd) {
+    if (!cmd.pos_err_pending) return;
+    const FlightConfig& cfg = FLIGHT_CONFIG;
+    auto& cs = flight_control_state.command;
+    auto& out = flight_control_state.output;
+    const AutoFlightState st = flight_control_state.mode.auto_state;
+    const stampfly::CmdPosErr& pe = cmd.pos_err;
+
+    cs.setpoint_received = true;
+    cs.last_setpoint_ms = cmd.pos_err_rx_ms;
+    cs.applied_setpoint_seq = cmd.pos_err_seq;
+    cs.xy_source = XY_SOURCE_POS_ERR;
+
+    cs.prev_pos_err_ms = (cs.last_pos_err_ms != 0) ? cs.last_pos_err_ms
+                                                   : cmd.pos_err_rx_ms;
+    cs.last_pos_err_ms = cmd.pos_err_rx_ms;
+    cs.pos_err_x_m = pe.err_x;
+    cs.pos_err_y_m = pe.err_y;
+    cs.pos_err_xy_valid =
+        (pe.flags & stampfly::CmdPosErr::FLAG_XY_ERR_VALID) != 0;
+    cs.pos_mocap_yaw_rad = pe.mocap_yaw;
+    // 非有限値は入口で無害化する(NaN はクランプ比較をすり抜けるため)
+    cs.pos_mocap_yaw_valid =
+        (pe.flags & stampfly::CmdPosErr::FLAG_MOCAP_YAW_VALID) != 0 &&
+        isfinite(pe.mocap_yaw);
+    cs.pos_err_fresh_sample = true;
+
+    // ヨー・高度目標は CMD_SETPOINT と同じ規約
+    cs.target_yaw_rad = pe.yaw_ref;
+    cs.target_yaw_valid = (pe.flags & stampfly::CmdPosErr::FLAG_YAW_REF_VALID) != 0 &&
+                          isfinite(pe.yaw_ref);
+
+    if ((pe.flags & stampfly::CmdPosErr::FLAG_ALT_REF_VALID) != 0 &&
+        isfinite(pe.alt_ref) &&
+        (st == AUTO_WAIT || st == AUTO_TAKEOFF || st == AUTO_HOVER)) {
+        float alt = pe.alt_ref;
+        if (alt < cfg.alt_ref_min_m) alt = cfg.alt_ref_min_m;
+        if (alt > cfg.alt_ref_max_m) alt = cfg.alt_ref_max_m;
+        out.Alt_ref = alt;
+    }
+}
+
+// 機上XY位置制御の1周期: 新サンプル到着時のみ PID を1ステップ回し(≈50Hz)、
+// 出力へは PC 側 SetpointShaper と同値のスルーレート制限を 400Hz で適用する。
+// yaw_rad はヨー角制御と同じソース(EKF 健全時は EKF ψ、それ以外 Madgwick)。
+void update_pos_control(float yaw_rad) {
+    const FlightConfig& cfg = FLIGHT_CONFIG;
+    auto& cs = flight_control_state.command;
+
+    if (cs.pos_err_fresh_sample) {
+        cs.pos_err_fresh_sample = false;
+        float dt = (cs.last_pos_err_ms - cs.prev_pos_err_ms) * 1.0e-3f;
+        if (dt <= 0.0f || dt > cfg.pos_max_dt_s) {
+            // 途絶明け(または初回): dt を仮値に置き換えるだけでは
+            // ギャップをまたいだ誤差差分で D 項が暴れる(gap/dt 倍)ため、
+            // D の履歴も再シードする(pos_max_dt_s の本来の意図)
+            dt = cfg.pos_initial_dt_s;
+            pos_pid_x.reseed_derivative();
+            pos_pid_y.reseed_derivative();
+        }
+        const bool valid = cs.pos_err_xy_valid;
+
+        float ex = cs.pos_err_x_m;
+        float ey = cs.pos_err_y_m;
+        if (!isfinite(ex) || !isfinite(ey)) { ex = 0.0f; ey = 0.0f; }
+        if (ex > cfg.pos_err_clamp_m) ex = cfg.pos_err_clamp_m;
+        if (ex < -cfg.pos_err_clamp_m) ex = -cfg.pos_err_clamp_m;
+        if (ey > cfg.pos_err_clamp_m) ey = cfg.pos_err_clamp_m;
+        if (ey < -cfg.pos_err_clamp_m) ey = -cfg.pos_err_clamp_m;
+
+        // ヨー回転補償: 制御座標系(ワールド)誤差 → 機体座標系。
+        // ψ=0 のとき既存の「x誤差→roll / y誤差→pitch」対応に一致する。
+        // 符号は pos_ctrl_yaw_sign(config.hpp)で調整可能(要地上検証)。
+        const float psi = cfg.pos_ctrl_yaw_sign * yaw_rad;
+        const float c = cosf(psi);
+        const float s = sinf(psi);
+        const float e_roll = c * ex + s * ey;
+        const float e_pitch = -s * ex + c * ey;
+
+        pos_pid_x.set_anomaly(!valid);
+        pos_pid_y.set_anomaly(!valid);
+        float roll_t = pos_pid_x.update(e_roll, dt, valid);
+        float pitch_t = pos_pid_y.update(e_pitch, dt, valid);
+        if (!valid) {
+            // PC 側と同じ規約: 無効データ中の指令は水平(PID 内部状態は減衰継続)
+            roll_t = 0.0f;
+            pitch_t = 0.0f;
+        }
+        pos_target_roll_rad = roll_t;
+        pos_target_pitch_rad = pitch_t;
+    }
+
+    // スルーレート制限(PC SetpointShaper 相当)を毎tick前進させる
+    float dt_tick = flight_control_state.timing.Interval_time;
+    if (dt_tick < 0.0f) dt_tick = 0.0f;
+    if (dt_tick > cfg.pos_max_dt_s) dt_tick = cfg.pos_max_dt_s;
+    const float max_delta = cfg.pos_slew_rad_per_s * dt_tick;
+    pos_cmd_roll_rad = slew_toward(pos_cmd_roll_rad, pos_target_roll_rad, max_delta);
+    pos_cmd_pitch_rad = slew_toward(pos_cmd_pitch_rad, pos_target_pitch_rad, max_delta);
 }
 
 // 飛行中(TAKEOFF/HOVER)のスラストベース+姿勢指令を更新する(OptiTrack版 get_command 相当)
@@ -342,20 +599,7 @@ void update_thrust_and_attitude_command(void) {
     }
     out.Thrust_command = out.Thrust0 * cfg.battery_nominal_v;
 
-    // 姿勢指令: setpointが新鮮なら適用、200ms超は水平保持(PROTOCOL.md フェイルセーフ)。
-    // 機体差バイアスはPC側プロファイルで加算済み(ファームには置かない)。
-    const uint32_t now_ms = millis();
-    const bool link_fresh =
-        cs.setpoint_received && (now_ms - cs.last_setpoint_ms) < cfg.link_level_hold_ms;
-    if (link_fresh) {
-        out.Roll_angle_command = cs.target_roll_rad;
-        out.Pitch_angle_command = cs.target_pitch_rad;
-    } else {
-        out.Roll_angle_command = 0.0f;
-        out.Pitch_angle_command = 0.0f;
-    }
-
-    // --- ヨー角制御(v2 契約 §2.3。flags bit1 無効時は V1 と同一のレートダンピング) ---
+    // ヨー推定ソースの選択(ヨー角制御と機上XY回転補償が共用)。
     // yaw_used: est_mode==1 かつ EKF 健全なら EKF ψ、est_mode==0 なら Madgwick。
     // est_mode==1 で EKF が不健全(磁気更新凍結/アンカー無効/FF無効)な間は、
     // 飛行中のヨーソース切替による指令段差を作らないため角度制御を止めて
@@ -369,6 +613,49 @@ void update_thrust_and_attitude_command(void) {
             yaw_source_ok = false;
         }
     }
+
+    // 姿勢指令: setpoint/pos_err が新鮮なら適用、200ms超は水平保持
+    // (PROTOCOL.md フェイルセーフ)。機体差バイアスはPC側プロファイルで
+    // 加算済み(ファームには置かない)。
+    const uint32_t now_ms = millis();
+    const bool link_fresh =
+        cs.setpoint_received && (now_ms - cs.last_setpoint_ms) < cfg.link_level_hold_ms;
+    if (link_fresh && cs.xy_source == XY_SOURCE_POS_ERR) {
+        // v2.1 機上XY位置制御: 位置誤差をヨー回転補償して XY PID。
+        // 回転に使うヨーは健全時 yaw_used(EKF/Madgwick)。EKF 不健全へ
+        // 遷移した瞬間は EKF-Madgwick のフレーム差をラッチし、不健全中は
+        // Madgwick+オフセットで連続なヨーを供給する(生の Madgwick へ
+        // 切り替えると誤差フレームに段差ができるため。ヨー角制御の
+        // レートダンピング縮退とは独立)。
+        float yaw_for_pos = yaw_used;
+        if (!yaw_source_ok) {
+            if (pos_yaw_fallback_prev_ok) {
+                pos_yaw_fallback_offset =
+                    wrapPi(sensor_state.Yaw_ekf_rad - sensor_state.Yaw_angle);
+            }
+            yaw_for_pos = wrapPi(sensor_state.Yaw_angle
+                                 + pos_yaw_fallback_offset);
+        }
+        pos_yaw_fallback_prev_ok = yaw_source_ok;
+        update_pos_control(yaw_for_pos);
+        out.Roll_angle_command = pos_cmd_roll_rad;
+        out.Pitch_angle_command = pos_cmd_pitch_rad;
+    } else if (link_fresh) {
+        out.Roll_angle_command = cs.target_roll_rad;
+        out.Pitch_angle_command = cs.target_pitch_rad;
+    } else {
+        out.Roll_angle_command = 0.0f;
+        out.Pitch_angle_command = 0.0f;
+        // 途絶中は XY 制御の出力状態も水平へ戻す(復帰時の段差防止)
+        pos_target_roll_rad = 0.0f;
+        pos_target_pitch_rad = 0.0f;
+        pos_cmd_roll_rad = 0.0f;
+        pos_cmd_pitch_rad = 0.0f;
+        pos_pid_x.set_anomaly(true);
+        pos_pid_y.set_anomaly(true);
+    }
+
+    // --- ヨー角制御(v2 契約 §2.3。flags bit1 無効時は V1 と同一のレートダンピング) ---
 
     bool yaw_cmd_valid = false;
     float yaw_cmd = 0.0f;
@@ -656,6 +943,7 @@ void handle_wait(const CommandSnapshot& cmd) {
             auto_takeoff_counter = 0;
             landing_state = 0;
             prev_range0_flag = 0;
+            reset_pos_control();   // 機上XY PID を毎フライト初期化(v2.1)
             transition_to(AUTO_TAKEOFF, Reason::START_CMD);
         }
     }
@@ -670,6 +958,7 @@ void handle_wait(const CommandSnapshot& cmd) {
         out.Pitch_rate_reference = 0.0f;
         out.Yaw_rate_reference = 0.0f;
         reset_yaw_angle_control();
+        reset_pos_control();
         landing_state = 0;
         auto_takeoff_counter = 0;
         prev_range0_flag = 0;
@@ -758,6 +1047,7 @@ void handle_complete(const CommandSnapshot& cmd) {
     out.Pitch_rate_reference = 0.0f;
     out.Yaw_rate_reference = 0.0f;
     reset_yaw_angle_control();
+    reset_pos_control();
     landing_state = 0;
     auto_takeoff_counter = 0;
     thrust_filtered.reset();
@@ -1135,10 +1425,11 @@ void loop_400Hz(void) {
     update_loop_timing();
     sensor_read();
 
-    // 受信コマンドの取り出しと setpoint 適用
+    // 受信コマンドの取り出しと setpoint / pos_err 適用
     CommandSnapshot cmd;
     comm_consume_commands(&cmd);
     apply_setpoint(cmd);
+    apply_pos_err(cmd);
 
     // v2 コマンド(0x14-0x23)の処理+TLM_ACK 応答。CMD_MODE の遷移は
     // この直後の状態スイッチで同tick内に反映される(STOP は各ハンドラが最優先)。

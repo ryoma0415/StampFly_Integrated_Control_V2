@@ -63,6 +63,14 @@ COLUMNS: tuple[str, ...] = (
     "tlm_nis", "tlm_ffg", "tlm_ff_status",
     # MoCap ヨー(Position モードのみ)と軌道状態
     "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
+    # --- v3 追加 6 列(機上XY制御 CMD_POS_ERR。末尾追加のみ) ---
+    # xy_cmd_mode: "pc"(CMD_SETPOINT)/"onboard"(CMD_POS_ERR)の判別
+    # cmd_err_*: 送信した位置誤差(クランプ後) / cmd_xy_valid: flags bit2
+    # cmd_mocap_yaw_deg: 送信した MoCap 実測ヨー(onboard のみ)
+    # mocap_heading_deg: MoCap 実測の制御座標系ヨー(pc/onboard 両モード)
+    "xy_cmd_mode",
+    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid", "cmd_mocap_yaw_deg",
+    "mocap_heading_deg",
 )
 
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数

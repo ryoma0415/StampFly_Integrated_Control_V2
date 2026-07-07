@@ -74,6 +74,26 @@ def build_vectors() -> dict:
          "yaw_ref": 0.0, "flags": 1},
         sp_v1.to_payload()))
 
+    # --- 3c. CMD_POS_ERR(v2.1 機上XY制御: 全フラグ有効の代表値)---
+    pe1 = sp.CmdPosErr(err_x=0.35, err_y=-0.2, alt_ref=0.5,
+                       yaw_ref=1.5708, mocap_yaw=1.62, flags=0x0F)
+    frames.append(frame_vector(
+        "cmd_pos_err_all_flags", "CMD_POS_ERR",
+        sp.MsgType.CMD_POS_ERR, 3,
+        {"err_x": 0.35, "err_y": -0.2, "alt_ref": 0.5,
+         "yaw_ref": 1.5708, "mocap_yaw": 1.62, "flags": 0x0F},
+        pe1.to_payload()))
+
+    # --- 3d. CMD_POS_ERR(XY 無効=MoCap 途絶中の水平指令。bit2=0)---
+    pe0 = sp.CmdPosErr(err_x=0.0, err_y=0.0, alt_ref=0.3,
+                       yaw_ref=0.0, mocap_yaw=0.0, flags=0x01)
+    frames.append(frame_vector(
+        "cmd_pos_err_xy_invalid", "CMD_POS_ERR",
+        sp.MsgType.CMD_POS_ERR, 4,
+        {"err_x": 0.0, "err_y": 0.0, "alt_ref": 0.3,
+         "yaw_ref": 0.0, "mocap_yaw": 0.0, "flags": 0x01},
+        pe0.to_payload()))
+
     # --- 4. TLM_STATE: 全フィールド既知値(135B、v2 末尾追加分を含む)---
     tlm_fields = {
         "seq_echo": 0x01020304,

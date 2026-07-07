@@ -29,6 +29,8 @@ def _build_message(kind: str, fields: dict):
         return None
     if kind == "CMD_SETPOINT":
         return sp.CmdSetpoint(**fields)
+    if kind == "CMD_POS_ERR":
+        return sp.CmdPosErr(**fields)
     if kind == "CMD_MODE":
         return sp.CmdMode(**fields)
     if kind == "CMD_MOTOR_RUN":

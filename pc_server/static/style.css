@@ -933,3 +933,14 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
   border: 1px solid var(--border);
   border-radius: 8px;
 }
+
+/* 複数機: 機体別サブ行(ヨー制御+FF) */
+.multi-sub-row {
+  margin-left: 80px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.multi-sub-row .switch-label { font-size: 12px; }
+.multi-sub-row input[type="number"] { width: 58px; }
+.multi-ff-select { max-width: 150px; font-size: 12px; }
+.multi-ff-status { font-size: 11px; color: var(--text-dim); }

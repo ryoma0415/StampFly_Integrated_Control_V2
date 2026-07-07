@@ -208,6 +208,22 @@ class SerialLink:
     def send_setpoint(self, setpoint: proto.CmdSetpoint) -> int:
         """CMD_SETPOINT を送信し、レイテンシ計測用に seq を記録する。"""
         seq = self.send(proto.MsgType.CMD_SETPOINT, setpoint.to_payload())
+        self._record_pending_setpoint(seq)
+        return seq
+
+    def send_pos_err(self, pos_err: proto.CmdPosErr) -> int:
+        """CMD_POS_ERR を送信し、レイテンシ計測用に seq を記録する。
+
+        機上XY制御モードの 50Hz ストリーム(CMD_SETPOINT の代替)。機体は
+        seq を TLM_STATE の seq_echo にエコーするため、往復レイテンシ計測は
+        CMD_SETPOINT と同じ仕組みに載る。
+        """
+        seq = self.send(proto.MsgType.CMD_POS_ERR, pos_err.to_payload())
+        self._record_pending_setpoint(seq)
+        return seq
+
+    def _record_pending_setpoint(self, seq: int) -> None:
+        """seq_echo 往復レイテンシ計測のための送信時刻記録(50Hz ストリーム共通)。"""
         now = time.monotonic()
         with self._latency_lock:
             self._pending_setpoints[seq] = now
@@ -216,7 +232,6 @@ class SerialLink:
             stale = [s for s, t in self._pending_setpoints.items() if t < cutoff]
             for s in stale:
                 del self._pending_setpoints[s]
-        return seq
 
     def send_to(self, node_id: int, msg_type: int, payload: bytes = b"") -> int:
         """フレームを RLY_MUX_UP で包んで peers[node_id] 宛に送信する。
@@ -247,6 +262,18 @@ class SerialLink:
         """CMD_SETPOINT を node_id 宛に送信し、ノード別レイテンシ用に記録する。"""
         seq = self.send_to(node_id, proto.MsgType.CMD_SETPOINT,
                            setpoint.to_payload())
+        self._record_node_pending(node_id, seq)
+        return seq
+
+    def send_pos_err_to(self, node_id: int, pos_err: proto.CmdPosErr) -> int:
+        """CMD_POS_ERR を node_id 宛に送信し、ノード別レイテンシ用に記録する。"""
+        seq = self.send_to(node_id, proto.MsgType.CMD_POS_ERR,
+                           pos_err.to_payload())
+        self._record_node_pending(node_id, seq)
+        return seq
+
+    def _record_node_pending(self, node_id: int, seq: int) -> None:
+        """ノード別 seq_echo レイテンシ計測の送信時刻記録(50Hz ストリーム共通)。"""
         now = time.monotonic()
         with self._latency_lock:
             pending = self._node_pending.setdefault(node_id, {})
@@ -256,7 +283,6 @@ class SerialLink:
             stale = [s for s, t in pending.items() if t < cutoff]
             for s in stale:
                 del pending[s]
-        return seq
 
     def send_with_ack(self, msg_type: int, payload: bytes = b"",
                       timeout_s: Optional[float] = None,
@@ -314,6 +340,37 @@ class SerialLink:
                     and last_ack.channel == wifi_channel):
                 return True, last_ack
         return False, last_ack
+
+    def send_with_ack_to(self, node_id: int, msg_type: int,
+                         payload: bytes = b"",
+                         timeout_s: Optional[float] = None,
+                         max_retries: Optional[int] = None
+                         ) -> Optional[proto.TlmAck]:
+        """ノード宛にフレームを送信し、当該ノードからの TLM_ACK を待つ。
+
+        send_with_ack のマルチ機体版。ACK の対応付けは
+        (node_id, acked_type, acked_seq) の完全一致(再送規律も同一:
+        既定 1.0s × 最大2回再送)。
+        """
+        if timeout_s is None:
+            timeout_s = self._command_ack_timeout_s
+        if max_retries is None:
+            max_retries = self._command_ack_max_retries
+        with self._cmd_ack_session_lock:
+            for _attempt in range(1 + max_retries):
+                seq = self.send_to(node_id, msg_type, payload)
+                key = (int(node_id), int(msg_type), seq)
+                deadline = time.monotonic() + timeout_s
+                with self._cmd_ack_cond:
+                    while key not in self._cmd_acks:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._cmd_ack_cond.wait(remaining)
+                    ack = self._cmd_acks.pop(key, None)
+                if ack is not None:
+                    return ack
+            return None
 
     def set_relay_peers(self, peers: list[tuple[bytes, int]], wifi_channel: int
                         ) -> tuple[bool, Optional[proto.RlyPeersAck]]:
@@ -452,6 +509,20 @@ class SerialLink:
         status, inner = proto.parse_frame(inner_bytes)
         if status is not proto.ParseStatus.OK or inner is None:
             self._rx_mux_errors += 1
+            return
+        if inner.type == proto.MsgType.TLM_ACK:
+            # ノード宛コマンドの ACK 待ち合わせ(キーは (node, type, seq)。
+            # 単機経路の (type, seq) キーとは長さが違うため衝突しない)
+            try:
+                cmd_ack = proto.TlmAck.from_payload(inner.payload)
+            except ValueError:
+                return
+            with self._cmd_ack_cond:
+                if len(self._cmd_acks) >= _CMD_ACK_CACHE_MAX:
+                    self._cmd_acks.pop(next(iter(self._cmd_acks)))
+                self._cmd_acks[(node_id, cmd_ack.acked_type,
+                                cmd_ack.acked_seq)] = cmd_ack
+                self._cmd_ack_cond.notify_all()
             return
         if inner.type == proto.MsgType.TLM_STATE and len(inner.payload) >= 4:
             # seq_echo(先頭4B)からノード別の往復レイテンシを計測

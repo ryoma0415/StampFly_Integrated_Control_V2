@@ -82,6 +82,7 @@ type値の範囲でルーティングする(リレーは中身を解釈せず型
 | 0x11 | CMD_STOP | なし(0B) | 即時着陸。**全飛行状態で受理**(TAKEOFF/LANDING中含む)。MOTOR_TEST 中はモーター停止→WAIT |
 | 0x12 | CMD_SETPOINT | `f32 roll_ref(rad), f32 pitch_ref(rad), f32 alt_ref(m), f32 yaw_ref(rad ±π), u8 flags` =**17B**(v2) | 姿勢+高度+ヨー角目標。flags bit0=alt_ref有効(0なら現在のalt_ref維持)、**bit1=yaw_ref有効(=ヨー角制御ON)**。bit1=0 のとき機体は v1 と同一動作(Yaw_rate_reference=0 のレートダンピングのみ)。**ハートビートを兼ねる**。PCは飛行の有無に関わらずセッション中50Hzで送信 |
 | 0x13 | CMD_RESET | なし(0B) | COMPLETE(OverG後)からの復帰。COMPLETE かつ altitude_est<0.15m でのみ受理 → AUTO_WAIT |
+| 0x24 | CMD_POS_ERR | `f32 err_x(m), f32 err_y(m), f32 alt_ref(m), f32 yaw_ref(rad ±π), f32 mocap_yaw(rad ±π), u8 flags` =**21B**(v2.1) | **機上XY制御モード**(control.json `xy_command_mode="onboard"`)の CMD_SETPOINT 代替ストリーム。PC は制御座標系の XY 位置誤差(目標−フィルタ済み現在位置)を送り、機体側が自身のヨー推定で誤差を機体座標系へ回転(**ヨー回転補償**)して XY PID → roll/pitch 指令を計算する。flags bit0=alt_ref有効、bit1=yaw_ref有効(CMD_SETPOINT と同義)、**bit2=err_x/err_y有効**(MoCap新鮮+閉ループ有効。0なら機体は水平指令+PID減衰)、**bit3=mocap_yaw有効**(MoCap実測の制御座標系ヨー。フレーム整合検証・ログ用で制御には未使用)。**ハートビートを兼ねる**(受信時刻・seq_echo は CMD_SETPOINT と共有し、途絶フェイルセーフ >200ms/>500ms がそのまま適用される)。機上XY PID のゲイン・クランプ・スルーレートはファーム config.hpp の `pos_*`(PC 側 control.json / server.json の実績値と同値で初期化) |
 
 #### v2 実験・キャリブレーション系(0x14–0x23)
 
@@ -125,7 +126,7 @@ v2 は**末尾追加のみ**: 既存オフセット 0–96 は v1 と不変
 
 | オフセット | 型 | フィールド | 単位 |
 |---|---|---|---|
-| 0 | u32 | seq_echo — 最後に適用した CMD_SETPOINT の seq(未受信なら0) | |
+| 0 | u32 | seq_echo — 最後に適用した CMD_SETPOINT / CMD_POS_ERR の seq(未受信なら0) | |
 | 4 | u32 | elapsed_ms — 起動からの経過 | ms |
 | 8 | u8 | state(下記enum) | |
 | 9 | u8 | flags: bit0 low_voltage, bit1 setpoint_fresh(<200ms), bit2 flying | |
@@ -318,8 +319,9 @@ Reason:      0=none, 1=start_cmd, 2=stop_cmd, 3=max_flight_time, 4=low_voltage,
 
 | 条件 | 動作 | 実装場所 |
 |---|---|---|
-| CMD_SETPOINT 途絶 >200ms(飛行中) | roll/pitch を水平(バイアス込み0)へ、alt_ref 維持。**yaw はヨー制御中なら途絶検出時点の推定ヨー角をラッチして保持**(v2。0 指令へ落とすと離陸方位への回頭を意味するため)。復帰で通常追従へ戻る | ファーム |
-| CMD_SETPOINT 途絶 >500ms(飛行中) | LANDING へ遷移(reason=8 link_loss)。auto_landing_step のヨーはレートダンピングのみ | ファーム |
+| CMD_SETPOINT 途絶 >200ms(飛行中) | roll/pitch を水平(バイアス込み0)へ、alt_ref 維持。**yaw はヨー制御中なら途絶検出時点の推定ヨー角をラッチして保持**(v2。0 指令へ落とすと離陸方位への回頭を意味するため)。復帰で通常追従へ戻る。CMD_POS_ERR(v2.1)も同一ハートビートを共有し同じ規範が適用される | ファーム |
+| CMD_SETPOINT 途絶 >500ms(飛行中) | LANDING へ遷移(reason=8 link_loss)。auto_landing_step のヨーはレートダンピングのみ(CMD_POS_ERR も同様) | ファーム |
+| テレメトリ途絶 >3s(単機・接続中) | UI 警告+RLY_SET_TARGET を自動再設定(10s 間隔。リレー再起動で RAM のみのターゲット設定が失われる事故からの自己修復)。複数機モードはスロット別監視(multi.tlm_timeout_s)側の責務 | PC |
 | EKF 不健全(磁気更新凍結 ffg bit5 / アンカー無効 / FF無効)で est_mode=1 | ヨー角制御を止めてレートダンピングに縮退(飛行中のヨーソース切替による指令段差を作らない)。ffg / ff_status で PC に通知 | ファーム(v2) |
 | CMD_MOTOR_RUN 途絶 >1.5s(MOTOR_TEST 中) | モーター自動停止 | ファーム(v2) |
 | 低電圧(<3.34V、20Hz×5サンプル連続 ≈0.25s) | 飛行中: LANDING(reason=4)。WAIT: START拒否(reason=5)(v2: 電圧源は INA3221 の 20Hz 読みに一本化) | ファーム |

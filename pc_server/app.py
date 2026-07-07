@@ -16,6 +16,9 @@
 (コーディング規約: ブロッキング I/O を async ループに持ち込まない)。
 
 起動: cd pc_server && python3 -m uvicorn app:app --host 127.0.0.1 --port 8000
+cd /Users/ryoma_nishimura/Code-Projects/StampFly-Project-Develop/Developments/StampFly_MoCap_System_v2/StampFly_Integrated_Control_V2/pc_server
+source .venv/bin/activate
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
 """
 
 from __future__ import annotations
@@ -323,19 +326,33 @@ async def api_ffprofile_status() -> dict:
 
 @app.post("/api/ffprofile")
 async def api_ffprofile(body: dict) -> dict:
+    """FF プロファイル操作。apply / mode / anchor は "drone" を指定すると
+    複数機モードの機体別操作(ノード宛+MAC 別適用状態)になる。"""
     action = body.get("action")
+    drone = body.get("drone")
     if action == "extract":
         return await asyncio.to_thread(
             session.ffprofile.extract, body.get("folder"), body.get("stems"),
             body.get("name"), body.get("memo"))
     if action == "apply":
+        if drone is not None:
+            return await asyncio.to_thread(
+                session.multi_ff_apply, str(drone), body.get("name"),
+                body.get("ff"), body.get("est"), bool(body.get("force")))
         return await asyncio.to_thread(
             session.ffprofile.apply, body.get("name"), body.get("ff"),
             body.get("est"), bool(body.get("force")))
     if action == "mode":
+        if drone is not None:
+            return await asyncio.to_thread(
+                session.multi_ff_mode, str(drone),
+                body.get("ff"), body.get("est"))
         return await asyncio.to_thread(session.ffprofile.mode,
                                        body.get("ff"), body.get("est"))
     if action == "anchor":
+        if drone is not None:
+            return await asyncio.to_thread(session.multi_ff_anchor,
+                                           str(drone))
         return await asyncio.to_thread(session.ffprofile.anchor)
     if action == "delete":
         return await asyncio.to_thread(session.ffprofile.delete,
@@ -399,6 +416,12 @@ async def _handle_command(message: dict) -> None:
             [str(n) for n in names] if isinstance(names, list) else [])
     elif action == "multi_start":
         await asyncio.to_thread(session.multi_start)
+    elif action == "multi_yaw":
+        yaw_deg = message.get("yaw_deg")
+        await asyncio.to_thread(
+            session.multi_yaw, str(message.get("name", "")),
+            message.get("enabled"),
+            None if yaw_deg is None else float(yaw_deg))
     else:
         session.warn(f"不明なコマンド: {action}")
 
@@ -444,11 +467,15 @@ async def _handle_message(message: dict) -> None:
                                float(message["y"]),
                                float(message["z"]))
         elif msg_type == "multi_target":
-            # 複数機モード: 機体別の目標位置(非ブロッキング)
-            session.multi_target(str(message["name"]),
-                                 float(message["x"]),
-                                 float(message["y"]),
-                                 float(message["z"]))
+            # 複数機モード: 機体別の目標位置。multi_target は _command_lock を
+            # 取る(multi_start との直列化)ため必ず executor へ逃がす。
+            # イベントループ上で同期的に呼ぶと、ロック保持中(connect/FF転送
+            # など)に 20Hz 配信・全 WS 処理・SIGINT 処理まで停止する。
+            await asyncio.to_thread(session.multi_target,
+                                    str(message["name"]),
+                                    float(message["x"]),
+                                    float(message["y"]),
+                                    float(message["z"]))
         else:
             session.warn(f"不明なメッセージ型: {msg_type}")
     except (KeyError, TypeError, ValueError) as exc:

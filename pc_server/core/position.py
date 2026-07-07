@@ -504,6 +504,12 @@ class PositionController:
             meta["tracking_valid"] = pose["tracking_valid"]
             meta["raw_pos"] = (pose["x"], pose["y"], pose["z"])
             meta["mocap_yaw_deg"] = pose["yaw_rad"] * RAD_TO_DEG
+            # 制御座標系ヨー(機上XY制御 CMD_POS_ERR の mocap_yaw 欄と
+            # フレーム整合検証ログ mocap_heading_deg に使う)
+            heading = pose.get("heading_rad")
+            if heading is not None:
+                meta["mocap_heading_rad"] = heading
+                meta["mocap_heading_deg"] = heading * RAD_TO_DEG
         if filter_result is not None:
             meta["filtered_pos"] = tuple(filter_result["filtered_position"])
             meta["is_outlier"] = filter_result["is_outlier"]

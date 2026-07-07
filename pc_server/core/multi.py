@@ -21,7 +21,10 @@ multi_start / stop)と 20Hz supervisor から呼ばれる。
   / XY 誤差発散(飛行中の閉ループで divergence_error_m 超過が
   divergence_hold_s 継続したら当該機へ CMD_STOP — rigid_body_id 取り違えで
   他機の位置とループを閉じる交差結合の検知)。
-- v1 スコープ: 静的目標のみ(円軌道なし)・ヨー角制御 OFF・CSV ログなし。
+- スコープ: 静的目標のみ(円軌道なし)・CSV ログなし。ヨー角制御は機体別に
+  ON/OFF 可(set_yaw — 単機と同じ SetpointShaper 経路で ±180°目標を整形)。
+  FF プロファイル適用も機体別に可(session.multi_ff_* → ffprofile の
+  node_id/mac 版。適用状態は ff_state.json の applied_by_mac)。
 """
 
 from __future__ import annotations
@@ -95,6 +98,8 @@ class DroneSlot:
         # XY 誤差が divergence_error_m を超え続けている開始時刻(発散検知)
         self.error_high_since: Optional[float] = None
         self.target_set = False
+        # UI 入力のヨー目標(生値 [deg]。スナップショット経由で UI が復元する)
+        self.yaw_target_deg = 0.0
         # 最新テレメトリ(ノード帰属済み)
         self.tlm: Optional[proto.TlmState] = None
         self.tlm_t: Optional[float] = None
@@ -145,6 +150,19 @@ class MultiControlManager:
         # 取り違えの最終防衛線)
         self._divergence_error_m: float = multi_cfg["divergence_error_m"]
         self._divergence_hold_s: float = multi_cfg["divergence_hold_s"]
+        # ヨー角目標の上限。PC 側 XY 位置ループ(xy_command_mode="pc")は
+        # 制御座標系固定(ワールド誤差 → roll/pitch にヨー回転補償なし)の
+        # ため、大きなヨー保持は XY 制御の実効ゲインを cos(ψ) に落とす
+        # (90°で直交・180°で正帰還)。cos30° ≈ 0.87 の範囲に制限する。
+        # xy_command_mode="onboard"(CMD_POS_ERR: 機体側でヨー回転補償)では
+        # この制約は原理上不要だが、飛行検証が済むまでクランプは維持する。
+        self._max_yaw_ctrl_deg: float = multi_cfg["max_yaw_ctrl_deg"]
+
+        # XY 指令モード(session と同じ control.json "control" 節を参照)
+        control_cfg = control_config.get("control", {})
+        xy_mode = control_cfg.get("xy_command_mode", "pc")
+        self._xy_onboard: bool = (xy_mode == "onboard")
+        self._pos_err_clamp_m: float = control_cfg.get("pos_err_clamp_m", 2.0)
 
         # スロット表(_lock 保護。RX スレッドの TLM ハンドラと UI コマンド、
         # supervisor が競合する)
@@ -296,6 +314,51 @@ class MultiControlManager:
         with self._lock:
             slot.target_set = True
         return True, "目標を設定しました"
+
+    def set_yaw(self, name: str, enabled: Optional[bool] = None,
+                yaw_deg: Optional[float] = None) -> tuple[bool, str]:
+        """機体別のヨー角制御 ON/OFF とヨー目標 [deg] を設定する。
+
+        目標は SetpointShaper が最短経路 wrap+スルーレート制限して 50Hz 送信
+        に反映する(単機のヨースライダと同じ経路)。飛行中の変更も可だが、
+        - 目標は ±max_yaw_ctrl_deg に制限(XY ループが制御座標系固定のため)
+        - MoCap 途絶中(armed/flying)は変更を拒否(位置盲目中の回頭を防ぐ)
+        """
+        slot = self._slot_by_name(name)
+        if slot is None:
+            return False, f"機体「{name}」は選択されていません"
+        with self._lock:
+            phase = slot.phase
+        if phase in (SLOT_ARMED, SLOT_FLYING):
+            age = slot.controller.mocap_age_s(self._clock())
+            if age is None or age > self._mocap_dropout_level_s:
+                return False, (f"機体「{name}」は MoCap 途絶中のためヨー設定を"
+                               "変更できません(復帰後にやり直してください)")
+        if yaw_deg is not None:
+            limit = self._max_yaw_ctrl_deg
+            if not isinstance(yaw_deg, (int, float)) \
+                    or not (-limit <= float(yaw_deg) <= limit):
+                return False, (f"ヨー目標は ±{limit:.0f}° で指定してください"
+                               f"({yaw_deg})。XY 位置制御は制御座標系固定の"
+                               "ため大きなヨー保持は位置保持を劣化させます")
+            slot.controller.set_yaw_setpoint(float(yaw_deg) * DEG_TO_RAD)
+            with self._lock:
+                slot.yaw_target_deg = float(yaw_deg)
+        if enabled is not None:
+            slot.controller.set_yaw_control(bool(enabled))
+        return True, "ヨー設定を更新しました"
+
+    def slot_info(self, name: str) -> Optional[dict]:
+        """機体名 → {node_id, mac, phase}(未選択なら None)。
+
+        session のノード宛コマンド(FF 適用など)のスロット解決に使う。
+        """
+        with self._lock:
+            for slot in self._slots:
+                if slot.name == name:
+                    return {"node_id": slot.node_id, "mac": slot.mac,
+                            "phase": slot.phase}
+        return None
 
     def start_all(self) -> tuple[bool, str]:
         """選択済み全機の一斉離陸(機体ごとに CMD_START をノード宛送信)。"""
@@ -678,9 +741,23 @@ class MultiControlManager:
                     "voltage": float(tlm.voltage),
                     "altitude_est": float(tlm.altitude_est),
                     "yaw": float(tlm.yaw) * RAD_TO_DEG,
+                    "yaw_est": float(tlm.yaw_est_rad) * RAD_TO_DEG,
+                    # ヨー角制御/FF の機体側状態(UI の機体別 FF 表示用)
+                    "yaw_ctrl_active": bool(
+                        tlm.ff_status
+                        & proto.TlmState.FF_STATUS_YAW_CTRL_ACTIVE),
+                    "est_mode_ekf": bool(
+                        tlm.ff_status & proto.TlmState.FF_STATUS_EST_EKF),
+                    "ffcal_loaded": bool(
+                        tlm.ff_status & proto.TlmState.FF_STATUS_FFCAL_LOADED),
+                    "ff_mode": int(tlm.ff_status
+                                   & proto.TlmState.FF_STATUS_FF_MODE_MASK),
                     "fresh": (now - tlm_t) <= self._telemetry_fresh_s,
                 }
             tx, ty, tz = slot.controller.get_target()
+            yaw_ref_rad, yaw_ctrl_on = slot.controller.yaw_setpoint()
+            with self._lock:
+                yaw_target_deg = slot.yaw_target_deg
             drones.append({
                 "node_id": slot.node_id,
                 "name": slot.name,
@@ -689,6 +766,9 @@ class MultiControlManager:
                 "phase": phase,
                 "target": ({"x": tx, "y": ty, "z": tz}
                            if target_set else None),
+                "yaw_ctrl_on": yaw_ctrl_on,
+                "yaw_ref_deg": yaw_ref_rad * RAD_TO_DEG,
+                "yaw_target_deg": yaw_target_deg,
                 "tlm": tlm_node,
                 "mocap": slot.controller.mocap_snapshot(now),
                 "latency_ms": self._serial.node_latency_ms(slot.node_id),
@@ -701,19 +781,55 @@ class MultiControlManager:
     # ==================================================================
 
     def _make_emit(self, node_id: int, profile: dict):
-        """スロット専用の setpoint 送信クロージャ(50Hz スレッドから)。"""
+        """スロット専用の setpoint/pos_err 送信クロージャ(50Hz スレッドから)。"""
         bias_roll = profile["roll_bias_deg"] * DEG_TO_RAD
         bias_pitch = profile["pitch_bias_deg"] * DEG_TO_RAD
 
         def emit(roll_rad: float, pitch_rad: float, alt_m: float,
                  meta: dict) -> None:
-            # v1: ヨー角制御は OFF 固定(flags bit1=0 → 機体はレートダンピング)
+            # ヨー角制御は機体別に選択可能(set_yaw)。単機の
+            # session._emit_setpoint と同じ規約で meta から反映する
+            # (OFF なら flags bit1=0 → 機体はレートダンピング)。
+            yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
+            yaw_ref = (float(meta.get("yaw_ref_rad") or 0.0)
+                       if yaw_ctrl_on else 0.0)
+            if self._xy_onboard:
+                # 機上XY制御(CMD_POS_ERR): 単機の session._emit_pos_err と
+                # 同じ規約。バイアスは送らない(機体側 I 項が吸収する)。
+                # bit2=0 でも実誤差を送る(0 すり替えは D 項スパイクの原因)。
+                xy_valid = (bool(meta.get("control_active"))
+                            and bool(meta.get("data_valid"))
+                            and not bool(meta.get("mocap_dropout")))
+                clamp = self._pos_err_clamp_m
+                err_x = max(-clamp, min(clamp,
+                                        float(meta.get("error_x") or 0.0)))
+                err_y = max(-clamp, min(clamp,
+                                        float(meta.get("error_y") or 0.0)))
+                heading = meta.get("mocap_heading_rad")
+                flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
+                if yaw_ctrl_on:
+                    flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID
+                if xy_valid:
+                    flags |= proto.CmdPosErr.FLAG_XY_ERR_VALID
+                if heading is not None:
+                    flags |= proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
+                pos_err = proto.CmdPosErr(
+                    err_x=err_x, err_y=err_y, alt_ref=alt_m, yaw_ref=yaw_ref,
+                    mocap_yaw=float(heading or 0.0), flags=flags)
+                try:
+                    self._serial.send_pos_err_to(node_id, pos_err)
+                except SerialLinkError:
+                    pass   # 切断検知は serial の on_disconnect → supervisor
+                return
+            flags = proto.CmdSetpoint.FLAG_ALT_REF_VALID
+            if yaw_ctrl_on:
+                flags |= proto.CmdSetpoint.FLAG_YAW_REF_VALID
             setpoint = proto.CmdSetpoint(
                 roll_ref=roll_rad + bias_roll,
                 pitch_ref=pitch_rad + bias_pitch,
                 alt_ref=alt_m,
-                yaw_ref=0.0,
-                flags=proto.CmdSetpoint.FLAG_ALT_REF_VALID,
+                yaw_ref=yaw_ref,
+                flags=flags,
             )
             try:
                 self._serial.send_setpoint_to(node_id, setpoint)

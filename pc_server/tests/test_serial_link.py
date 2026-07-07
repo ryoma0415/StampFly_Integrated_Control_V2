@@ -234,6 +234,59 @@ def test_mux_down_bad_inner_is_counted(link_env):
     assert wait_until(lambda: link.stats()["rx_mux_errors"] == 1)
 
 
+def make_mux_ack_responder(node_offset: int = 0):
+    """RLY_MUX_UP の内側コマンドに、MUX_DOWN で包んだ TLM_ACK を返す。
+
+    node_offset で「別ノードからの ACK」を模擬できる(照合失敗試験用)。
+    """
+    def responder(frame: proto.Frame):
+        if frame.type != proto.MsgType.RLY_MUX_UP:
+            return None
+        node_id, inner_bytes = proto.mux_unwrap(frame.payload)
+        status, inner = proto.parse_frame(inner_bytes)
+        assert status is proto.ParseStatus.OK and inner is not None
+        ack = proto.TlmAck(acked_type=inner.type, acked_seq=inner.seq,
+                           status=proto.TlmAck.STATUS_OK)
+        reply = proto.pack_frame(proto.MsgType.TLM_ACK, 1, ack.to_payload())
+        reply_node = (node_id + node_offset) % proto.RLY_MAX_PEERS
+        return [(proto.MsgType.RLY_MUX_DOWN,
+                 proto.mux_wrap(reply_node, reply))]
+    return responder
+
+
+def test_send_with_ack_to_roundtrip(server_config):
+    transport = FakeTransport(auto_responder=make_mux_ack_responder())
+    link = SerialLink(server_config, transport_factory=lambda p, b: transport)
+    link.connect("FAKE")
+    try:
+        ack = link.send_with_ack_to(
+            2, proto.MsgType.CMD_FF_MODE,
+            proto.CmdFfMode(ff_mode=2, est_mode=1).to_payload())
+    finally:
+        link.disconnect()
+    assert ack is not None
+    assert ack.status == proto.TlmAck.STATUS_OK
+    assert ack.acked_type == proto.MsgType.CMD_FF_MODE
+    assert len(transport.frames_of_type(proto.MsgType.RLY_MUX_UP)) == 1
+
+
+def test_send_with_ack_to_ignores_other_node_ack(server_config):
+    # 別ノード帰属の ACK では解決しない(タイムアウト+再送して None)
+    transport = FakeTransport(auto_responder=make_mux_ack_responder(
+        node_offset=1))
+    link = SerialLink(server_config, transport_factory=lambda p, b: transport)
+    link.connect("FAKE")
+    try:
+        ack = link.send_with_ack_to(
+            0, proto.MsgType.CMD_FF_ANCHOR, b"",
+            timeout_s=0.05, max_retries=1)
+    finally:
+        link.disconnect()
+    assert ack is None
+    # 初回+1回再送 = 2送信
+    assert len(transport.frames_of_type(proto.MsgType.RLY_MUX_UP)) == 2
+
+
 def make_peers_ack_responder(status: int = proto.RlyPeersAck.STATUS_OK):
     """RLY_SET_PEERS に RLY_PEERS_ACK を返すレスポンダを作る。"""
     def responder(frame: proto.Frame):

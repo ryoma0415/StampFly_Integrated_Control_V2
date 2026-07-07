@@ -52,6 +52,10 @@ PHASE_CONNECTED = "connected"
 PHASE_ARMED = "armed"
 PHASE_FLYING = "flying"
 
+# XY 指令モード(control.json "control"."xy_command_mode")
+XY_CMD_MODE_PC = "pc"            # PC 側 PID → CMD_SETPOINT(従来)
+XY_CMD_MODE_ONBOARD = "onboard"  # 位置誤差 → CMD_POS_ERR(機体側でヨー回転補償+PID)
+
 # 飛行中とみなす FlightState(LANDING 中も「flying」フェーズとして扱う)
 _IN_FLIGHT_STATES = frozenset({
     proto.FlightState.TAKEOFF, proto.FlightState.HOVER, proto.FlightState.LANDING,
@@ -66,6 +70,15 @@ _START_REJECT_REASONS = frozenset({
 })
 
 MS_PER_S = 1000.0
+
+# shutdown(Ctrl-C 経路)が _command_lock を待つ上限 [s](構造定数)。
+# FF 転送など長時間ロックを保持する操作の最中でも、プロセス終了を無期限に
+# 待たせない(超過時は構成要素を直接畳む強制経路へ落ちる)。
+_SHUTDOWN_LOCK_TIMEOUT_S = 5.0
+
+# テレメトリ途絶時のリレーターゲット再設定で _command_lock を待つ上限 [s]。
+# UI コマンド実行中なら今回は見送り、次の監視周期で再試行する。
+_REASSERT_LOCK_TIMEOUT_S = 0.5
 
 # WebSocket の "log" メッセージの origin 値(LOG_TEXT 由来以外はサーバ発)
 LOG_ORIGIN_NAMES = {proto.LogText.ORIGIN_RELAY: "relay",
@@ -143,6 +156,12 @@ class SessionManager:
         self._mocap_dropout_level_s: float = failsafe["mocap_dropout_level_s"]
         self._mocap_dropout_stop_s: float = failsafe["mocap_dropout_stop_s"]
         self._telemetry_fresh_s: float = self.server_config["freshness"]["telemetry_fresh_s"]
+        # 単機テレメトリ途絶監視(リレー再起動などのサイレント断の検出)。
+        # 既定値は server.json failsafe 節と同値(旧形式の設定でも動くよう
+        # .get で読む)。
+        self._tlm_stale_s: float = failsafe.get("tlm_stale_s", 3.0)
+        self._relay_reassert_interval_s: float = failsafe.get(
+            "relay_reassert_interval_s", 10.0)
         # RLY_STATS(1Hz)の鮮度閾値。受信「時刻」で判定する(counter の内容変化では
         # 判定しない — ターゲット未設定で上りを拒否中は全counterが静止し得るため)
         self._relay_stats_fresh_s: float = self.server_config["freshness"]["relay_stats_fresh_s"]
@@ -152,6 +171,18 @@ class SessionManager:
 
         # UI への即時メッセージ(event / log)。app.py が drain する。
         self.events: queue.Queue = queue.Queue()
+
+        # XY 指令モード(control.json "control" 節):
+        # - "pc":      従来どおり PC 側 PID の roll/pitch 角度指令(CMD_SETPOINT)
+        # - "onboard": 位置誤差を送り機体側でヨー回転補償+XY PID(CMD_POS_ERR)
+        control_cfg = self.control_config.get("control", {})
+        xy_mode = control_cfg.get("xy_command_mode", XY_CMD_MODE_PC)
+        if xy_mode not in (XY_CMD_MODE_PC, XY_CMD_MODE_ONBOARD):
+            self.warn(f"control.json xy_command_mode が不正です: {xy_mode!r}"
+                      f"('{XY_CMD_MODE_PC}' として扱います)")
+            xy_mode = XY_CMD_MODE_PC
+        self._xy_command_mode: str = xy_mode
+        self._pos_err_clamp_m: float = control_cfg.get("pos_err_clamp_m", 2.0)
 
         # 構成要素
         self.serial = SerialLink(self.server_config,
@@ -192,6 +223,10 @@ class SessionManager:
         self.serial.register_handler(proto.MsgType.TLM_EXP, self._on_tlm_exp)
         self.serial.register_handler(proto.MsgType.TLM_CAL_DATA,
                                      self._on_tlm_cal_data)
+        # マルチ機体: ノード帰属つき TLM_CAL_DATA(機体別 FF 適用の読み戻しが
+        # 別ノードの遅延応答で汚染されないよう、ノード別スロットへ振り分ける)
+        self.serial.register_node_handler(proto.MsgType.TLM_CAL_DATA,
+                                          self._on_tlm_cal_data_node)
 
         # UI コマンドの直列化(_ui_command デコレータが使用)。supervisor の
         # stop()/teardown とも共有する。self._lock より外側で取得すること
@@ -218,6 +253,12 @@ class SessionManager:
         # MoCap 途絶警告のエピソード管理
         self._mocap_warned = False
         self._mocap_stop_sent = False
+
+        # 単機テレメトリ途絶(リレー再起動等のサイレント断)監視の状態
+        self._connected_at: Optional[float] = None
+        self._tlm_stale_warned = False
+        self._relay_reassert_at: Optional[float] = None
+        self._relay_reassert_busy = False
 
         # 最新テレメトリ
         self._tlm_state: Optional[proto.TlmState] = None
@@ -268,6 +309,9 @@ class SessionManager:
             self._tlm_state_t = None
             self._rly_stats = None
             self._rly_stats_t = None
+            self._connected_at = self._clock()
+            self._tlm_stale_warned = False
+            self._relay_reassert_at = None
 
         # リレーへ ESP-NOW ピア設定(各1.0s 待ち、初回+最大3回再送=最大4回。
         # 完了まで上り転送はリレー側で拒否されるため、送信スレッド起動より先に行う)
@@ -895,6 +939,65 @@ class SessionManager:
             self.warn(f"一斉開始不可: {message}")
         return ok
 
+    def multi_yaw(self, name: str, enabled=None, yaw_deg=None) -> bool:
+        """機体別ヨー角制御 ON/OFF・ヨー目標 [deg](複数機モード)。"""
+        ok, message = self.multi.set_yaw(
+            name,
+            enabled=None if enabled is None else bool(enabled),
+            yaw_deg=None if yaw_deg is None else float(yaw_deg))
+        if not ok:
+            self.warn(f"ヨー設定不可: {message}")
+        return ok
+
+    def _multi_ff_slot(self, drone: str) -> tuple[Optional[dict], str]:
+        """機体別 FF 操作のスロット解決+ガード(選択済み・全機地上のみ)。
+
+        FF 転送は _command_lock を数十秒保持し得るため、**いずれかの機体が
+        飛行中の間は全面拒否**する(飛行中に stop() の再送監視が
+        _command_lock 待ちでブロックされる事故を防ぐ)。
+        """
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_MULTI:
+            return None, "複数機モードではありません"
+        if self.multi.any_armed_or_flying():
+            return None, ("飛行中の機体があるため FF 操作できません"
+                          "(全機着陸後にやり直してください)")
+        info = self.multi.slot_info(drone)
+        if info is None:
+            return None, f"機体「{drone}」は選択されていません"
+        return info, ""
+
+    @_ui_command
+    def multi_ff_apply(self, drone: str, name, ff=None, est=None,
+                       force: bool = False) -> dict:
+        """機体別 FF プロファイル適用(複数機モード。ノード宛+MAC 別状態)。"""
+        info, reason = self._multi_ff_slot(drone)
+        if info is None:
+            self.warn(f"FF適用不可: {reason}")
+            return {"ok": False, "message": reason}
+        return self.ffprofile.apply(name, ff=ff, est=est, force=force,
+                                    node_id=info["node_id"], mac=info["mac"])
+
+    @_ui_command
+    def multi_ff_mode(self, drone: str, ff, est) -> dict:
+        """機体別 ff_mode / est_mode の実行時切替(複数機モード)。"""
+        info, reason = self._multi_ff_slot(drone)
+        if info is None:
+            self.warn(f"FFモード変更不可: {reason}")
+            return {"ok": False, "message": reason}
+        return self.ffprofile.mode(ff, est, node_id=info["node_id"],
+                                   mac=info["mac"])
+
+    @_ui_command
+    def multi_ff_anchor(self, drone: str) -> dict:
+        """機体別アンカー再取得(複数機モード)。"""
+        info, reason = self._multi_ff_slot(drone)
+        if info is None:
+            self.warn(f"アンカー再取得不可: {reason}")
+            return {"ok": False, "message": reason}
+        return self.ffprofile.anchor(node_id=info["node_id"])
+
     def mocap_bodies(self) -> dict:
         """現在観測中の全リジッドボディ一覧(紐付け確認 UI 用)。
 
@@ -974,8 +1077,28 @@ class SessionManager:
             masks, pattern=pattern, notes=notes, min_start_vbat=min_start_vbat)
 
     def shutdown(self) -> None:
-        """サーバ終了時の後始末。"""
-        self.disconnect()
+        """サーバ終了時の後始末(Ctrl-C の lifespan 経路)。
+
+        _command_lock が長時間保持されていても(FF 転送は数十秒保持し得る)
+        プロセス終了を無期限に待たせない: タイムアウト付きでロックを取得し、
+        取れなければ構成要素を直接(各自の有界な停止処理で)畳む。
+        """
+        acquired = self._command_lock.acquire(timeout=_SHUTDOWN_LOCK_TIMEOUT_S)
+        try:
+            if acquired:
+                self.disconnect()   # RLock 再入のため通常経路のまま
+            else:
+                self.warn("コマンド実行中のため強制シャットダウンします")
+                self._supervisor_stop.set()
+                self._stop_active_sender()
+                self.logger.stop()
+                self.serial.disconnect()
+        finally:
+            if acquired:
+                self._command_lock.release()
+        # パッシブ起動(mocap_bodies)の NatNet はどの teardown 経路にも
+        # 属さないため、終了時に必ず畳む(daemon 化済みだが行儀として)
+        self.mocap.shutdown()
         self.experiment.shutdown()
 
     # ==================================================================
@@ -991,7 +1114,13 @@ class SessionManager:
             self._relay_target_ok = False
         self.posture.set_default_alt(profile["default_alt_m"])
 
-    def _configure_relay_target(self, profile: dict) -> None:
+    def _configure_relay_target(self, profile: dict,
+                                quiet_ok: bool = False) -> None:
+        """RLY_SET_TARGET を送信して ACK を確認する。
+
+        quiet_ok=True で成功時の info を抑制する(テレメトリ途絶時の
+        周期的な自動再設定がログを埋めないように。失敗警告は常に出す)。
+        """
         try:
             mac = cfg.parse_mac(profile["mac"])
             ok, ack = self.serial.set_relay_target(mac, profile["wifi_channel"])
@@ -1001,8 +1130,9 @@ class SessionManager:
         with self._lock:
             self._relay_target_ok = ok
         if ok:
-            self.info(f"リレーターゲット設定完了: {profile['mac']} "
-                      f"ch{profile['wifi_channel']}")
+            if not quiet_ok:
+                self.info(f"リレーターゲット設定完了: {profile['mac']} "
+                          f"ch{profile['wifi_channel']}")
         else:
             status = ack.status if ack is not None else "no_ack"
             self.warn(f"リレーターゲット設定失敗(status={status})。"
@@ -1048,6 +1178,9 @@ class SessionManager:
             self._mocap_warned = False
             self._mocap_stop_sent = False
             self._experiment_active = False
+            self._connected_at = None
+            self._tlm_stale_warned = False
+            self._relay_reassert_at = None
         self.position.set_control_active(False)
         self.info(message)
 
@@ -1068,11 +1201,19 @@ class SessionManager:
         v2: ヨー目標は meta("yaw_ref_rad" / "yaw_ctrl_on")で受け取り、
         ON のとき flags bit1(FLAG_YAW_REF_VALID)を立てて 17B で送信する。
         OFF のときは yaw_ref=0 / bit1=0(機体は V1 と同一のレートダンピング)。
+
+        v2.1: Position モードかつ xy_command_mode="onboard" のときは
+        roll/pitch 角度指令の代わりに位置誤差(CMD_POS_ERR)を送る
+        (_emit_pos_err)。Posture モードは常に CMD_SETPOINT。
         """
         with self._lock:
             bias_roll = self._bias_roll_rad
             bias_pitch = self._bias_pitch_rad
             phase = self._phase
+        if (meta.get("mode") == "position"
+                and self._xy_command_mode == XY_CMD_MODE_ONBOARD):
+            self._emit_pos_err(alt_m, meta, phase)
+            return
         yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
         yaw_ref = float(meta.get("yaw_ref_rad") or 0.0) if yaw_ctrl_on else 0.0
         flags = proto.CmdSetpoint.FLAG_ALT_REF_VALID
@@ -1094,8 +1235,64 @@ class SessionManager:
             pass   # 切断検知は _on_serial_disconnect → supervisor が処理
 
         if self.logger.active:
-            self.logger.log_row(self._build_log_row(
-                setpoint, seq, send_success, phase, meta))
+            row = self._build_log_row(setpoint, seq, send_success, phase, meta)
+            row["xy_cmd_mode"] = XY_CMD_MODE_PC
+            self.logger.log_row(row)
+
+    def _emit_pos_err(self, alt_m: float, meta: dict, phase: str) -> None:
+        """機上XY制御モード: CMD_POS_ERR(位置誤差ストリーム)を送信してログする。
+
+        roll/pitch 指令は機体側 XY PID が計算するため送らない(トリム
+        バイアスも送らない — 定常オフセットは機体側 I 項が吸収する)。
+        bit2(XY_ERR_VALID)は「閉ループ有効 かつ データ有効 かつ MoCap
+        非途絶」。無効時も**実誤差(クランプ後)をそのまま送る**: 機体側が
+        bit2=0 で水平指令+PID減衰を行い、PID の誤差履歴(prev_error)は
+        現実を追い続ける(PC 側計算 position.py と同じ規約。誤差を 0 に
+        すり替えると復帰1サンプル目に D 項スパイクを作る)。alt_ref /
+        yaw_ref の整形は既存の SetpointShaper 出力(呼び出し元)を使う。
+        """
+        yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
+        yaw_ref = float(meta.get("yaw_ref_rad") or 0.0) if yaw_ctrl_on else 0.0
+        xy_valid = (bool(meta.get("control_active"))
+                    and bool(meta.get("data_valid"))
+                    and not bool(meta.get("mocap_dropout")))
+        clamp = self._pos_err_clamp_m
+        err_x = max(-clamp, min(clamp, float(meta.get("error_x") or 0.0)))
+        err_y = max(-clamp, min(clamp, float(meta.get("error_y") or 0.0)))
+        heading = meta.get("mocap_heading_rad")
+        flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
+        if yaw_ctrl_on:
+            flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID
+        if xy_valid:
+            flags |= proto.CmdPosErr.FLAG_XY_ERR_VALID
+        if heading is not None:
+            flags |= proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
+        pos_err = proto.CmdPosErr(
+            err_x=err_x, err_y=err_y, alt_ref=alt_m, yaw_ref=yaw_ref,
+            mocap_yaw=float(heading or 0.0), flags=flags)
+        seq: Optional[int] = None
+        send_success = False
+        try:
+            seq = self.serial.send_pos_err(pos_err)
+            send_success = True
+        except SerialLinkError:
+            pass   # 切断検知は _on_serial_disconnect → supervisor が処理
+
+        if self.logger.active:
+            # 共有列(alt/yaw 等)はゼロ姿勢の CmdSetpoint 形で埋め、
+            # xy_cmd_mode 列で判別する(roll/pitch 指令は機体側で計算され、
+            # tlm_roll_ref_rad / tlm_pitch_ref_rad 列に現れる)。
+            row = self._build_log_row(
+                proto.CmdSetpoint(roll_ref=0.0, pitch_ref=0.0, alt_ref=alt_m,
+                                  yaw_ref=yaw_ref, flags=flags & 0x03),
+                seq, send_success, phase, meta)
+            row["xy_cmd_mode"] = XY_CMD_MODE_ONBOARD
+            row["cmd_err_x_m"] = err_x
+            row["cmd_err_y_m"] = err_y
+            row["cmd_xy_valid"] = xy_valid
+            row["cmd_mocap_yaw_deg"] = (None if heading is None
+                                        else heading * RAD_TO_DEG)
+            self.logger.log_row(row)
 
     def _build_log_row(self, setpoint: proto.CmdSetpoint, seq: Optional[int],
                        send_success: bool, phase: str, meta: dict) -> dict:
@@ -1140,7 +1337,8 @@ class SessionManager:
                     "consecutive_outliers", "data_source", "filter_threshold",
                     "tracking_valid", "rb_error", "frame_number", "marker_count",
                     "frame_dt_ms", "mocap_age_ms",
-                    "mocap_yaw_deg", "traj_mode", "traj_phase_rad"):
+                    "mocap_yaw_deg", "mocap_heading_deg",
+                    "traj_mode", "traj_phase_rad"):
             if key in meta:
                 row[key] = meta[key]
         if "marker_count" in meta:
@@ -1284,6 +1482,14 @@ class SessionManager:
             return
         self.calibration.on_cal_data(cal)
 
+    def _on_tlm_cal_data_node(self, node_id: int, frame: proto.Frame) -> None:
+        """ノード帰属つき TLM_CAL_DATA(MUX_DOWN 経由。RXスレッド上)。"""
+        try:
+            cal = proto.TlmCalData.from_payload(frame.payload)
+        except ValueError:
+            return
+        self.calibration.on_cal_data(cal, node_id=node_id)
+
     def _update_phase_from_drone(self, state: int, flags: int) -> None:
         """ドローンの報告状態から armed/flying/connected フェーズを更新する。"""
         flying_flag = bool(flags & proto.TlmState.FLAG_FLYING)
@@ -1382,8 +1588,83 @@ class SessionManager:
                 self.warn("MoCap 途絶 >2s: CMD_STOP を送信します(自動着陸)")
                 self.stop()
 
+        # --- 単機テレメトリ途絶(リレー再起動等のサイレント断)---
+        # リレーはターゲット設定を RAM のみに保持するため、リレーの再起動で
+        # 「シリアルは生きているが機体との転送だけ死んだ」ゾンビ接続になり得る
+        # (受信は空読み継続でリンク断とは検出されない)。TLM_STATE の途絶で
+        # 検出し、警告 + RLY_SET_TARGET の自動再設定で自己修復を試みる。
+        # 複数機モードはスロット別監視(multi.supervise)側の責務。
+        self._supervise_tlm_staleness(now)
+
         # --- 複数機モード(スロットごとの STOP 再送 / MoCap 途絶 / 猶予) ---
         self.multi.supervise(now)
+
+    def _supervise_tlm_staleness(self, now: float) -> None:
+        """単機経路のテレメトリ鮮度監視1周期(supervise から毎周期呼ばれる)。"""
+        if not self.serial.is_connected or self.multi.active:
+            return
+        with self._lock:
+            airframe = self._airframe
+            tlm_t = self._tlm_state_t
+            reference = tlm_t if tlm_t is not None else self._connected_at
+            stale = (reference is not None
+                     and now - reference > self._tlm_stale_s)
+            can_reassert = (airframe is not None
+                            and cfg.mac_is_set(airframe.get("mac")))
+            warn_stale = stale and not self._tlm_stale_warned
+            recovered = (not stale) and self._tlm_stale_warned
+            if warn_stale:
+                self._tlm_stale_warned = True
+            if recovered:
+                self._tlm_stale_warned = False
+            reassert = (stale and can_reassert
+                        and not self._relay_reassert_busy
+                        and (self._relay_reassert_at is None
+                             or now - self._relay_reassert_at
+                             >= self._relay_reassert_interval_s))
+            if reassert:
+                self._relay_reassert_busy = True
+                self._relay_reassert_at = now
+        if warn_stale:
+            if can_reassert:
+                self.warn(f"機体テレメトリが {self._tlm_stale_s:.0f}s 以上"
+                          "途絶しています。リレーターゲットを自動再設定します"
+                          "(リレー再起動などで設定が失われた可能性。機体の"
+                          "電源が入っていない場合はこの警告のままになります)")
+            else:
+                self.warn(f"機体テレメトリが {self._tlm_stale_s:.0f}s 以上"
+                          "途絶しています(機体プロファイルが未選択のため"
+                          "自動再設定はできません)")
+        if recovered:
+            self.info("機体テレメトリが回復しました")
+        if reassert:
+            # set_relay_target は ACK 待ちで最大約4秒ブロックするため、
+            # supervisor 本体(STOP 再送等の監視)を止めない専用スレッドで行う
+            threading.Thread(target=self._reassert_relay_target,
+                             args=(airframe,),
+                             name="relay-reassert", daemon=True).start()
+
+    def _reassert_relay_target(self, airframe: dict) -> None:
+        """テレメトリ途絶時の RLY_SET_TARGET 再送(supervisor 起点の別スレッド)。
+
+        UI コマンド(connect / select_airframe)と交錯しないよう _command_lock を
+        短いタイムアウト付きで取得し、取れなければ今回は見送る(次周期に再試行)。
+        ロック待ちの間に機体選択が変わり得るため、取得後にスナップショットが
+        現在の選択と同一であることを確認してから送る(古いターゲットへ
+        黙って戻さない)。
+        """
+        acquired = self._command_lock.acquire(timeout=_REASSERT_LOCK_TIMEOUT_S)
+        try:
+            if acquired and self.serial.is_connected and not self.multi.active:
+                with self._lock:
+                    still_current = self._airframe is airframe
+                if still_current:
+                    self._configure_relay_target(airframe, quiet_ok=True)
+        finally:
+            if acquired:
+                self._command_lock.release()
+            with self._lock:
+                self._relay_reassert_busy = False
 
     def _send_stop(self) -> bool:
         try:
@@ -1527,6 +1808,7 @@ class SessionManager:
         session = {
             "mode": mode,
             "phase": phase,
+            "xy_cmd_mode": self._xy_command_mode,
             "serial_connected": self.serial.is_connected,
             "airframe": airframe["name"] if airframe else None,
             "relay_target_ok": relay_target_ok,

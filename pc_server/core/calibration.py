@@ -548,6 +548,8 @@ class CalibrationManager:
         self._lock = threading.Lock()
         self._cal_data: Optional[proto.TlmCalData] = None
         self._cal_data_at = 0.0
+        # マルチ機体: ノード別 TLM_CAL_DATA スロット {node: (cal, monotonic)}
+        self._cal_data_by_node: dict[int, tuple[proto.TlmCalData, float]] = {}
         self._mag3d_fit: Optional[dict] = None
         self._mag3d_error: Optional[str] = None
         self._accel6 = Accel6Calibrator()
@@ -555,23 +557,47 @@ class CalibrationManager:
 
     # ---- TLM_CAL_DATA 流入(RXスレッド上) ----
 
-    def on_cal_data(self, cal: proto.TlmCalData) -> None:
-        with self._lock:
-            self._cal_data = cal
-            self._cal_data_at = time.time()
+    def on_cal_data(self, cal: proto.TlmCalData,
+                    node_id: Optional[int] = None) -> None:
+        """TLM_CAL_DATA の格納(RXスレッド上)。
 
-    def fetch_cal_data(self) -> Optional[proto.TlmCalData]:
-        """CMD_CAL_GET → TLM_CAL_DATA を待つ(タイムアウトで None)。"""
-        requested_at = time.time()
+        node_id 付き(MUX_DOWN 経由)はノード別スロットへ、単機経路は従来の
+        共有スロットへ格納する。遅延到着した別ノードの応答が他機の
+        fetch_cal_data を満たさないよう、スロットを分離して帰属を保証する。
+        """
+        with self._lock:
+            if node_id is None:
+                self._cal_data = cal
+                self._cal_data_at = time.monotonic()
+            else:
+                self._cal_data_by_node[node_id] = (cal, time.monotonic())
+
+    def fetch_cal_data(self, node_id: Optional[int] = None
+                       ) -> Optional[proto.TlmCalData]:
+        """CMD_CAL_GET → TLM_CAL_DATA を待つ(タイムアウトで None)。
+
+        node_id 指定時はマルチ機体モードのノード宛に要求し、**当該ノード帰属の
+        応答のみ**(ノード別スロット+要求時刻ゲート)を受理する。
+        """
+        requested_at = time.monotonic()
         try:
-            self.link.send(proto.MsgType.CMD_CAL_GET)
+            if node_id is None:
+                self.link.send(proto.MsgType.CMD_CAL_GET)
+            else:
+                self.link.send_to(node_id, proto.MsgType.CMD_CAL_GET)
         except SerialLinkError:
             return None
-        deadline = time.time() + self._cal_get_timeout_s
-        while time.time() < deadline:
+        deadline = time.monotonic() + self._cal_get_timeout_s
+        while time.monotonic() < deadline:
             with self._lock:
-                if self._cal_data is not None and self._cal_data_at >= requested_at:
-                    return self._cal_data
+                if node_id is None:
+                    if self._cal_data is not None \
+                            and self._cal_data_at >= requested_at:
+                        return self._cal_data
+                else:
+                    entry = self._cal_data_by_node.get(node_id)
+                    if entry is not None and entry[1] >= requested_at:
+                        return entry[0]
             time.sleep(CAL_DATA_POLL_S)
         return None
 

@@ -234,8 +234,12 @@ StampFly_Integrated_Control_V2/
   - Multi時(v2): `{"type":"command","action":"multi_select","names":[...]}`
     (2〜4機の選択適用 → RLY_SET_PEERS)/
     `{"type":"multi_target","name":..,"x":..,"y":..,"z":..}`(機体別目標)/
-    `{"type":"command","action":"multi_start"}`(一斉離陸)。
-    `stop` は全機一斉(§複数機モード)
+    `{"type":"command","action":"multi_start"}`(一斉離陸)/
+    `{"type":"command","action":"multi_yaw","name":..,"enabled":bool,
+    "yaw_deg":..}`(機体別ヨー角制御 ON/OFF+目標 ±180°)。
+    `stop` は全機一斉(§複数機モード)。
+    `/api/ffprofile` の `apply`/`mode`/`anchor` は `"drone":name` 指定で
+    機体別(ノード宛+MAC 別適用状態 `applied_by_mac`)になる
   - `{"type":"command","action":"set_logging","enabled":bool}`
   - v2 追加コマンド: `"experiment_activate"` / `"set_yaw_control"` /
     `"circle_start"`(center_x/center_y/radius_m/period_s/clockwise/alt_m/face_tangent)/
@@ -351,7 +355,8 @@ _enter_experiment / _exit_experiment)と
   `tlm_state_div`(1 = 間引きなし。リレーが node 別に TLM_STATE のみ 1/n 間引き)/
   `target_xy_abs_max_m`(2.0)/ `min_target_separation_m`(0.5)/
   `tlm_timeout_s`(3.0)/ `start_ground_z_max_m`(0.3)/
-  `divergence_error_m`(1.0)/ `divergence_hold_s`(1.0)。
+  `divergence_error_m`(1.0)/ `divergence_hold_s`(1.0)/
+  `max_yaw_ctrl_deg`(30.0 — UI 側 `UI.MULTI_YAW_LIMIT_DEG` と同値に保つ)。
 - **UART 帯域**: シリアルは既定 **460800**(リレー `RELAY_UART_BAUD` と
   server.json `serial.baudrate` を必ず一致させる)。下り TLM_STATE ≈146B
   (ワイヤ)×25Hz ≈3.7KB/s/機(マルチ時は +MUX 包装 ≈11B)。
@@ -359,8 +364,21 @@ _enter_experiment / _exit_experiment)と
   460800(≈46KB/s。4機下り ≈33%、上り 4×50Hz CMD_SETPOINT ≈21%)へ移行した。
   460800 非対応の USB シリアルブリッジは firmware_relay の `release-115200` env
   +`serial.baudrate`=115200 で運用し、2機まで+`multi.tlm_state_div` 間引きで補う。
-- **v1 スコープ**: 静的目標のみ(円軌道なし)・ヨー角制御 OFF・multi モード中の
-  CSV ログなし。
+- **機体別ヨー角制御(v2)**: `multi_yaw` で機体ごとに ON/OFF+目標を選択
+  できる。目標は ±`multi.max_yaw_ctrl_deg`(既定 30°)に制限する —
+  XY 位置ループは制御座標系固定(ワールド誤差 → roll/pitch にヨー回転補償
+  なし)のため、大きなヨー保持は XY 制御の実効ゲインを cos(ψ) に落とす
+  (90°で直交、180°で正帰還。単機の接線ヨーも同じ性質)。目標は各スロットの
+  SetpointShaper が最短経路 wrap+45°/s 制限で整形(単機のヨースライダと
+  同一経路)。OFF の機体は flags bit1=0(レートダンピング)。MoCap 途絶中の
+  機体へのヨー変更は拒否。est_mode=1 で EKF 不健全時は機体側が自動で
+  レートダンピングに縮退する(単機 §13 と同一のファーム側フェイルセーフ)。
+- **機体別 FF プロファイル(v2)**: `/api/ffprofile` の `apply`/`mode`/`anchor`
+  に `"drone":name` を指定するとノード宛(RLY_MUX_UP + ノード別 TLM_ACK/
+  TLM_CAL_DATA 照合)で実行される。適用状態は `ff_state.json` の
+  `applied_by_mac[mac]` に機体別記録(単機の `applied` とは独立)。
+  飛行中(armed/flying)の機体への FF 操作は拒否される。
+- **スコープ**: 静的目標のみ(円軌道なし)・multi モード中の CSV ログなし。
 
 ## 安全クランプ(多層)
 

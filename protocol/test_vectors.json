@@ -55,6 +55,40 @@
       "wire_hex": "0402120201010e110ad7a33c0ad7233ccdcccc3e010101040192c200"
     },
     {
+      "name": "cmd_pos_err_all_flags",
+      "payload_kind": "CMD_POS_ERR",
+      "type": 36,
+      "seq": 3,
+      "fields": {
+        "err_x": 0.35,
+        "err_y": -0.2,
+        "alt_ref": 0.5,
+        "yaw_ref": 1.5708,
+        "mocap_yaw": 1.62,
+        "flags": 15
+      },
+      "payload_hex": "3333b33ecdcc4cbe0000003ff90fc93f295ccf3f0f",
+      "logical_hex": "022403000000153333b33ecdcc4cbe0000003ff90fc93f295ccf3f0f9ce3",
+      "wire_hex": "0402240301010a153333b33ecdcc4cbe01010d3ff90fc93f295ccf3f0f9ce300"
+    },
+    {
+      "name": "cmd_pos_err_xy_invalid",
+      "payload_kind": "CMD_POS_ERR",
+      "type": 36,
+      "seq": 4,
+      "fields": {
+        "err_x": 0.0,
+        "err_y": 0.0,
+        "alt_ref": 0.3,
+        "yaw_ref": 0.0,
+        "mocap_yaw": 0.0,
+        "flags": 1
+      },
+      "payload_hex": "00000000000000009a99993e000000000000000001",
+      "logical_hex": "0224040000001500000000000000009a99993e0000000000000000010e5f",
+      "wire_hex": "040224040101021501010101010101059a99993e0101010101010104010e5f00"
+    },
+    {
       "name": "tlm_state_full",
       "payload_kind": "TLM_STATE",
       "type": 48,

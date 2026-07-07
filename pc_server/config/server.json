@@ -15,6 +15,7 @@
     "min_target_separation_m": 0.5,
     "tlm_timeout_s": 3.0,
     "start_ground_z_max_m": 0.3,
+    "max_yaw_ctrl_deg": 30.0,
     "divergence_error_m": 1.0,
     "divergence_hold_s": 1.0
   },
@@ -53,7 +54,9 @@
     "target_ack_timeout_s": 1.0,
     "target_ack_max_retries": 3,
     "command_ack_timeout_s": 1.0,
-    "command_ack_max_retries": 2
+    "command_ack_max_retries": 2,
+    "tlm_stale_s": 3.0,
+    "relay_reassert_interval_s": 10.0
   },
   "experiment": {
     "motor_keepalive_s": 0.4,

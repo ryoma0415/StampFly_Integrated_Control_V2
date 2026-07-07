@@ -40,6 +40,14 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             alt_ref=f32(rng.uniform(0.0, 1.5)),
             yaw_ref=f32(rng.uniform(-3.15, 3.15)),
             flags=rng.randrange(256))
+    if msg_type == sp.MsgType.CMD_POS_ERR:
+        return sp.CmdPosErr(
+            err_x=f32(rng.uniform(-2.0, 2.0)),
+            err_y=f32(rng.uniform(-2.0, 2.0)),
+            alt_ref=f32(rng.uniform(0.0, 1.5)),
+            yaw_ref=f32(rng.uniform(-3.15, 3.15)),
+            mocap_yaw=f32(rng.uniform(-3.15, 3.15)),
+            flags=rng.randrange(256))
     if msg_type == sp.MsgType.CMD_MODE:
         return sp.CmdMode(mode=rng.randrange(2))
     if msg_type == sp.MsgType.CMD_MOTOR_RUN:

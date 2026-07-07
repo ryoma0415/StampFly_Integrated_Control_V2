@@ -337,6 +337,16 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.flags = ju8(f, "flags");
     ok = serialize(m, buf, sizeof(buf));
     n = CmdSetpoint::PAYLOAD_SIZE;
+  } else if (kind == "CMD_POS_ERR") {
+    CmdPosErr m;
+    m.err_x = jf(f, "err_x");
+    m.err_y = jf(f, "err_y");
+    m.alt_ref = jf(f, "alt_ref");
+    m.yaw_ref = jf(f, "yaw_ref");
+    m.mocap_yaw = jf(f, "mocap_yaw");
+    m.flags = ju8(f, "flags");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdPosErr::PAYLOAD_SIZE;
   } else if (kind == "CMD_MODE") {
     CmdMode m;
     m.mode = ju8(f, "mode");
@@ -610,6 +620,10 @@ std::vector<uint8_t> reserialize_payload(const std::string& kind,
     CmdSetpoint m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
     n = CmdSetpoint::PAYLOAD_SIZE;
+  } else if (kind == "CMD_POS_ERR") {
+    CmdPosErr m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdPosErr::PAYLOAD_SIZE;
   } else if (kind == "CMD_MODE") {
     CmdMode m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));

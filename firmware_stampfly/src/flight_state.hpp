@@ -82,16 +82,34 @@ struct ControlOutputState {
     uint8_t Yaw_ctrl_active = 0;         // ヨー角度制御が実際に効いているか(ff_status bit5)
 };
 
-// CMD_SETPOINT の適用追跡(seq_echo・リンク鮮度の根拠)
+// XY 指令ソース(最後に受信したストリームが姿勢指令の出どころを決める)
+enum XyCommandSource : uint8_t {
+    XY_SOURCE_ATTITUDE = 0,  // CMD_SETPOINT: PC 計算の roll/pitch 角度指令
+    XY_SOURCE_POS_ERR = 1,   // CMD_POS_ERR: 位置誤差 → 機上XY PID(ヨー回転補償)
+};
+
+// CMD_SETPOINT / CMD_POS_ERR の適用追跡(seq_echo・リンク鮮度の根拠)。
+// last_setpoint_ms / setpoint_received / applied_setpoint_seq は両ストリーム
+// 共有のハートビート(既存フェイルセーフ: >200ms 水平保持 / >500ms 自動着陸)。
 struct CommandTrackingState {
-    bool setpoint_received = false;     // 一度でも有効なsetpointを受けたか
-    uint32_t applied_setpoint_seq = 0;  // 最後に適用した CMD_SETPOINT の seq(未受信なら0)
-    uint32_t last_setpoint_ms = 0;      // 最後のsetpoint受信時刻 [ms]
-    float target_roll_rad = 0.0f;       // 受信した姿勢目標 [rad]
+    bool setpoint_received = false;     // 一度でも有効なsetpoint/pos_errを受けたか
+    uint32_t applied_setpoint_seq = 0;  // 最後に適用したフレームの seq(未受信なら0)
+    uint32_t last_setpoint_ms = 0;      // 最後の受信時刻 [ms]
+    float target_roll_rad = 0.0f;       // 受信した姿勢目標 [rad](XY_SOURCE_ATTITUDE)
     float target_pitch_rad = 0.0f;
     // --- v2: CMD_SETPOINT 17B(yaw_ref / flags bit1) ---
     float target_yaw_rad = 0.0f;        // 受信したヨー角目標 [rad](target_yaw_valid時のみ有効)
     bool target_yaw_valid = false;      // flags bit1 = ヨー角制御ON
+    // --- v2.1: CMD_POS_ERR(機上XY位置制御) ---
+    XyCommandSource xy_source = XY_SOURCE_ATTITUDE;  // 最後に受信したストリーム
+    float pos_err_x_m = 0.0f;           // 受信した位置誤差(制御座標系)[m]
+    float pos_err_y_m = 0.0f;
+    bool pos_err_xy_valid = false;      // flags bit2(MoCap 新鮮+閉ループ有効)
+    float pos_mocap_yaw_rad = 0.0f;     // 受信した MoCap 実測ヨー [rad](診断用)
+    bool pos_mocap_yaw_valid = false;   // flags bit3
+    uint32_t last_pos_err_ms = 0;       // 最後の pos_err 受信時刻 [ms]
+    uint32_t prev_pos_err_ms = 0;       // 1つ前の受信時刻(XY PID の dt 根拠)[ms]
+    bool pos_err_fresh_sample = false;  // 未処理の新サンプルがあるか(XY PID が消費)
 };
 
 struct FlightControlState {

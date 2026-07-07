@@ -229,11 +229,16 @@ class FfProfileManager:
             applied = {**applied, "verified": bool(state.get("verified"))}
         else:
             applied = None
+        # マルチ機体: 機体(MAC)別の適用状態(verified は各エントリ内に持つ)
+        applied_by_mac = state.get("applied_by_mac")
+        if not isinstance(applied_by_mac, dict):
+            applied_by_mac = {}
         with self._lock:
             busy = self.busy
             message = self.message
         return {"profiles": profiles, "folders": folders,
                 "loose_stems": loose_stems, "applied": applied,
+                "applied_by_mac": applied_by_mac,
                 "busy": busy, "message": message}
 
     # ---- 排他(キャリブプロファイルとスロット共有) ----
@@ -347,11 +352,18 @@ class FfProfileManager:
 
     # ---- 適用 ----
 
-    def _send_step(self, msg_type: int, payload: bytes) -> tuple[bool, str]:
+    def _send_step(self, msg_type: int, payload: bytes,
+                   node_id: Optional[int] = None) -> tuple[bool, str]:
         """1コマンドを ACK 待ち+リトライ付きで送る(リトライは serial_link
-        側の send_with_ack が行う: 1.0s × 最大2回再送)。"""
+        側の send_with_ack が行う: 1.0s × 最大2回再送)。
+
+        node_id 指定時はマルチ機体モードのノード宛(RLY_MUX_UP 経由)。
+        """
         try:
-            ack = self.link.send_with_ack(msg_type, payload)
+            if node_id is None:
+                ack = self.link.send_with_ack(msg_type, payload)
+            else:
+                ack = self.link.send_with_ack_to(node_id, msg_type, payload)
         except SerialLinkError as exc:
             return False, f"送信失敗: {exc}"
         return ack_ok(ack), ack_detail(ack)
@@ -375,11 +387,20 @@ class FfProfileManager:
         return est if est in (proto.CmdFfMode.EST_MODE_COMPLEMENTARY,
                               proto.CmdFfMode.EST_MODE_EKF) else default
 
-    def _read_back_ff(self) -> Optional[proto.TlmCalData]:
-        return self.calibration.fetch_cal_data()
+    def _read_back_ff(self, node_id: Optional[int] = None
+                      ) -> Optional[proto.TlmCalData]:
+        return self.calibration.fetch_cal_data(node_id)
 
     def apply(self, name: Any, ff: Any = None, est: Any = None,
-              force: bool = False) -> dict[str, Any]:
+              force: bool = False, node_id: Optional[int] = None,
+              mac: Optional[str] = None) -> dict[str, Any]:
+        """FF プロファイルを適用する。
+
+        node_id / mac 指定時はマルチ機体モードのノード宛に適用し、適用状態は
+        ff_state.json の applied_by_mac[mac] に記録する(単機の "applied" は
+        触らない)。機体別の較正・FF は各機体の NVS に永続化されるため、
+        本メソッドの分割転送+CRC 照合の手順は単機と完全に同一。
+        """
         clean = sanitize_profile_name(name)
         path = self.profile_dir / f"{clean}.json"
         if not clean or not path.is_file():
@@ -399,7 +420,7 @@ class FfProfileManager:
         try:
             # 1. binding 照合: プロファイルは取得時の mag3d 空間に固有
             #    (dB は補正後フレームで計測されている)
-            cal = self._read_back_ff()
+            cal = self._read_back_ff(node_id)
             if cal is None:
                 return self._fail("機体から TLM_CAL_DATA を取得できませんでした"
                                   "(リンク/機体状態を確認)")
@@ -426,13 +447,13 @@ class FfProfileManager:
             steps.append((proto.MsgType.CMD_FF_COMMIT,
                           proto.CmdFfCommit(crc32=crc).to_payload()))
             for msg_type, payload in steps:
-                ok, detail = self._send_step(msg_type, payload)
+                ok, detail = self._send_step(msg_type, payload, node_id)
                 if not ok:
                     if msg_type == proto.MsgType.CMD_FF_COMMIT:
                         # commit は ACK ロストでも成功している可能性がある
                         # (再送は「ステージングなし」で失敗し得る)。
                         # 読み戻して CRC を照合してから諦める。
-                        data = self._read_back_ff()
+                        data = self._read_back_ff(node_id)
                         if (data is not None
                                 and (data.valid_flags
                                      & proto.TlmCalData.VALID_FFCAL)
@@ -441,7 +462,7 @@ class FfProfileManager:
                     return self._fail(
                         f"{proto.MsgType(msg_type).name} が失敗しました: {detail}")
             # 3. 読み戻して valid + CRC を検証
-            data = self._read_back_ff()
+            data = self._read_back_ff(node_id)
             if data is None:
                 return self._fail("CAL_GET の応答がありません", verified=False)
             got_valid = bool(data.valid_flags & proto.TlmCalData.VALID_FFCAL)
@@ -453,20 +474,34 @@ class FfProfileManager:
             ok, detail = self._send_step(
                 proto.MsgType.CMD_FF_MODE,
                 proto.CmdFfMode(ff_mode=ff_value,
-                                est_mode=est_value).to_payload())
+                                est_mode=est_value).to_payload(), node_id)
             if not ok:
                 return self._fail(f"CMD_FF_MODE が失敗しました: {detail}",
                                   verified=True, crc=f"{crc:08x}")
-            # 4. 適用状態の永続化(crc は yaw側スキーマと同じ hex8 文字列)
-            self._save_state({
-                "applied": {"name": clean, "memo": str(profile.get("memo", "")),
-                            "applied_at": time.time(), "crc": f"{crc:08x}",
-                            "ff": ff_value, "est": est_value},
-                "verified": True,
-            })
+            # 4. 適用状態の永続化(crc は yaw側スキーマと同じ hex8 文字列)。
+            #    機体(MAC)指定時は applied_by_mac に、単機は従来の "applied" に
+            applied_entry = {"name": clean, "memo": str(profile.get("memo", "")),
+                             "applied_at": time.time(), "crc": f"{crc:08x}",
+                             "ff": ff_value, "est": est_value}
+            if mac is not None:
+                state = self._load_state()
+                by_mac = state.get("applied_by_mac")
+                if not isinstance(by_mac, dict):
+                    by_mac = {}
+                by_mac[mac] = {**applied_entry, "verified": True}
+                state["applied_by_mac"] = by_mac
+                self._save_state(state)
+            else:
+                self._save_state({
+                    **{k: v for k, v in self._load_state().items()
+                       if k == "applied_by_mac"},
+                    "applied": applied_entry,
+                    "verified": True,
+                })
             forced = "(force適用)" if (diffs and force) else ""
+            target = f" → {mac}" if mac else ""
             self._set_message(f"適用・CRC照合OK: {clean}{forced}"
-                              f"(ff={ff_value}, est={est_value})")
+                              f"(ff={ff_value}, est={est_value}){target}")
             return {"ok": True, "verified": True, "crc": f"{crc:08x}",
                     "name": clean, **self.status()}
         finally:
@@ -474,7 +509,8 @@ class FfProfileManager:
 
     # ---- モード / アンカー / 削除 ----
 
-    def mode(self, ff: Any, est: Any) -> dict[str, Any]:
+    def mode(self, ff: Any, est: Any, node_id: Optional[int] = None,
+             mac: Optional[str] = None) -> dict[str, Any]:
         busy = self._begin()
         if busy:
             return self._fail(busy)
@@ -482,38 +518,52 @@ class FfProfileManager:
             # 排他スロットを取ってから状態を読む(read-modify-write が
             # 並行 apply() と競合しない — yaw側の no-TOCTOU 踏襲)
             state = self._load_state()
-            applied = (state.get("applied")
-                       if isinstance(state.get("applied"), dict) else None)
+            if mac is not None:
+                by_mac = state.get("applied_by_mac")
+                applied = (by_mac.get(mac)
+                           if isinstance(by_mac, dict)
+                           and isinstance(by_mac.get(mac), dict) else None)
+            else:
+                applied = (state.get("applied")
+                           if isinstance(state.get("applied"), dict) else None)
+            # 状態ファイル由来の値も clamp 経由で無害化する(壊れた
+            # ff_state.json の null/文字列で int() が例外を出さないように)
             ff_value = self._clamp_ff(
-                ff, default=(int(applied.get("ff", FF_MODE_DEFAULT))
+                ff, default=(self._clamp_ff(applied.get("ff"))
                              if applied else FF_MODE_DEFAULT))
             est_value = self._clamp_est(
-                est, default=(int(applied.get("est", EST_MODE_DEFAULT))
+                est, default=(self._clamp_est(applied.get("est"))
                               if applied else EST_MODE_DEFAULT))
             ok, detail = self._send_step(
                 proto.MsgType.CMD_FF_MODE,
                 proto.CmdFfMode(ff_mode=ff_value,
-                                est_mode=est_value).to_payload())
+                                est_mode=est_value).to_payload(), node_id)
             if not ok:
                 return self._fail(f"CMD_FF_MODE が失敗しました: {detail}")
             if applied is not None:
                 applied["ff"] = ff_value
                 applied["est"] = est_value
-                state["applied"] = applied
+                if mac is not None:
+                    state["applied_by_mac"][mac] = applied
+                else:
+                    state["applied"] = applied
                 self._save_state(state)
+            target = f" → {mac}" if mac else ""
             self._set_message(
-                f"ffモードを変更しました(ff={ff_value}, est={est_value})")
+                f"ffモードを変更しました(ff={ff_value}, est={est_value})"
+                f"{target}")
             return {"ok": True, "ff": ff_value, "est": est_value,
                     **self.status()}
         finally:
             self._end()
 
-    def anchor(self) -> dict[str, Any]:
+    def anchor(self, node_id: Optional[int] = None) -> dict[str, Any]:
         busy = self._begin()
         if busy:
             return self._fail(busy)
         try:
-            ok, detail = self._send_step(proto.MsgType.CMD_FF_ANCHOR, b"")
+            ok, detail = self._send_step(proto.MsgType.CMD_FF_ANCHOR, b"",
+                                         node_id)
             if not ok:
                 return self._fail(f"アンカー再取得に失敗しました: {detail}")
             self._set_message("アンカーを再取得しました")

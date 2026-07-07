@@ -36,6 +36,35 @@ struct FlightConfig {
     PidGainConfig yaw_angle{3.0f, 10.0f, 0.0f, 0.125f};
     float yaw_rate_limit_rad_s = 1.0f;      // psi_pid 出力クランプ [rad/s]
 
+    // --- 機上XY位置制御(v2.1: CMD_POS_ERR。位置誤差 → roll/pitch 角度指令) ---
+    // アルゴリズム・数値は PC 側で飛行実績のある core/pid.py +
+    // config/control.json("pid" 節)と config/server.json("clamps" 節の
+    // slew_rate_deg_per_s)を踏襲する。PC 側計算(CMD_SETPOINT)との違いは
+    // 誤差を機体ヨー推定で機体座標系へ回転(ヨー回転補償)してから PID に
+    // 入れる点のみ。
+    float pos_kp = 0.139f;                   // control.json pid.x/y.kp
+    float pos_ki = 0.020f;                   // control.json pid.x/y.ki
+    float pos_kd = 0.204f;                   // control.json pid.x/y.kd
+    float pos_output_limit_rad = 0.087f;     // 出力クランプ ≈±5°(control.json output_limit)
+    float pos_d_filter_alpha = 0.6f;         // D項LPF係数(control.json d_filter_alpha)
+    float pos_i_decay_rate = 0.98f;          // 異常回復期間の I 項減衰率
+    float pos_i_update_threshold_m = 0.3f;   // I 項を更新する誤差上限 [m]
+    float pos_invalid_i_decay = 0.995f;      // データ無効時の I 項微減衰率(pc pid.py と同値)
+    float pos_invalid_d_scale = 0.3f;        // データ無効時の D 項抑制係数(同上)
+    uint8_t pos_anomaly_recovery_ticks = 10; // 異常回復後に I 項を減衰させ続ける回数(同上)
+    float pos_integral_error_factor_gain = 2.0f;  // 動的アンチワインドアップの誤差感度(同上)
+    float pos_initial_dt_s = 0.02f;          // 初回/異常 dt の仮値(50Hz 想定)
+    float pos_min_dt_s = 0.001f;             // これ未満の dt はスキップ(ゼロ除算防止)
+    float pos_max_dt_s = 0.1f;               // これ超過は dt 仮値+D項再シード(途絶復帰時のD項暴れ防止)
+    float pos_dt_floor_s = 0.01f;            // D項計算の dt 下限(ESP-NOW バースト受信によるD項スパイク防止)
+    float pos_slew_rad_per_s = 30.0f * (float)M_PI / 180.0f;  // 出力スルーレート(server.json clamps と同値)
+    float pos_err_clamp_m = 2.0f;            // 受信誤差の安全クランプ [m]
+    // ヨー回転補償の符号。機体ヨー推定(Madgwick/EKF)の正方向が制御座標系
+    // ヨー(上から見て CCW 正)と一致していれば +1。地上検証(機体を手で
+    // +90° 回して TLM の roll_ref/pitch_ref の符号応答、または PC ログの
+    // mocap_heading_deg と tlm_yaw_est の追従方向を比較)で確認すること。
+    float pos_ctrl_yaw_sign = 1.0f;
+
     // --- 制御ループ周期 ---
     float control_period_s = 0.0025f;       // 400Hz 制御周期 [s]
     uint32_t loop_period_us = 2500;         // タイマアラーム周期 [µs]

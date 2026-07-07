@@ -74,6 +74,7 @@ class MsgType(IntEnum):
     CMD_FF_COMMIT = 0x21
     CMD_FF_MODE = 0x22
     CMD_FF_ANCHOR = 0x23
+    CMD_POS_ERR = 0x24
     # 下り(ドローン -> PC): 0x30–0x4F
     TLM_STATE = 0x30
     TLM_EVENT = 0x31
@@ -297,6 +298,7 @@ def encode_wire(msg_type: int, seq: int, payload: bytes = b"") -> bytes:
 # ---------------------------------------------------------------------------
 
 _CMD_SETPOINT_FMT = "<ffffB"
+_CMD_POS_ERR_FMT = "<fffffB"
 _CMD_MODE_FMT = "<B"
 _CMD_MOTOR_RUN_FMT = "<fB"
 _CMD_MAG3D_SET_FMT = "<B3f9f"
@@ -324,6 +326,7 @@ _RLY_PEERS_ACK_FMT = "<BBBB"
 # PROTOCOL.md 記載のペイロードサイズと一致することを import 時に強制
 # (C++ 側の static_assert に対応)
 assert struct.calcsize(_CMD_SETPOINT_FMT) == 17
+assert struct.calcsize(_CMD_POS_ERR_FMT) == 21
 assert struct.calcsize(_CMD_MODE_FMT) == 1
 assert struct.calcsize(_CMD_MOTOR_RUN_FMT) == 5
 assert struct.calcsize(_CMD_MAG3D_SET_FMT) == 49
@@ -379,6 +382,45 @@ class CmdSetpoint:
     def from_payload(cls, data: bytes) -> "CmdSetpoint":
         _check_len("CMD_SETPOINT", data, cls.PAYLOAD_SIZE)
         return cls(*struct.unpack(_CMD_SETPOINT_FMT, data))
+
+
+@dataclass
+class CmdPosErr:
+    """0x24 CMD_POS_ERR(21B)— XY 位置誤差+高度+ヨー目標(機上XY制御モード)。
+
+    CMD_SETPOINT の代替ストリーム(50Hz、ハートビート兼用)。PC は roll/pitch
+    角度指令の代わりに制御座標系の位置誤差(目標 − フィルタ済み現在位置)を
+    送り、機体側が自身のヨー推定で誤差を機体座標系へ回転(ヨー回転補償)
+    してから XY PID を回す。alt_ref / yaw_ref / flags bit0-1 の意味は
+    CMD_SETPOINT と同一。
+
+    mocap_yaw は MoCap 実測の制御座標系ヨー(リジッドボディ前方軸の方位、
+    ±π)。機体側のヨー推定とのフレーム整合検証・ログ用途で、bit3 が立って
+    いる場合のみ有効(機体制御は自身のヨー推定を用いる)。
+    """
+    err_x: float = 0.0      # m(制御座標系。target - filtered)
+    err_y: float = 0.0      # m
+    alt_ref: float = 0.0    # m
+    yaw_ref: float = 0.0    # rad(±π、機体ヨー角目標)
+    mocap_yaw: float = 0.0  # rad(±π、MoCap 実測ヨー。bit3 有効時のみ)
+    flags: int = 0
+
+    TYPE = MsgType.CMD_POS_ERR
+    PAYLOAD_SIZE = 21
+    FLAG_ALT_REF_VALID = 0x01    # bit0(CMD_SETPOINT と同義)
+    FLAG_YAW_REF_VALID = 0x02    # bit1(同上)
+    FLAG_XY_ERR_VALID = 0x04     # bit2: err_x/err_y 有効(MoCap 新鮮+閉ループ有効)
+    FLAG_MOCAP_YAW_VALID = 0x08  # bit3: mocap_yaw 有効
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_POS_ERR_FMT, self.err_x, self.err_y,
+                           self.alt_ref, self.yaw_ref, self.mocap_yaw,
+                           self.flags)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdPosErr":
+        _check_len("CMD_POS_ERR", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_POS_ERR_FMT, data))
 
 
 @dataclass
@@ -674,7 +716,7 @@ class TlmState:
     v2: 末尾追加のみ(既存オフセット 0–96 は v1 と不変。serial_link.py が
     seq_echo を先頭オフセット直読みするため末尾追加限定)。
     """
-    seq_echo: int = 0        # 最後に適用した CMD_SETPOINT の seq(未受信なら0)
+    seq_echo: int = 0        # 最後に適用した CMD_SETPOINT / CMD_POS_ERR の seq(未受信なら0)
     elapsed_ms: int = 0      # 起動からの経過 [ms]
     state: int = 0           # FlightState
     flags: int = 0           # bit0 low_voltage, bit1 setpoint_fresh(<200ms), bit2 flying
@@ -1214,6 +1256,7 @@ EMPTY_PAYLOAD_TYPES = frozenset({
 # 型 -> ペイロードクラス(可変長 LOG_TEXT を含む)
 PAYLOAD_CLASSES = {
     MsgType.CMD_SETPOINT: CmdSetpoint,
+    MsgType.CMD_POS_ERR: CmdPosErr,
     MsgType.CMD_MODE: CmdMode,
     MsgType.CMD_MOTOR_RUN: CmdMotorRun,
     MsgType.CMD_MAG3D_SET: CmdMag3dSet,
@@ -1249,6 +1292,7 @@ EXPECTED_PAYLOAD_SIZE: dict[MsgType, Optional[int]] = {
     MsgType.CMD_START: 0,
     MsgType.CMD_STOP: 0,
     MsgType.CMD_SETPOINT: CmdSetpoint.PAYLOAD_SIZE,
+    MsgType.CMD_POS_ERR: CmdPosErr.PAYLOAD_SIZE,
     MsgType.CMD_RESET: 0,
     MsgType.CMD_MODE: CmdMode.PAYLOAD_SIZE,
     MsgType.CMD_MOTOR_RUN: CmdMotorRun.PAYLOAD_SIZE,

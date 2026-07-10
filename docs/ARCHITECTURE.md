@@ -127,9 +127,10 @@ StampFly_Integrated_Control_V2/
 │   │   │                  地磁気47都道府県・キャリブプロファイル保存/適用/照合)
 │   │   ├── ffprofile.py   v2: FfProfileManager(FF抽出サブプロセス・CMD_FF_* 分割転送・
 │   │   │                  CRC照合・ff_state.json)
-│   │   └── logger.py      CSVログ(ON時のみ)。logs/YYYYMMDD_HHMMSS_<mode>.csv。
+│   │   └── logger.py      CSVログ(START〜飛行終了)。logs/flight_logs/
+│   │                      <日時>_<mode>.csv(Multi は機体ごと <日時>_multi_<機体名>.csv)。
 │   │                      50Hz制御行+最新テレメトリ/mocapスナップショット結合。
-│   │                      列定義は docs/LOG_STRUCTURE.md と1対1(v2: 94列)
+│   │                      列定義は docs/LOG_STRUCTURE.md と1対1(v3: 100列)
 │   ├── config/
 │   │   ├── server.json    ポート既定値, serial(baudrate 既定 460800), レート,
 │   │   │                  クランプ(v2: max_yaw_deg, yaw_slew_rate_deg_per_s),
@@ -145,7 +146,7 @@ StampFly_Integrated_Control_V2/
 │   │   ├── sweep_results/         スイープ CSV+meta(サブフォルダで8本1セット管理可)
 │   │   ├── ff_profiles/           FFプロファイル JSON(stampfly_ff_profile v1)
 │   │   ├── calibration_profiles/  キャリブプロファイル JSON(stampfly_calibration_profile v1)
-│   │   ├── yaw_eval_results/      旧形式 yawlog(data_analysis/analyze_yaw_eval.py 用)
+│   │   ├── yaw_eval_results/      旧形式 yawlog 置き場(レガシー。専用解析スクリプトは削除済み)
 │   │   └── ff_state.json          FF適用状態(適用中プロファイル名・crc・ff/est)
 │   ├── static/            index.html, app.js, style.css(ビルド不要のvanilla JS。CDN禁止)
 │   ├── vendor/            NatNetClient.py, MoCapData.py, DataDescriptions.py(既存流用)
@@ -153,12 +154,16 @@ StampFly_Integrated_Control_V2/
 │   ├── tests/             pytest(フェイク serial/NatNet でロジック検証。v2: 実験/
 │   │                      キャリブ/FF/円軌道/ヨー整形/ログ列のテストを含む)
 │   └── requirements.txt   fastapi, uvicorn[standard], pyserial, numpy, pytest(バージョン固定)
-├── data_analysis/         v2: FF係数抽出・ベンチ解析(独立 venv)
-│   ├── ff_params/core.py  純粋関数: スイープ8ラン → FFプロファイル dict(忠実移植)
-│   ├── make_ff_profile.py 抽出CLI(既定入力 ../pc_server/data/sweep_results、
+├── data_analysis/         v2: FF係数抽出・スイープ/実験ログ解析(独立 venv)
+│   ├── ff_params/core.py  純粋関数: スイープ8ラン → FFプロファイル dict(忠実移植。
+│   │                      sequence meta → 単機ラン展開も担当)
+│   ├── make_ff_profile.py 抽出CLI+対話モード(既定入力 ../pc_server/data/sweep_results、
 │   │                      既定出力 ../pc_server/data/ff_profiles)
-│   ├── analyze_*.py, replay_yaw_ff.py  ベンチ/旧yawlog向け解析(旧形式のまま)
-│   ├── tests/test_ff_extraction.py    受入テスト(6/12照合+付録A再現)
+│   ├── plot_sweep.py      スイープ校正解析+加算性シーケンス検証のグラフ化(対話式/CLI)
+│   ├── plot_explog.py     Experiment 計測ログ(pc_server/data/exp_logs)のグラフ化(対話式/CLI)
+│   ├── graphs/            グラフ出力先(生成物)
+│   ├── tests/test_ff_extraction.py    受入テスト(6/12照合+付録A再現+sequence展開)
+│   │        fixtures/results.json     受入テストの真値
 │   └── requirements.txt   numpy, matplotlib
 ├── flight_log_viewer/     v2: 飛行ログ(logs/*.csv 94列)の可視化(独立 venv)
 │   ├── visualize.py       対話式/バッチ CLI

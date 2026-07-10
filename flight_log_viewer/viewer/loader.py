@@ -29,6 +29,12 @@ from .constants import (
 # なければ Madgwick(その場合 madgwick 自身は比較から除外)。
 YAW_ESTIMATOR_KEYS: tuple[str, ...] = ("madgwick", "ekf", "gyro_int")
 
+# 飛行ログの既定保存先: <repo>/logs/flight_logs/
+# (viewer/ → flight_log_viewer/ → <repo> の 2 階層上)
+DEFAULT_FLIGHT_LOGS_DIR: Path = (
+    Path(__file__).resolve().parents[2] / "logs" / "flight_logs"
+)
+
 
 # ---------------------------------------------------------------------------
 # 角度ユーティリティ
@@ -66,8 +72,9 @@ class FlightLog:
 
     path: Path
     df: pd.DataFrame
-    mode: str                       # "posture" / "position" / "unknown"
+    mode: str                       # "posture" / "position" / "multi" / "unknown"
     warnings: list[str] = field(default_factory=list)
+    drone_name: str | None = None   # multi ログの機体名(<ts>_multi_<name>.csv)
 
     @property
     def name(self) -> str:
@@ -158,6 +165,8 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("tlm_roll_rad", "tlm_roll_deg"),
         ("tlm_pitch_rad", "tlm_pitch_deg"),
         ("tlm_yaw_ref_rad", "tlm_yaw_ref_deg"),
+        ("tlm_roll_ref_rad", "tlm_roll_ref_deg"),
+        ("tlm_pitch_ref_rad", "tlm_pitch_ref_deg"),
         ("traj_phase_rad", "traj_phase_deg"),
     ):
         if rad_col in df.columns:
@@ -239,12 +248,19 @@ def load_log(csv_path: str | Path) -> FlightLog:
 
     df = _add_derived_columns(df)
 
-    # モード判定(mode 列 → ファイル名サフィックスの順)
+    # モード判定(mode 列 → ファイル名の順)。multi はファイル名
+    # <ts>_multi_<機体名>.csv から機体名も取り出す。
+    stem = csv_path.stem
+    drone_name: str | None = None
+    if "_multi_" in stem:
+        drone_name = stem.split("_multi_", 1)[1] or None
+
     mode = "unknown"
     if "mode" in df.columns and df["mode"].notna().any():
         mode = str(df["mode"].dropna().iloc[0])
+    elif drone_name is not None:
+        mode = "multi"
     else:
-        stem = csv_path.stem
         for candidate in ("posture", "position"):
             if stem.endswith(f"_{candidate}"):
                 mode = candidate
@@ -253,4 +269,58 @@ def load_log(csv_path: str | Path) -> FlightLog:
     for message in warnings:
         print(f"警告: {message}")
 
-    return FlightLog(path=csv_path, df=df, mode=mode, warnings=warnings)
+    return FlightLog(path=csv_path, df=df, mode=mode, warnings=warnings,
+                     drone_name=drone_name)
+
+
+def group_timestamp(csv_path: str | Path) -> str | None:
+    """multi ログのグループキー(<ts>_multi_<name>.csv の <ts>)を返す。
+
+    multi ログでなければ None。
+    """
+    stem = Path(csv_path).stem
+    if "_multi_" not in stem:
+        return None
+    ts = stem.split("_multi_", 1)[0]
+    return ts or None
+
+
+def load_group(ts_or_path: str | Path,
+               logs_dir: str | Path | None = None) -> list[FlightLog]:
+    """同一タイムスタンプの multi ログ群をまとめて読み込む。
+
+    Args:
+        ts_or_path: グループのタイムスタンプ文字列(例 "20260710_123456")、
+            またはグループに属する任意の 1 ファイルのパス。
+        logs_dir: タイムスタンプ指定時の検索ディレクトリ
+            (既定: <repo>/logs/flight_logs/)。パス指定時はそのファイルの
+            ディレクトリを使い、この引数は無視する。
+
+    Returns:
+        機体名の昇順に並んだ FlightLog のリスト。
+
+    Raises:
+        FileNotFoundError: 該当する multi ログが 1 本も見つからない場合。
+        ValueError: パス指定だが multi ログの命名(<ts>_multi_<name>.csv)
+            でない場合。
+    """
+    candidate = Path(ts_or_path)
+    if candidate.suffix.lower() == ".csv" or candidate.is_file():
+        ts = group_timestamp(candidate)
+        if ts is None:
+            raise ValueError(
+                f"multi ログの命名(<ts>_multi_<機体名>.csv)ではありません: "
+                f"{candidate}"
+            )
+        directory = candidate.resolve().parent
+    else:
+        ts = str(ts_or_path)
+        directory = Path(logs_dir) if logs_dir is not None \
+            else DEFAULT_FLIGHT_LOGS_DIR
+
+    paths = sorted(directory.glob(f"{ts}_multi_*.csv"))
+    if not paths:
+        raise FileNotFoundError(
+            f"multi ログが見つかりません: {directory}/{ts}_multi_*.csv"
+        )
+    return [load_log(path) for path in paths]

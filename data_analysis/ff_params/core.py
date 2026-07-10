@@ -1,6 +1,6 @@
 """FFプロファイル抽出コア (純粋関数: 8ラン → プロファイルdict).
 
-集計・フィットは analyze_feasibility_20260612.py から**そのまま**移植している
+集計・フィットは旧 analyze_feasibility_20260612.py (削除済み) から**そのまま**移植している
 (aggregate / fit_affine / fit_prop / LUT生成 / duty→電流2次fit)。
 数値挙動を変えないこと (受入テスト: 6/12 results.json と相対誤差 <1e-6 で一致)。
 仕様: docs/ff_pipeline_design.md §2-3。
@@ -102,7 +102,7 @@ def fit_prop(I_active, Y):
 def build_lut_points(all_aggs: dict) -> tuple[float, list[dict]]:
     """LUTブレークポイント: 4姿勢の同(duty,leg)ステップを平均 → 電流順, (idle, 0)起点。
 
-    analyze_feasibility_20260612.py line 459-476 の忠実移植。
+    旧 analyze_feasibility_20260612.py (削除済み) line 459-476 の忠実移植。
     all_aggs は正準姿勢順 (Yaw=0° 先頭) の dict であること (先頭がテンプレート)。
     """
     labels = list(all_aggs.keys())
@@ -126,7 +126,7 @@ def build_lut_points(all_aggs: dict) -> tuple[float, list[dict]]:
 def fit_duty_to_current(agg: dict) -> dict:
     """duty→単機電流 2次fit (I_active = c2 d² + c1 d + c0)。
 
-    analyze_feasibility_20260612.py line 479-488 の忠実移植 (1モーター分)。
+    旧 analyze_feasibility_20260612.py (削除済み) line 479-488 の忠実移植 (1モーター分)。
     """
     d = np.array([s["duty"] for s in agg["steps"]])
     Ia = np.array([s["I"] for s in agg["steps"]]) - agg["idle"]
@@ -184,9 +184,113 @@ def _date_of(meta: dict) -> str:
     return s[:10] if len(s) >= 10 else ""
 
 
+# ------------------------------------------------------- sequence expand ------
+SEQUENCE_META_SCHEMA = "stampfly_sweep_sequence_meta"
+
+
+def is_sequence_token(token: str) -> bool:
+    """--stems 等の1項目が sequence meta を指すか (名前ベース判定)。
+
+    受理形: 'sequence_<id>' / 'sequence_<id>_meta' / 'sequence_<id>_meta.json' /
+    それらへのパス。
+    """
+    return Path(str(token)).name.startswith("sequence_")
+
+
+def resolve_sequence_meta(token: str, results_dir: Path) -> Path:
+    """sequence token → meta JSON パスに解決。見つからなければ ValueError。"""
+    p = Path(str(token))
+    if p.suffix == ".json":
+        cands = [p, Path(results_dir) / p.name]
+    else:
+        name = p.name if p.name.endswith("_meta") else p.name + "_meta"
+        cands = [p.parent / f"{name}.json", Path(results_dir) / f"{name}.json"]
+    for c in cands:
+        if c.is_file():
+            return c
+    raise ValueError(f"sequence meta が見つからない: {token} "
+                     f"(探索: {', '.join(str(c) for c in cands)})")
+
+
+def expand_sequence_meta(meta_path: Path,
+                         search_dirs: list[Path]) -> list[tuple[str, Path]]:
+    """sequence meta の runs[] を単機スイープの (stem, dir) リストに展開する。
+
+    対象は完了済み (phase=='done' かつ aborted でない) かつ motors が単機
+    (FL/FR/RL/RR) の run のみ。全機/対角ペア run は展開しない (プロファイル
+    抽出の単機4本供給が目的のため)。参照ファイル (<stem>_meta.json /
+    <stem>_samples.csv) は search_dirs を順に探し、最初に両方揃った dir を採用。
+    見つからなければ ValueError。
+    """
+    meta_path = Path(meta_path)
+    seq = json.loads(meta_path.read_text(encoding="utf-8"))
+    if seq.get("schema") != SEQUENCE_META_SCHEMA:
+        raise ValueError(f"schema が sequence meta ではない "
+                         f"({seq.get('schema')!r}): {meta_path}")
+    out: list[tuple[str, Path]] = []
+    for r in seq.get("runs", []):
+        if r.get("phase") != "done" or r.get("aborted"):
+            continue
+        if r.get("motors") not in MOTORS:
+            continue
+        fname = str(r.get("meta") or r.get("samples") or "")
+        for suf in ("_meta.json", "_samples.csv"):
+            if fname.endswith(suf):
+                stem = fname[: -len(suf)]
+                break
+        else:
+            raise ValueError(f"sequence meta の run 参照名が不正: "
+                             f"{fname!r} ({meta_path})")
+        for d in search_dirs:
+            d = Path(d)
+            if (d / f"{stem}_meta.json").is_file() \
+                    and (d / f"{stem}_samples.csv").is_file():
+                out.append((stem, d))
+                break
+        else:
+            raise ValueError(
+                f"sequence meta が参照する {stem} のペアが見つからない "
+                f"(探索dir: {', '.join(str(Path(d)) for d in search_dirs)})")
+    return out
+
+
+def expand_stems(tokens: list[str], results_dir: Path,
+                 extra_search_dirs: list[Path] | None = None
+                 ) -> list[tuple[str, Path]]:
+    """stem/sequence meta 混在の指定を (stem, dir) リストへ展開 (重複は先勝ち)。
+
+    sequence token は resolve_sequence_meta → expand_sequence_meta で参照先の
+    単機ランに展開する (meta のあるフォルダ → results_dir → extra の順に探索)。
+    通常の sweep stem はそのまま (stem, results_dir)。
+    これにより「全機4本 + sequence meta 1個」の5ファイル指定が従来の8本指定と
+    同じ入力集合になる。
+    """
+    results_dir = Path(results_dir)
+    out: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+
+    def _add(stem: str, d: Path) -> None:
+        if stem not in seen:
+            seen.add(stem)
+            out.append((stem, Path(d)))
+
+    for tok in tokens:
+        if is_sequence_token(tok):
+            mp = resolve_sequence_meta(tok, results_dir)
+            dirs = [mp.parent, results_dir] + list(extra_search_dirs or [])
+            for stem, d in expand_sequence_meta(mp, dirs):
+                _add(stem, d)
+        else:
+            _add(str(tok), results_dir)
+    return out
+
+
 # ---------------------------------------------------------------- classify ----
 def classify_runs(runs: list[dict]) -> tuple[list[dict], dict]:
     """8ランを全機×4姿勢 / 単機×4 に自動分類する。
+
+    sequence meta を含む指定は、事前に expand_stems() で単機4本の stem に
+    展開してから load_run → 本関数に渡す (結果は従来の8本指定と同一)。
 
     Returns:
         all_runs: 正準姿勢順 (Yaw=0°, 90°, ±180°, −90°) の全機ラン4本

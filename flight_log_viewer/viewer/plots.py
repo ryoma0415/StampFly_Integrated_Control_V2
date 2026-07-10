@@ -13,13 +13,33 @@ from . import jp_font
 
 jp_font.setup_japanese_font()
 
+import matplotlib.colors as mcolors  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
 from .constants import (  # noqa: E402
+    AX_BG,
     COLORS,
+    FIG_BG,
+    FIG_DPI,
+    GRID_ALPHA,
+    GRID_COLOR,
     LOOP_DT_NOMINAL_US,
     LOW_VOLTAGE_THRESHOLD_V,
 )
 from .loader import FlightLog  # noqa: E402
 from .style import legend_dark, new_fig, save_fig  # noqa: E402
+
+
+def _style_time_colorbar(fig, ax, norm, cmap, **kwargs):
+    """plasma 時間カラーバーをダークテーマで付ける。"""
+    cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, **kwargs)
+    cbar.set_label("時間 [s]", color="white", fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color="white")
+    for label in cbar.ax.yaxis.get_ticklabels():
+        label.set_color("white")
+    cbar.outline.set_edgecolor(GRID_COLOR)
+    return cbar
 
 
 def _fig_xy_trajectory(log: FlightLog, out_dir: Path) -> Path | None:
@@ -290,6 +310,134 @@ def _fig_mocap_diag(log: FlightLog, out_dir: Path) -> Path | None:
     return save_fig(fig, out_dir, "09_mocap_diagnostics.png")
 
 
+def _fig_xyz_3d(log: FlightLog, out_dir: Path) -> Path | None:
+    """15: 3D 飛行軌跡(plasma 時間カラー散布)。Position/Multi のみ。
+
+    旧 Drone_Log_Viewer(For_Presentation/generate_static_image.py の
+    _save_3d_position_png)の見た目を踏襲: plasma カラー散布+カラーバー、
+    view_init(25, -60)、始点緑/終点赤、等スケール。
+    """
+    if not (log.has("pos_x") and log.has("pos_y") and log.has("pos_z")):
+        return None
+    df = log.df
+    mask = (df["pos_x"].notna() & df["pos_y"].notna()
+            & df["pos_z"].notna()).to_numpy()
+    if mask.sum() < 2:
+        return None
+    t = log.t[mask]
+    x = df["pos_x"].to_numpy(dtype=float)[mask]
+    y = df["pos_y"].to_numpy(dtype=float)[mask]
+    z = df["pos_z"].to_numpy(dtype=float)[mask]
+
+    fig = plt.figure(figsize=(10.0, 8.0), dpi=FIG_DPI)
+    fig.patch.set_facecolor(FIG_BG)
+    ax = fig.add_subplot(projection="3d")
+    ax.set_facecolor(FIG_BG)
+    pane_rgba = mcolors.to_rgba(AX_BG)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_pane_color(pane_rgba)
+    ax.tick_params(colors="white", labelsize=9)
+    ax.grid(True, alpha=GRID_ALPHA, color=GRID_COLOR)
+
+    cmap = plt.get_cmap("plasma")
+    tmax = float(t.max())
+    tmin = float(t.min())
+    norm = plt.Normalize(tmin, tmax if tmax > tmin else tmin + 1.0)
+    ax.plot(x, y, z, color=COLORS["trajectory"], linewidth=1.2, alpha=0.7)
+    ax.scatter(x, y, z, c=t, cmap=cmap, norm=norm, s=8, alpha=0.9,
+               depthshade=False)
+    ax.scatter(x[:1], y[:1], z[:1], color=COLORS["start"], s=80,
+               edgecolors="white", linewidth=1.2, label="開始位置")
+    ax.scatter(x[-1:], y[-1:], z[-1:], color=COLORS["end"], s=80,
+               edgecolors="white", linewidth=1.2, label="終了位置")
+
+    # 等スケール(最大レンジの立方体に合わせる)
+    half = max(float(np.ptp(x)), float(np.ptp(y)), float(np.ptp(z)), 0.2) / 2.0
+    ax.set_xlim((x.max() + x.min()) / 2 - half, (x.max() + x.min()) / 2 + half)
+    ax.set_ylim((y.max() + y.min()) / 2 - half, (y.max() + y.min()) / 2 + half)
+    ax.set_zlim((z.max() + z.min()) / 2 - half, (z.max() + z.min()) / 2 + half)
+    ax.view_init(elev=25, azim=-60)
+
+    ax.set_title("3D 飛行軌跡(時間カラー)", color="white", fontsize=14, pad=12)
+    ax.set_xlabel("X [m]", color="white", fontsize=10)
+    ax.set_ylabel("Y [m]", color="white", fontsize=10)
+    ax.set_zlabel("Z [m]", color="white", fontsize=10)
+    _style_time_colorbar(fig, ax, norm, cmap, pad=0.12, shrink=0.7)
+    legend_dark(ax)
+    return save_fig(fig, out_dir, "15_xyz_3d.png")
+
+
+def _fig_xy_time(log: FlightLog, out_dir: Path) -> Path | None:
+    """16: XY 軌跡の plasma 時間カラー散布版(旧 v3_2d 相当)。Position のみ。"""
+    if not (log.has("pos_x") and log.has("pos_y")):
+        return None
+    df = log.df
+    mask = (df["pos_x"].notna() & df["pos_y"].notna()).to_numpy()
+    if mask.sum() < 2:
+        return None
+    t = log.t[mask]
+    x = df["pos_x"].to_numpy(dtype=float)[mask]
+    y = df["pos_y"].to_numpy(dtype=float)[mask]
+
+    fig, ax = new_fig(figsize=(9.0, 8.0))
+    cmap = plt.get_cmap("plasma")
+    tmax = float(t.max())
+    tmin = float(t.min())
+    norm = plt.Normalize(tmin, tmax if tmax > tmin else tmin + 1.0)
+    ax.plot(x, y, color=COLORS["trajectory"], linewidth=1.0, alpha=0.6)
+    ax.scatter(x, y, c=t, cmap=cmap, norm=norm, s=10, alpha=0.9)
+    if log.has("target_x") and log.has("target_y"):
+        ax.plot(df["target_x"], df["target_y"], color=COLORS["target"],
+                linewidth=1.0, linestyle="--", alpha=0.7, label="目標軌道")
+    ax.scatter(x[:1], y[:1], color=COLORS["start"], s=110, zorder=5,
+               edgecolors="white", linewidth=1.5, label="開始位置")
+    ax.scatter(x[-1:], y[-1:], color=COLORS["end"], s=110, zorder=5,
+               edgecolors="white", linewidth=1.5, label="終了位置")
+
+    ax.set_title("XY 軌跡(時間カラー)", fontsize=14)
+    ax.set_xlabel("X [m]", fontsize=11)
+    ax.set_ylabel("Y [m]", fontsize=11)
+    ax.set_aspect("equal")
+    _style_time_colorbar(fig, ax, norm, cmap, pad=0.02)
+    legend_dark(ax)
+    return save_fig(fig, out_dir, "16_xy_time.png")
+
+
+def _fig_cmd_echo(log: FlightLog, out_dir: Path) -> Path | None:
+    """17: 送信指令 vs 機体適用エコー(旧 06_feedback_vs_command 相当)。全モード。
+
+    PC が送った roll_ref_deg/pitch_ref_deg と、機体が実際に適用した
+    tlm_roll_ref_rad/tlm_pitch_ref_rad(deg 変換済み派生列)を重畳し、
+    指令伝達・遅延を確認する。
+    """
+    pairs = (
+        ("Roll", "roll_ref_deg", "tlm_roll_ref_deg", COLORS["meas_roll"]),
+        ("Pitch", "pitch_ref_deg", "tlm_pitch_ref_deg", COLORS["meas_pitch"]),
+    )
+    if not any(log.has(col)
+               for _, ref_col, echo_col, _c in pairs
+               for col in (ref_col, echo_col)):
+        return None
+    t = log.t
+    df = log.df
+    fig, axes = new_fig(2, 1, figsize=(12.0, 8.0), sharex=True)
+
+    for ax, (axis_label, ref_col, echo_col, echo_color) in zip(axes, pairs):
+        if log.has(ref_col):
+            ax.plot(t, df[ref_col], color="#AAAAAA", linewidth=1.0, alpha=0.85,
+                    label=f"{axis_label} 送信指令(PC)")
+        if log.has(echo_col):
+            ax.plot(t, df[echo_col], color=echo_color, linewidth=1.0, alpha=0.9,
+                    label=f"{axis_label} 機体適用エコー")
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_ylabel(f"{axis_label} [deg]", fontsize=10)
+        legend_dark(ax)
+
+    axes[0].set_title("指令エコー: 送信指令 vs 機体適用", fontsize=14)
+    axes[-1].set_xlabel("時間 [s]", fontsize=11)
+    return save_fig(fig, out_dir, "17_cmd_echo.png")
+
+
 def generate_static_figures(log: FlightLog, out_dir: str | Path) -> list[Path]:
     """静止画グラフ一式を out_dir に生成し、生成できたパスの一覧を返す。"""
     out_dir = Path(out_dir)
@@ -304,6 +452,9 @@ def generate_static_figures(log: FlightLog, out_dir: str | Path) -> list[Path]:
         _fig_power,
         _fig_latency,
         _fig_mocap_diag,
+        _fig_xyz_3d,
+        _fig_xy_time,
+        _fig_cmd_echo,
     )
     saved: list[Path] = []
     for gen in generators:

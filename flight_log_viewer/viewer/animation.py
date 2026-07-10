@@ -34,6 +34,7 @@ from .constants import (  # noqa: E402
     FIG_BG,
     GRID_ALPHA,
     GRID_COLOR,
+    MULTI_DRONE_COLORS,
     YAW_SOURCES,
 )
 from .loader import FlightLog  # noqa: E402
@@ -220,6 +221,37 @@ def _legend(ax, **kwargs) -> None:
             text.set_color("white")
 
 
+def _build_ts_panel(ax, df: pd.DataFrame, ylabel: str,
+                    specs: tuple[tuple[str, str, str, str], ...]) -> list:
+    """時系列パネルの Line2D 群を作る。specs=(列名, 表示名, 色, 線種)。
+
+    データが無い列はスキップし、y 範囲は全データから固定する
+    (フレーム毎の再計算を避ける)。単機・複数機アニメで共用。
+    """
+    _style_ax(ax)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_xlabel("時間 [s]", fontsize=8)
+    lines = []
+    for col, label, color, linestyle in specs:
+        if col not in df.columns:
+            continue
+        values = df[col].to_numpy(dtype=float)
+        if not np.isfinite(values).any():
+            continue
+        (line,) = ax.plot([], [], color=color, linewidth=1.2, alpha=0.9,
+                          linestyle=linestyle, label=label)
+        lines.append((line, values))
+    if lines:
+        all_values = np.concatenate([v for _, v in lines])
+        finite = all_values[np.isfinite(all_values)]
+        if finite.size:
+            low, high = float(np.min(finite)), float(np.max(finite))
+            pad = max((high - low) * 0.1, 1e-3)
+            ax.set_ylim(low - pad, high + pad)
+        _legend(ax, ncol=max(1, len(lines) // 2))
+    return lines
+
+
 class _AnimationBuilder:
     """7 パネルアニメーションの Figure・Artist を構築し、フレーム更新する。"""
 
@@ -350,29 +382,7 @@ class _AnimationBuilder:
     def _make_ts_panel(self, ax, ylabel: str,
                        specs: tuple[tuple[str, str, str, str], ...]) -> list:
         """時系列パネルの Line2D 群を作る。specs=(列名, 表示名, 色, 線種)。"""
-        _style_ax(ax)
-        ax.set_ylabel(ylabel, fontsize=9)
-        ax.set_xlabel("時間 [s]", fontsize=8)
-        lines = []
-        for col, label, color, linestyle in specs:
-            if col not in self.df.columns:
-                continue
-            values = self.df[col].to_numpy(dtype=float)
-            if not np.isfinite(values).any():
-                continue
-            (line,) = ax.plot([], [], color=color, linewidth=1.2, alpha=0.9,
-                              linestyle=linestyle, label=label)
-            lines.append((line, values))
-        if lines:
-            # y 範囲は全データから固定(フレーム毎の再計算を避ける)
-            all_values = np.concatenate([v for _, v in lines])
-            finite = all_values[np.isfinite(all_values)]
-            if finite.size:
-                low, high = float(np.min(finite)), float(np.max(finite))
-                pad = max((high - low) * 0.1, 1e-3)
-                ax.set_ylim(low - pad, high + pad)
-            _legend(ax, ncol=max(1, len(lines) // 2))
-        return lines
+        return _build_ts_panel(ax, self.df, ylabel, specs)
 
     def update(self, frame_idx: int):
         """FuncAnimation のフレーム更新コールバック。"""
@@ -487,4 +497,203 @@ def generate_animation(
               progress_callback=_progress)
     plt.close(builder.fig)
     print(f"アニメーション生成完了: {out_path}")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 複数機同時制御(multi)アニメーション
+# ---------------------------------------------------------------------------
+
+class _MultiAnimationBuilder:
+    """複数機アニメ: 共有 XY 大パネル + 機体別の高度/ヨー小パネル。
+
+    レイアウトは gridspec(機体数 N × 4 列)。左 2 列を全行ぶち抜きで
+    共有 XY パネルに使い、右 2 列に機体 i の高度(col2)/ヨー(col3)を
+    行 i に並べる(N=2〜4 を想定)。動画合成は multi では非対応(仕様)。
+    """
+
+    def __init__(self, logs: list[FlightLog],
+                 frames_dfs: list[pd.DataFrame],
+                 frame_times: np.ndarray) -> None:
+        self.logs = logs
+        self.t = frame_times
+        n = len(logs)
+
+        self.fig = plt.figure(figsize=FIGURE_SIZE, dpi=ANIM_DPI)
+        self.fig.patch.set_facecolor(FIG_BG)
+        gs = self.fig.add_gridspec(
+            n, 4, left=0.05, right=0.98, top=0.90, bottom=0.07,
+            wspace=0.28, hspace=0.55,
+            width_ratios=[1.15, 1.15, 1.0, 1.0],
+        )
+
+        # --- 共有 XY パネル(全機の trail+現在位置+目標を機体別色で) ---
+        self.ax_xy = self.fig.add_subplot(gs[:, 0:2])
+        _style_ax(self.ax_xy)
+        self.ax_xy.set_title("複数機 XY 軌跡(共有)", fontsize=12)
+        self.ax_xy.set_xlabel("X [m]", fontsize=9)
+        self.ax_xy.set_ylabel("Y [m]", fontsize=9)
+
+        # (has_pos, trail, point, frames_df) を機体ごとに保持
+        self.xy_artists: list[tuple[bool, object, object, pd.DataFrame]] = []
+        all_x: list[np.ndarray] = []
+        all_y: list[np.ndarray] = []
+        for i, (log, df) in enumerate(zip(logs, frames_dfs)):
+            color = MULTI_DRONE_COLORS[i % len(MULTI_DRONE_COLORS)]
+            name = log.drone_name or log.name
+            has_pos = log.has("pos_x") and log.has("pos_y")
+            trail = point = None
+            if has_pos:
+                if "target_x" in df.columns and np.isfinite(
+                        df["target_x"].to_numpy(dtype=float)).any():
+                    self.ax_xy.plot(df["target_x"], df["target_y"],
+                                    color=color, linewidth=0.9,
+                                    linestyle="--", alpha=0.45,
+                                    label=f"{name} 目標")
+                (trail,) = self.ax_xy.plot(
+                    [], [], color=color, linewidth=1.6, alpha=0.9,
+                    label=f"{name} 軌跡")
+                (point,) = self.ax_xy.plot(
+                    [], [], marker="o", markersize=11, color=color,
+                    markeredgecolor="white", linestyle="none")
+                all_x.append(df["pos_x"].to_numpy(dtype=float))
+                all_y.append(df["pos_y"].to_numpy(dtype=float))
+            self.xy_artists.append((has_pos, trail, point, df))
+
+        if all_x:
+            x = np.concatenate(all_x)
+            y = np.concatenate(all_y)
+            if np.isfinite(x).any():
+                margin = 0.2
+                self.ax_xy.set_xlim(np.nanmin(x) - margin, np.nanmax(x) + margin)
+                self.ax_xy.set_ylim(np.nanmin(y) - margin, np.nanmax(y) + margin)
+            self.ax_xy.set_aspect("equal", adjustable="box")
+            _legend(self.ax_xy, loc="upper right", ncol=2)
+        else:
+            self.ax_xy.text(0.5, 0.5, "位置データなし",
+                            transform=self.ax_xy.transAxes,
+                            ha="center", va="center", color="gray", fontsize=11)
+
+        # --- 機体別の高度/ヨー小パネル ---
+        self.ts_panels: list[tuple[object, list]] = []
+        for i, (log, df) in enumerate(zip(logs, frames_dfs)):
+            color = MULTI_DRONE_COLORS[i % len(MULTI_DRONE_COLORS)]
+            name = log.drone_name or log.name
+
+            ax_alt = self.fig.add_subplot(gs[i, 2])
+            alt_lines = _build_ts_panel(
+                ax_alt, df, "高度 [m]",
+                (("alt_ref_m", "目標", COLORS["alt_ref"], "--"),
+                 ("tlm_altitude_est_m", "推定", COLORS["alt_est"], "-"),
+                 ("tlm_altitude_tof_m", "ToF", COLORS["alt_tof"], "-")))
+            ax_alt.set_title(f"{name} 高度", fontsize=10, color=color)
+
+            ax_yaw = self.fig.add_subplot(gs[i, 3])
+            yaw_lines = _build_ts_panel(
+                ax_yaw, df, "ヨー [deg]",
+                (("yaw_ekf_unwrap_deg", "EKF", COLORS["yaw_ekf"], "-"),
+                 ("yaw_mocap_unwrap_deg", "MoCap", COLORS["yaw_mocap"], "-"),
+                 ("cmd_yaw_ref_deg", "指令", COLORS["yaw_cmd"], "--")))
+            ax_yaw.set_title(f"{name} ヨー", fontsize=10, color=color)
+
+            self.ts_panels += [(ax_alt, alt_lines), (ax_yaw, yaw_lines)]
+
+        self.title = self.fig.suptitle("", fontsize=13, color="white")
+        self._names = " / ".join(
+            (log.drone_name or log.name) for log in logs)
+
+    def update(self, frame_idx: int):
+        """FuncAnimation のフレーム更新コールバック。"""
+        now = self.t[frame_idx]
+
+        for has_pos, trail, point, df in self.xy_artists:
+            if not has_pos:
+                continue
+            start = max(0, frame_idx - XY_TRAIL_POINTS)
+            trail.set_data(df["pos_x"].iloc[start:frame_idx + 1],
+                           df["pos_y"].iloc[start:frame_idx + 1])
+            px = df["pos_x"].iloc[frame_idx]
+            py = df["pos_y"].iloc[frame_idx]
+            if np.isfinite(px) and np.isfinite(py):
+                point.set_data([px], [py])
+
+        window_lo = now - TRAIL_WINDOW_S
+        start = int(np.searchsorted(self.t, window_lo))
+        sl = slice(start, frame_idx + 1)
+        for ax, lines in self.ts_panels:
+            for line, values in lines:
+                line.set_data(self.t[sl], values[sl])
+            ax.set_xlim(window_lo, now + TRAIL_WINDOW_S * 0.1)
+
+        self.title.set_text(
+            f"複数機同時制御   t={now:6.2f}s   機体: {self._names}")
+        return []
+
+
+def generate_multi_animation(
+    logs: list[FlightLog],
+    out_path: str | Path,
+    fps: float | None = None,
+    start_s: float | None = None,
+    end_s: float | None = None,
+) -> Path:
+    """複数機グループのアニメーション MP4 を生成する(動画合成なし)。
+
+    Args:
+        logs: 同一グループの読み込み済みフライトログ(2〜4 機)。
+        out_path: 出力 MP4 パス。
+        fps: 出力フレームレート(省略時 20fps)。
+        start_s / end_s: 切り出し範囲 [s](elapsed_time 基準・全機共通)。
+    """
+    if not logs:
+        raise ValueError("multi アニメーション対象のログがありません。")
+    if not FFMpegWriter.isAvailable():
+        raise RuntimeError(
+            "ffmpeg が見つかりません。MP4 出力には ffmpeg のインストールが必要です"
+            "(macOS: brew install ffmpeg)。"
+        )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 全機共通の時間軸(既定: 最も早い開始〜最も遅い終了)
+    t0 = min(float(log.t[0]) for log in logs) if start_s is None else float(start_s)
+    t1 = max(float(log.t[-1]) for log in logs) if end_s is None else float(end_s)
+    if t1 <= t0:
+        raise ValueError(f"切り出し範囲が不正です: start={t0}, end={t1}")
+    duration = t1 - t0
+
+    anim_fps = float(fps) if fps else DEFAULT_ANIM_FPS
+    n_frames = int(duration * anim_fps)
+    if n_frames < 2:
+        raise ValueError("アニメーションのフレーム数が不足しています。")
+    frame_times = t0 + np.arange(n_frames) / anim_fps
+
+    print(f"\n複数機アニメーション生成: {len(logs)}機, "
+          f"{n_frames}フレーム @ {anim_fps:.1f}fps → {out_path}")
+    frames_dfs = [_interpolate_to_frames(log.df, frame_times) for log in logs]
+    builder = _MultiAnimationBuilder(logs, frames_dfs, frame_times)
+
+    writer = FFMpegWriter(
+        fps=anim_fps,
+        metadata={"title": f"StampFly Multi Flight Log: {out_path.stem}"},
+        codec="libx264",
+        bitrate=BITRATE_KBPS,
+        extra_args=["-pix_fmt", "yuv420p"],
+    )
+    anim = FuncAnimation(builder.fig, builder.update, frames=n_frames, blit=False)
+
+    last_pct = -1
+
+    def _progress(current: int, total: int) -> None:
+        nonlocal last_pct
+        pct = int(100 * current / total)
+        if pct >= last_pct + 10:
+            last_pct = pct
+            print(f"  進捗: {pct}% ({current}/{total})")
+
+    anim.save(str(out_path), writer=writer, dpi=ANIM_DPI,
+              progress_callback=_progress)
+    plt.close(builder.fig)
+    print(f"複数機アニメーション生成完了: {out_path}")
     return out_path

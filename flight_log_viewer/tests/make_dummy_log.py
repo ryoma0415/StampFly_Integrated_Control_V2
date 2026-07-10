@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""合成ダミーフライトログ(94列・50Hz)の生成スクリプト。
+"""合成ダミーフライトログ(100列・50Hz)の生成スクリプト。
 
 flight_log_viewer の全機能(静止画・ヨー解析・アニメーション・レポート)を
 実ログなしで検証するための CSV を生成する。列は viewer.constants.V2_COLUMNS
-(= docs/LOG_STRUCTURE.md v2 契約の 94 列)と同一順序で出力する。
+(= docs/LOG_STRUCTURE.md v3 契約の 100 列。V3 の CMD_POS_ERR 診断 6 列を含む)
+と同一順序で出力する。出力先は新レイアウト <repo>/logs/flight_logs/。
 
-シナリオ(position モード):
+シナリオ(position / multi モード):
   接続 → 離陸 → ホバリング → 円軌道(ヨー指令ステップあり) → 着陸 → 完了
   - MoCap 真値ヨーに対し Madgwick=+1.5°/min、ジャイロ積算=−6°/min の
     ドリフトを与え、EKF はほぼ真値に追従させる(ヨー解析の検証用)。
   - NIS スパイクと ffg ゲート発火、b_m の緩慢ドリフトも合成する。
+  - V3 列は機上XY制御(xy_cmd_mode="onboard")相当の値を合成する。
 
-posture モードでは位置・MoCap・軌道列を空欄にする(実機と同じ挙動)。
+posture モードでは位置・MoCap・軌道・V3 列を空欄にする(実機と同じ挙動)。
+
+multi モードでは同一タイムスタンプで 2 機分
+(<ts>_multi_droneA.csv / <ts>_multi_droneB.csv、mode 列 = "multi")を生成し、
+それぞれ中心・半径・位相の異なる円軌道を飛ばす。
 
 使い方:
-  python tests/make_dummy_log.py                     # ../../logs/dummy_position.csv
-  python tests/make_dummy_log.py --mode posture      # ../../logs/dummy_posture.csv
-  python tests/make_dummy_log.py --duration 20 --out /tmp/short.csv
+  python tests/make_dummy_log.py                  # posture/position/multi×2 の4本
+  python tests/make_dummy_log.py --mode posture   # dummy_posture.csv のみ
+  python tests/make_dummy_log.py --mode multi     # multi グループのみ
+  python tests/make_dummy_log.py --mode position --duration 20 --out /tmp/short.csv
 """
 
 from __future__ import annotations
@@ -47,8 +54,19 @@ from viewer.constants import (  # noqa: E402
     V2_COLUMNS,
 )
 
-DEFAULT_LOGS_DIR = _HERE.parent.parent / "logs"
+# 新レイアウト: 飛行ログは <repo>/logs/flight_logs/ に置く
+DEFAULT_LOGS_DIR = _HERE.parent.parent / "logs" / "flight_logs"
+# 旧レイアウト(<repo>/logs/ 直下)に残っている古いダミーの掃除対象
+LEGACY_LOGS_DIR = _HERE.parent.parent / "logs"
 FLOAT_DECIMALS = 6  # logger.py と同じ桁数
+
+# multi ダミーのグループタイムスタンプ(固定値。再実行時に上書きされる)
+DUMMY_MULTI_TS = "20260101_000000"
+# (機体名, 円軌道中心, 半径, 初期位相, 乱数シード)
+MULTI_DRONES: tuple[tuple[str, tuple[float, float], float, float, int], ...] = (
+    ("droneA", (-0.6, 0.0), 0.50, 0.0, 20260706),
+    ("droneB", (0.6, 0.0), 0.40, math.pi, 20260707),
+)
 
 # FlightState(プロトコル準拠)
 STATE_WAIT = 2
@@ -104,9 +122,23 @@ def _wrap_pi(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def generate_rows(mode: str, duration_s: float) -> list[dict]:
-    """1 行 = COLUMNS キーの dict のリストを生成する。"""
-    rng = np.random.default_rng(RANDOM_SEED)
+def generate_rows(
+    mode: str,
+    duration_s: float,
+    *,
+    circle_center: tuple[float, float] = (0.0, 0.0),
+    circle_radius: float = CIRCLE_RADIUS_M,
+    circle_phase0: float = 0.0,
+    seed: int = RANDOM_SEED,
+) -> list[dict]:
+    """1 行 = COLUMNS キーの dict のリストを生成する。
+
+    mode は "position" / "posture" / "multi"。multi は position と同じ列を
+    埋める(mode 列のみ "multi")。circle_* で機体ごとに異なる円軌道を作れる。
+    """
+    cx, cy = circle_center
+    fills_position = mode in ("position", "multi")
+    rng = np.random.default_rng(seed)
     n_rows = int(duration_s * LOG_RATE_HZ)
     t0_wall = datetime.now()
 
@@ -122,7 +154,7 @@ def generate_rows(mode: str, duration_s: float) -> list[dict]:
 
     rows: list[dict] = []
     yaw_true_deg = 0.0        # MoCap 真値ヨー(1 次遅れ応答の状態)
-    circle_phase = 0.0        # 円軌道位相 [rad]
+    circle_phase = circle_phase0  # 円軌道位相 [rad]
     dt = 1.0 / LOG_RATE_HZ
 
     for i in range(n_rows):
@@ -160,21 +192,21 @@ def generate_rows(mode: str, duration_s: float) -> list[dict]:
         if in_circle:
             circle_phase = (circle_phase + 2.0 * math.pi * dt / CIRCLE_PERIOD_S) \
                 % (2.0 * math.pi)
-            target_x = CIRCLE_RADIUS_M * math.cos(circle_phase)
-            target_y = CIRCLE_RADIUS_M * math.sin(circle_phase)
+            target_x = cx + circle_radius * math.cos(circle_phase)
+            target_y = cy + circle_radius * math.sin(circle_phase)
             traj_mode = 1
         else:
-            target_x, target_y = 0.0, 0.0
+            target_x, target_y = cx, cy
             traj_mode = 0
 
         # 実位置: 目標に少し遅れて追従+ノイズ
         lag_phase = circle_phase - 0.25 if in_circle else 0.0
         if in_circle:
-            pos_x = CIRCLE_RADIUS_M * math.cos(lag_phase) + float(rng.normal(0, 0.012))
-            pos_y = CIRCLE_RADIUS_M * math.sin(lag_phase) + float(rng.normal(0, 0.012))
+            pos_x = cx + circle_radius * math.cos(lag_phase) + float(rng.normal(0, 0.012))
+            pos_y = cy + circle_radius * math.sin(lag_phase) + float(rng.normal(0, 0.012))
         else:
-            pos_x = float(rng.normal(0, 0.02))
-            pos_y = float(rng.normal(0, 0.02))
+            pos_x = cx + float(rng.normal(0, 0.02))
+            pos_y = cy + float(rng.normal(0, 0.02))
 
         # ---- 高度 ----
         if t < t_connect:
@@ -266,8 +298,8 @@ def generate_rows(mode: str, duration_s: float) -> list[dict]:
         row["cmd_yaw_ref_deg"] = cmd_yaw_deg
         row["yaw_ctrl_on"] = 1 if yaw_ctrl_on else 0
 
-        # ---- 位置系(position モードのみ) ----
-        if mode == "position":
+        # ---- 位置系(position / multi モードのみ) ----
+        if fills_position:
             row["pos_x"], row["pos_y"], row["pos_z"] = pos_x, pos_y, alt
             row["raw_pos_x"] = pos_x + float(rng.normal(0, 0.004))
             row["raw_pos_y"] = pos_y + float(rng.normal(0, 0.004))
@@ -300,6 +332,14 @@ def generate_rows(mode: str, duration_s: float) -> list[dict]:
             row["mocap_yaw_deg"] = yaw_true_noisy
             row["traj_mode"] = traj_mode
             row["traj_phase_rad"] = circle_phase if traj_mode == 1 else None
+
+            # ---- V3 列(機上XY制御 CMD_POS_ERR 診断。onboard 相当を合成) ----
+            row["xy_cmd_mode"] = "onboard"
+            row["cmd_err_x_m"] = max(-0.5, min(0.5, target_x - pos_x))
+            row["cmd_err_y_m"] = max(-0.5, min(0.5, target_y - pos_y))
+            row["cmd_xy_valid"] = 1 if flying else 0
+            row["cmd_mocap_yaw_deg"] = yaw_true_noisy
+            row["mocap_heading_deg"] = yaw_true_noisy
 
         # ---- テレメトリ(TLM_STATE スナップショット) ----
         row["tlm_age_ms"] = 20.0 if i % 2 else 0.5   # 25Hz TLM を 50Hz 行に結合
@@ -368,20 +408,67 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
             writer.writerow([_fmt(row.get(col)) for col in V2_COLUMNS])
 
 
+def _cleanup_legacy_dummies() -> None:
+    """旧レイアウト(logs/ 直下)の dummy_*.csv を削除する。"""
+    for name in ("dummy_position.csv", "dummy_posture.csv"):
+        legacy = LEGACY_LOGS_DIR / name
+        if legacy.is_file():
+            legacy.unlink()
+            print(f"旧ダミーを削除: {legacy}")
+
+
+def make_single(mode: str, duration_s: float, out_path: Path | None = None) -> Path:
+    """posture / position のダミー 1 本を生成する。"""
+    out_path = out_path or (DEFAULT_LOGS_DIR / f"dummy_{mode}.csv")
+    rows = generate_rows(mode, duration_s)
+    write_csv(rows, out_path)
+    print(f"生成完了: {out_path} ({len(rows)}行 × {N_COLUMNS}列, mode={mode})")
+    return out_path
+
+
+def make_multi_group(duration_s: float, ts: str = DUMMY_MULTI_TS) -> list[Path]:
+    """multi ダミーグループ(2機、<ts>_multi_<name>.csv)を生成する。"""
+    paths: list[Path] = []
+    for name, center, radius, phase0, seed in MULTI_DRONES:
+        out_path = DEFAULT_LOGS_DIR / f"{ts}_multi_{name}.csv"
+        rows = generate_rows(
+            "multi", duration_s,
+            circle_center=center, circle_radius=radius,
+            circle_phase0=phase0, seed=seed,
+        )
+        write_csv(rows, out_path)
+        print(f"生成完了: {out_path} ({len(rows)}行 × {N_COLUMNS}列, "
+              f"mode=multi, drone={name})")
+        paths.append(out_path)
+    return paths
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="ダミーフライトログ(94列)の生成")
-    parser.add_argument("--mode", choices=("position", "posture"), default="position",
-                        help="ログモード(posture では位置/MoCap 列が空欄)")
+    parser = argparse.ArgumentParser(description="ダミーフライトログ(100列)の生成")
+    parser.add_argument("--mode", choices=("all", "position", "posture", "multi"),
+                        default="all",
+                        help="生成対象(既定 all = posture/position/multi×2 の4本。"
+                             "posture では位置/MoCap/V3 列が空欄)")
     parser.add_argument("--duration", type=float, default=40.0,
                         help="ログ長 [s](既定 40)")
     parser.add_argument("--out", type=Path, default=None,
-                        help=f"出力パス(既定: {DEFAULT_LOGS_DIR}/dummy_<mode>.csv)")
+                        help="出力パス(position/posture 単体指定時のみ有効。"
+                             f"既定: {DEFAULT_LOGS_DIR}/dummy_<mode>.csv)")
     args = parser.parse_args()
 
-    out_path = args.out or (DEFAULT_LOGS_DIR / f"dummy_{args.mode}.csv")
-    rows = generate_rows(args.mode, args.duration)
-    write_csv(rows, out_path)
-    print(f"生成完了: {out_path} ({len(rows)}行 × {N_COLUMNS}列, mode={args.mode})")
+    if args.out is not None and args.mode in ("all", "multi"):
+        parser.error("--out は --mode position / posture のときのみ指定できます")
+
+    _cleanup_legacy_dummies()
+
+    if args.mode in ("all", "posture"):
+        make_single("posture", args.duration,
+                    args.out if args.mode == "posture" else None)
+    if args.mode in ("all", "position"):
+        make_single("position", args.duration,
+                    args.out if args.mode == "position" else None)
+    if args.mode in ("all", "multi"):
+        make_multi_group(args.duration)
     return 0
 
 

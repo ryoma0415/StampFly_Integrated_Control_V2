@@ -1,6 +1,10 @@
 """CSV フライトログ(ログ ON 時のみ)。
 
-- 出力先: リポジトリ直下 logs/YYYYMMDD_HHMMSS_<mode>.csv
+- 出力先: リポジトリ直下 logs/flight_logs/YYYYMMDD_HHMMSS_<mode>.csv
+- 寿命: START(CMD_START 受理)〜飛行終了(着陸/START 猶予切れ/切断)。
+  開閉は session.py(_open_flight_log / _finish_flight_log)が管理する。
+  複数機モード(mode="multi")はスロットごとに1インスタンスを持ち、
+  MultiControlManager(open_flight_logs / close_flight_logs)が管理する。
 - 50Hz の制御行(CMD_SETPOINT 送信ごとに1行)+最新テレメトリ/mocap
   スナップショットの結合。列定義は docs/LOG_STRUCTURE.md に文書化
   (旧 NatNet_PID_Controller の57列の語彙を継承し、TLM_STATE 列で拡張)。
@@ -16,6 +20,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from .config import LOGS_DIR
 
@@ -75,6 +81,105 @@ COLUMNS: tuple[str, ...] = (
 
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数
 
+MS_PER_S = 1000.0
+
+# PositionController の meta からそのままキー名一致で転記する診断列
+# (session._build_log_row と multi の機体別ログで共通)
+META_PASSTHROUGH_KEYS: tuple[str, ...] = (
+    "error_x", "error_y", "target_x", "target_y", "target_z",
+    "data_valid", "control_active", "mocap_dropout",
+    "is_outlier", "used_prediction", "confidence",
+    "consecutive_outliers", "data_source", "filter_threshold",
+    "tracking_valid", "rb_error", "frame_number", "marker_count",
+    "frame_dt_ms", "mocap_age_ms",
+    "mocap_yaw_deg", "mocap_heading_deg",
+    "traj_mode", "traj_phase_rad",
+)
+
+
+def _state_name(state: int) -> str:
+    try:
+        return proto.FlightState(state).name
+    except ValueError:
+        return f"UNKNOWN({state})"
+
+
+def _reason_name(reason: int) -> str:
+    try:
+        return proto.Reason(reason).name
+    except ValueError:
+        return f"UNKNOWN({reason})"
+
+
+def meta_to_row(meta: dict) -> dict:
+    """PositionController の meta 辞書 → 位置/フィルタ診断列(欠損は省略)。"""
+    row: dict = {}
+    filtered = meta.get("filtered_pos")
+    if filtered is not None:
+        row["pos_x"], row["pos_y"], row["pos_z"] = filtered
+    raw = meta.get("raw_pos")
+    if raw is not None:
+        row["raw_pos_x"], row["raw_pos_y"], row["raw_pos_z"] = raw
+    pid_components = meta.get("pid_components")
+    if pid_components is not None:
+        for axis in ("x", "y"):
+            for term in ("p", "i", "d"):
+                row[f"pid_{axis}_{term}"] = pid_components[axis][term]
+    for key in META_PASSTHROUGH_KEYS:
+        if key in meta:
+            row[key] = meta[key]
+    if "marker_count" in meta:
+        row["rb_marker_count"] = meta["marker_count"]
+    return row
+
+
+def tlm_state_to_row(tlm: proto.TlmState, age_s: float) -> dict:
+    """最新 TLM_STATE のスナップショット → tlm_* 列(age_s は受信からの経過秒)。"""
+    return {
+        "tlm_age_ms": age_s * MS_PER_S,
+        "tlm_seq_echo": tlm.seq_echo,
+        "tlm_elapsed_ms": tlm.elapsed_ms,
+        "tlm_state": tlm.state,
+        "tlm_state_name": _state_name(tlm.state),
+        "tlm_flags": tlm.flags,
+        "tlm_reason": tlm.reason,
+        "tlm_reason_name": _reason_name(tlm.reason),
+        "tlm_roll_rad": tlm.roll,
+        "tlm_pitch_rad": tlm.pitch,
+        "tlm_yaw_rad": tlm.yaw,
+        "tlm_p_rad_s": tlm.p,
+        "tlm_q_rad_s": tlm.q,
+        "tlm_r_rad_s": tlm.r,
+        "tlm_roll_ref_rad": tlm.roll_ref,
+        "tlm_pitch_ref_rad": tlm.pitch_ref,
+        "tlm_alt_ref_m": tlm.alt_ref,
+        "tlm_altitude_tof_m": tlm.altitude_tof,
+        "tlm_altitude_est_m": tlm.altitude_est,
+        "tlm_alt_velocity_m_s": tlm.alt_velocity,
+        "tlm_z_dot_ref_m_s": tlm.z_dot_ref,
+        "tlm_voltage_v": tlm.voltage,
+        "tlm_duty_fr": tlm.duty_fr,
+        "tlm_duty_fl": tlm.duty_fl,
+        "tlm_duty_rr": tlm.duty_rr,
+        "tlm_duty_rl": tlm.duty_rl,
+        "tlm_ax_g": tlm.ax,
+        "tlm_ay_g": tlm.ay,
+        "tlm_az_g": tlm.az,
+        "tlm_loop_dt_us": tlm.loop_dt_us,
+        # v2: TLM_STATE 末尾拡張(ヨー推定/FF 診断)
+        "tlm_yaw_est_rad": tlm.yaw_est_rad,
+        "tlm_yaw_gyro_int_rad": tlm.yaw_gyro_int_rad,
+        "tlm_yaw_ref_rad": tlm.yaw_ref_rad,
+        "tlm_current_a": tlm.current_a,
+        "tlm_db_hat_x_ut": tlm.db_hat_x_ut,
+        "tlm_db_hat_y_ut": tlm.db_hat_y_ut,
+        "tlm_bm_x_ut": tlm.bm_x_ut,
+        "tlm_bm_y_ut": tlm.bm_y_ut,
+        "tlm_nis": tlm.nis,
+        "tlm_ffg": tlm.ffg,
+        "tlm_ff_status": tlm.ff_status,
+    }
+
 
 def _format_cell(value) -> str:
     """セル値を CSV 文字列に変換する(None → 空、bool → 0/1)。"""
@@ -110,11 +215,16 @@ class FlightLogger:
         with self._lock:
             return self._file_path
 
-    def start(self, mode: str) -> Path:
-        """ログファイルを作成しヘッダを書く。既に開いていれば閉じてから開く。"""
+    def start(self, mode: str, stamp: Optional[str] = None) -> Path:
+        """ログファイルを作成しヘッダを書く。既に開いていれば閉じてから開く。
+
+        stamp を指定すると そのタイムスタンプ文字列でファイル名を作る
+        (複数機モードで全機のファイル名を同一時刻に揃えるため)。
+        """
         self.stop()
         self._logs_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if stamp is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self._logs_dir / f"{stamp}_{mode}.csv"
         with self._lock:
             self._file = open(path, "w", newline="", encoding="utf-8")

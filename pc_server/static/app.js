@@ -138,6 +138,9 @@ const els = {
   highDutyCheck: $("highDutyCheck"),
   btnMotorStart: $("btnMotorStart"), btnMotorApply: $("btnMotorApply"), btnMotorStop: $("btnMotorStop"),
   motorStatusText: $("motorStatusText"), expLive: $("expLive"),
+  // 計測(EKF/FF性能ログ)パネル(T1-6: exp_record_start/stop)
+  btnExpRecStart: $("btnExpRecStart"), btnExpRecStop: $("btnExpRecStop"),
+  expRecStatus: $("expRecStatus"),
   sweepLocation: $("sweepLocation"), sweepOrientation: $("sweepOrientation"), sweepMemo: $("sweepMemo"),
   btnSweepStart: $("btnSweepStart"), btnSweepAbort: $("btnSweepAbort"),
   sweepStepTag: $("sweepStepTag"), sweepProgressFill: $("sweepProgressFill"),
@@ -1465,6 +1468,13 @@ function applyMode(mode, sendToServer) {
   }
   // Experiment はパネル数が多いため左カラムを広げる
   els.mainEl.classList.toggle("mode-experiment", mode === "experiment");
+  // Experiment 表示中は飛行ログトグルを無効化(飛行ログは START〜着陸のみで
+  // experiment では記録されない。計測は Experiment タブの計測パネルを使う)
+  const logNa = mode === "experiment";
+  els.logToggle.disabled = logNa;
+  els.logToggle.parentElement.title = logNa
+    ? "Experiment モードでは飛行ログは記録されません(計測は Experiment タブの「計測(EKF/FF性能ログ)」を使用)"
+    : "";
   // 共通ヨーブロックをアクティブタブへ移設(単一実体・二重配線なし)
   if (mode === "position") {
     els.yawSlotPosition.appendChild(els.yawBlock);
@@ -1548,6 +1558,18 @@ function renderExperiment() {
   } else {
     els.motorStatusText.textContent = "停止";
     els.motorStatusText.classList.remove("running");
+  }
+
+  // 計測(EKF/FF性能ログ)の状態表示(サーバ側 experiment.recording が正)
+  const rec = exp && exp.recording;
+  if (rec && rec.active) {
+    els.expRecStatus.textContent =
+      `計測中: ${rec.file || "--"}(${rec.samples ?? 0}サンプル)`;
+    els.expRecStatus.classList.add("running");
+  } else {
+    els.expRecStatus.textContent =
+      rec && rec.file ? `停止中(直近: ${rec.file})` : "停止中";
+    els.expRecStatus.classList.remove("running");
   }
 
   // TLM_EXP ライブ表示
@@ -1643,6 +1665,7 @@ function updateExperimentControls() {
   const seqRunning = !!(exp && exp.sequence && exp.sequence.running);
   const busy = sweepRunning || seqRunning;
   const motorRunning = !!(exp && exp.motor && exp.motor.running);
+  const recording = !!(exp && exp.recording && exp.recording.active);
 
   els.btnExpActivate.disabled = !(wsOpen && serial && uiMode === "experiment" && !active);
 
@@ -1659,14 +1682,24 @@ function updateExperimentControls() {
   // Stop は安全経路のため常時活性(WS 切断時のみ無意味なので無効化)
   els.btnMotorStop.disabled = !wsOpen;
 
+  // 計測(EKF/FF性能ログ): 開始はモーターテスト有効かつスイープ/シーケンス
+  // 非実行時のみ。停止はサーバ側が常時受理するため計測中は常に押せる
+  els.btnExpRecStart.disabled = !(wsOpen && active && !busy && !recording);
+  els.btnExpRecStop.disabled = !(wsOpen && recording);
+
+  // 計測中はスイープ/シーケンス開始を禁止(サーバ側拒否と同じ制限をUIにも)
   els.btnSweepStart.disabled =
-    !(wsOpen && active && fixture && !busy && selectedSweepMask() !== 0);
+    !(wsOpen && active && fixture && !busy && !recording && selectedSweepMask() !== 0);
   els.btnSweepAbort.disabled = !(wsOpen && sweepRunning);
-  els.btnSeqStart.disabled = !(wsOpen && active && fixture && !busy);
+  els.btnSeqStart.disabled = !(wsOpen && active && fixture && !busy && !recording);
   els.btnSeqAbort.disabled = !(wsOpen && seqRunning);
 
-  // 実行中はスイープ条件の変更をロック
-  for (const cb of document.querySelectorAll(".sweep-motor")) cb.disabled = busy;
+  // 実行中はスイープ条件の変更をロック。
+  // 計測中はモーター選択を全モーター固定(CMD_MOTOR_RUN は 0xF のみ受理)
+  for (const cb of document.querySelectorAll(".sweep-motor")) {
+    if (recording) cb.checked = true;
+    cb.disabled = busy || recording;
+  }
   for (const rb of document.querySelectorAll('input[name="sweepPattern"]')) rb.disabled = busy;
   for (const inp of [els.sweepLocation, els.sweepOrientation, els.sweepMemo]) {
     inp.disabled = busy;
@@ -2097,6 +2130,16 @@ function wireEvents() {
   els.btnMotorStop.addEventListener("click", () => {
     sendCommand("motor_stop");
     appendConsole("ui", "モーター停止要求");
+  });
+
+  // 計測(EKF/FF性能ログ)開始/停止(結果はサーバの info/警告ログで通知される)
+  els.btnExpRecStart.addEventListener("click", () => {
+    sendCommand("exp_record_start");
+    appendConsole("ui", "計測開始を要求しました(EKF/FF性能ログ)");
+  });
+  els.btnExpRecStop.addEventListener("click", () => {
+    sendCommand("exp_record_stop");
+    appendConsole("ui", "計測停止を要求しました");
   });
 
   // スイープ

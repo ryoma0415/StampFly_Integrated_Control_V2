@@ -43,6 +43,10 @@ _FIGURE_CAPTIONS: dict[str, str] = {
     "12_ekf_diagnostics.png": "EKF 診断(NIS / b_m / db̂ / ゲート)",
     "13_ff_status.png": "ff_status タイムライン",
     "14_yaw_tracking.png": "ヨー指令追従",
+    "15_xyz_3d.png": "3D 飛行軌跡(時間カラー)",
+    "16_xy_time.png": "XY 軌跡(時間カラー)",
+    "17_cmd_echo.png": "指令エコー: 送信指令 vs 機体適用",
+    "M01_multi_xy.png": "複数機 XY 軌跡(共有)",
 }
 
 
@@ -365,6 +369,85 @@ def generate_report(log: FlightLog, out_dir: str | Path,
         encoding="utf-8")
     print(f"  保存: {html_path}")
     return txt_path, html_path
+
+
+# ---------------------------------------------------------------------------
+# 複数機(multi)レポート
+# ---------------------------------------------------------------------------
+
+def _max_altitude_m(log: FlightLog) -> float:
+    """最大高度 [m](推定高度優先、無ければ pos_z)。"""
+    for col in ("tlm_altitude_est_m", "pos_z"):
+        if log.has(col):
+            values = log.df[col].to_numpy(dtype=float)
+            finite = values[np.isfinite(values)]
+            if finite.size:
+                return float(np.max(finite))
+    return math.nan
+
+
+def generate_multi_report(logs: list[FlightLog], out_dir: str | Path) -> Path:
+    """複数機グループの index.html を生成する。
+
+    - 全機サマリ表(機体名 / 記録時間 / 飛行時間 / 位置 RMS / 最大高度)
+    - 共有図 M01_multi_xy.png(out_dir に生成済みであれば埋め込む)
+    - 機体別サブフォルダの index.html へのリンク
+      (機体別 index は generate_report で個別に生成する)
+    """
+    from .multi_plots import MULTI_XY_FILENAME, drone_label  # noqa: PLC0415
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print("\n複数機レポートを生成します...")
+
+    body: list[str] = []
+    group_name = out_dir.name
+    body.append(f"<h1>複数機フライトレポート: {html.escape(group_name)}</h1>")
+    body.append(f"<p class='meta'>生成日時: "
+                f"{datetime.now().isoformat(timespec='seconds')} / 機体数: "
+                f"{len(logs)}</p>")
+    for log in logs:
+        for warning in log.warnings:
+            body.append(f"<p class='warn'>警告 [{html.escape(drone_label(log))}]:"
+                        f" {html.escape(warning)}</p>")
+
+    # 全機サマリ表(機体別 index.html も同じループで生成する)
+    body.append("<h2>全機サマリ</h2><table>")
+    body.append("<tr><th>機体名</th><th>記録時間 [s]</th><th>飛行時間 [s]</th>"
+                "<th>位置 RMS 2D [m]</th><th>最大高度 [m]</th><th>詳細</th></tr>")
+    for log in logs:
+        name = drone_label(log)
+        sub_dir = out_dir / name
+        generate_report(log, sub_dir)  # summary.txt + 機体別 index.html
+        summary = compute_summary(log)
+        link = f"{name}/index.html"
+        body.append(
+            f"<tr><td>{html.escape(name)}</td>"
+            f"<td class='num'>{_fmt(summary['duration_s'], 1)}</td>"
+            f"<td class='num'>{_fmt(summary['flight_time_s'], 1)}</td>"
+            f"<td class='num'>{_fmt(summary['pos_rms_2d_m'], 3)}</td>"
+            f"<td class='num'>{_fmt(_max_altitude_m(log), 2)}</td>"
+            f"<td><a href='{html.escape(link)}' style='color:#93c5fd'>"
+            f"機体別レポート</a></td></tr>")
+    body.append("</table>")
+
+    # 共有 XY 図(multi_plots.fig_multi_xy が out_dir に生成済みなら埋め込む)
+    m01 = out_dir / MULTI_XY_FILENAME
+    if m01.is_file():
+        caption = _FIGURE_CAPTIONS.get(m01.name, m01.stem)
+        body.append("<h2>共有図</h2>")
+        body.append(
+            f"<div class='figure'><div class='caption'>{html.escape(caption)}"
+            f" ({html.escape(m01.name)})</div>"
+            f"<img src='{html.escape(m01.name)}' alt='{html.escape(caption)}'>"
+            f"</div>")
+
+    html_path = out_dir / "index.html"
+    html_path.write_text(
+        _html_page(f"複数機フライトレポート: {group_name}", "\n".join(body)),
+        encoding="utf-8")
+    print(f"  保存: {html_path}")
+    return html_path
 
 
 # ---------------------------------------------------------------------------

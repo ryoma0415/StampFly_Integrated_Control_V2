@@ -185,6 +185,15 @@ COLORS: dict[str, str] = {
     "marker": "#2ECC71",
 }
 
+# 複数機同時制御(multi)の機体別カラー(最大4機。M01 共有 XY 図などで
+# 機体 index 順に割り当てる。既存 trajectory/end/start/target 系と調和する色)
+MULTI_DRONE_COLORS: tuple[str, ...] = (
+    "#3498db",  # 機体1: 青(trajectory と同系)
+    "#e74c3c",  # 機体2: 赤
+    "#2ecc71",  # 機体3: 緑
+    "#f1c40f",  # 機体4: 黄
+)
+
 # ヨー4系統の (キー名, 列名(rad or deg), 表示名, 色, 単位が deg か)
 YAW_SOURCES: tuple[tuple[str, str, str, str, bool], ...] = (
     ("madgwick", "tlm_yaw_rad", "Madgwick", COLORS["yaw_madgwick"], False),

@@ -15,7 +15,9 @@ from typing import Any
 from . import PC_SERVER_DIR, REPO_DIR
 
 CONFIG_DIR = PC_SERVER_DIR / "config"
-LOGS_DIR = REPO_DIR / "logs"
+# 飛行ログ CSV の出力先(logs/ 直下は動画等の他アセットと共有するため
+# flight_logs/ サブディレクトリに分離する)
+LOGS_DIR = REPO_DIR / "logs" / "flight_logs"
 
 SERVER_CONFIG_PATH = CONFIG_DIR / "server.json"
 CONTROL_CONFIG_PATH = CONFIG_DIR / "control.json"
@@ -24,6 +26,8 @@ AIRFRAMES_CONFIG_PATH = CONFIG_DIR / "airframes.json"
 # v2: 生成データは pc_server/data/ 配下に集約(契約 §6)
 DATA_DIR = PC_SERVER_DIR / "data"
 SWEEP_RESULTS_DIR = DATA_DIR / "sweep_results"
+# 実験モードの計測ログ(EKF/FF 性能評価。ExpRecorder が使用)
+EXP_LOGS_DIR = DATA_DIR / "exp_logs"
 FF_PROFILES_DIR = DATA_DIR / "ff_profiles"
 CALPROFILES_DIR = DATA_DIR / "calibration_profiles"
 FF_STATE_PATH = DATA_DIR / "ff_state.json"

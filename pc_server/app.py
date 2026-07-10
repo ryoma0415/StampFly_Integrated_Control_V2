@@ -8,7 +8,8 @@
   (GET=状態、POST {"action": ...}=操作。core 層の戻り値 dict をそのまま返す)
 - WebSocket /ws: UI コマンド受付 + 20Hz 状態配信 + 即時 event/log 配信
   (v2 コマンド: set_mode "experiment" / experiment_activate / set_yaw_control /
-   circle_start / circle_stop / motor_start / motor_set / motor_stop、
+   circle_start / circle_stop / motor_start / motor_set / motor_stop /
+   exp_record_start / exp_record_stop、
    setpoint メッセージの yaw_deg、yaw メッセージ)
 
 ブロッキングする SessionManager 呼び出しは asyncio.to_thread で executor に
@@ -409,6 +410,10 @@ async def _handle_command(message: dict) -> None:
                                 float(message.get("duty", 0.0)))
     elif action == "motor_stop":
         await asyncio.to_thread(session.motor_stop)
+    elif action == "exp_record_start":
+        await asyncio.to_thread(session.exp_record_start)
+    elif action == "exp_record_stop":
+        await asyncio.to_thread(session.exp_record_stop)
     elif action == "multi_select":
         names = message.get("names")
         await asyncio.to_thread(

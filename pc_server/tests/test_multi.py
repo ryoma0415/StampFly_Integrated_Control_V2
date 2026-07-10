@@ -412,6 +412,125 @@ class TestMultiGuards:
         assert relay.uplinks(0, proto.MsgType.CMD_START) == []
 
 
+class TestMultiFlightLogs:
+    """T3-5: 機体別フライトログ(寿命 = 一斉開始〜全機着陸、自動OFF)。"""
+
+    def _prepare(self, multi_session, tmp_path):
+        """選択+目標設定+新鮮な MoCap まで進めた session を返す。"""
+        session, transport, clock, relay = multi_session
+        session.multi.logs_dir = tmp_path   # ログ出力先をテスト領域へ
+        select_two(session)
+        session.multi_target("drone 1", 0.5, 0.5, 0.4)
+        session.multi_target("drone 2", -0.5, -0.5, 0.4)
+        feed_fresh_mocap(session, clock)
+        return session, transport, clock, relay
+
+    def _push_tlm(self, transport, node, state, flags):
+        tlm = proto.TlmState(state=state, flags=flags)
+        inner = proto.pack_frame(proto.MsgType.TLM_STATE, 1, tlm.to_payload())
+        transport.push(proto.MsgType.RLY_MUX_DOWN, proto.mux_wrap(node, inner))
+
+    def _land_all(self, session, transport):
+        """全機を flying へ昇格させたのち着陸(WAIT)まで進める。"""
+        for node in (0, 1):
+            self._push_tlm(transport, node, proto.FlightState.HOVER,
+                           proto.TlmState.FLAG_FLYING)
+        assert wait_until(lambda: all(
+            s.phase == "flying" for s in session.multi._slots))
+        for node in (0, 1):
+            self._push_tlm(transport, node, proto.FlightState.WAIT, 0)
+        assert wait_until(lambda: all(
+            s.phase == "idle" for s in session.multi._slots))
+
+    def test_logging_reserved_until_start_all(self, multi_session, tmp_path):
+        session, transport, clock, relay = self._prepare(
+            multi_session, tmp_path)
+        session.set_logging(True)
+        assert session.multi.logging_active is False   # 予約のみ
+        assert list(tmp_path.glob("*.csv")) == []
+
+        assert session.multi_start() is True           # 一斉開始で開く
+        assert session.multi.logging_active is True
+        names = sorted(p.name for p in tmp_path.glob("*.csv"))
+        assert len(names) == 2
+        # 機体名 sanitize(英数と - _ 以外 → -)+ 全機同一タイムスタンプ
+        assert names[0].endswith("_multi_drone-1.csv")
+        assert names[1].endswith("_multi_drone-2.csv")
+        assert len({n.split("_multi_")[0] for n in names}) == 1
+        # status: logging=True、log_file は「先頭ファイル名 ×N機」
+        snap = session.get_state_snapshot()["data"]["session"]
+        assert snap["logging"] is True
+        assert snap["log_file"].startswith(names[0])
+        assert snap["log_file"].endswith("×2機")
+
+    def test_rows_written_and_all_landed_closes_auto_off(self, multi_session,
+                                                         tmp_path):
+        session, transport, clock, relay = self._prepare(
+            multi_session, tmp_path)
+        session.set_logging(True)
+        assert session.multi_start() is True
+        # 決定的に1行書かせる(FakeClock を進めない限り 50Hz スレッドは
+        # step しないため、直接 step を呼んでも競合しない)
+        for slot in session.multi._slots:
+            slot.controller.step(clock())
+        files = sorted(tmp_path.glob("*.csv"))
+        assert len(files) == 2
+
+        # 全機着陸 → supervise が全ファイル close + 予約フラグ自動 OFF
+        self._land_all(session, transport)
+        assert session.multi.logging_active is True    # 検知は supervise 側
+        session.supervise(clock())
+        assert session.multi.logging_active is False
+        assert session._logging_enabled is False
+
+        for path in files:
+            lines = path.read_text(encoding="utf-8").strip().splitlines()
+            header = lines[0].split(",")
+            assert header[0] == "timestamp"
+            assert len(lines) >= 2                     # ヘッダ + 1行以上
+            row = lines[1].split(",")
+            assert row[header.index("mode")] == "multi"
+            assert row[header.index("phase")] == "armed"
+            assert row[header.index("send_success")] == "1"
+
+    def test_stop_all_keeps_logging_until_landed(self, multi_session,
+                                                 tmp_path):
+        session, transport, clock, relay = self._prepare(
+            multi_session, tmp_path)
+        session.set_logging(True)
+        assert session.multi_start() is True
+        assert session.stop() is True                  # 全機へ CMD_STOP
+        # 着陸検知(全機 idle)までは記録を続ける
+        session.supervise(clock())
+        assert session.multi.logging_active is True
+        self._land_all(session, transport)
+        session.supervise(clock())
+        assert session.multi.logging_active is False
+        assert session._logging_enabled is False
+
+    def test_set_logging_during_multi_flight_opens_and_off_closes(
+            self, multi_session, tmp_path):
+        session, transport, clock, relay = self._prepare(
+            multi_session, tmp_path)
+        assert session.multi_start() is True           # ログ予約なしで開始
+        assert session.multi.logging_active is False
+        session.set_logging(True)                      # 飛行中 ON → 即開く
+        assert session.multi.logging_active is True
+        assert len(list(tmp_path.glob("*.csv"))) == 2
+        session.set_logging(False)                     # OFF は即閉じ
+        assert session.multi.logging_active is False
+
+    def test_teardown_closes_logs_and_auto_off(self, multi_session, tmp_path):
+        session, transport, clock, relay = self._prepare(
+            multi_session, tmp_path)
+        session.set_logging(True)
+        assert session.multi_start() is True
+        assert session.multi.logging_active is True
+        session.disconnect()                           # teardown 経路
+        assert session.multi.logging_active is False
+        assert session._logging_enabled is False
+
+
 class TestMultiYawAndFf:
     """機体別ヨー角制御と機体別 FF 操作(ノード宛 ACK 経由)。"""
 

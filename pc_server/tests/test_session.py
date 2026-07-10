@@ -337,7 +337,10 @@ class TestEventsAndLogText:
 
 
 class TestLoggingIntegration:
-    def test_logging_toggle_creates_and_closes_file(self, tmp_path, session_factory):
+    """飛行ログの寿命 = START(CMD_START 受理)〜飛行終了(+自動OFF)。"""
+
+    def test_logging_on_is_reservation_until_start(self, tmp_path,
+                                                   session_factory):
         session, transport, clock = session_factory()
         session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
         session.connect("FAKE")
@@ -345,13 +348,112 @@ class TestLoggingIntegration:
         session.posture.stop()
 
         session.set_logging(True)
+        assert not session.logger.active       # 接続中でも予約のみ
+
+        assert session.start()                 # CMD_START 受理 → ファイルを開く
         assert session.logger.active
         log_file = session.logger.file_path
         assert log_file is not None
         assert log_file.name.endswith("_posture.csv")
 
         session.posture.step(clock())          # 1行書かれる
-        session.set_logging(False)
+        session.set_logging(False)             # OFF は従来どおり即閉じ
         assert not session.logger.active
         content = log_file.read_text(encoding="utf-8").strip().splitlines()
         assert len(content) == 2               # ヘッダ + 1行
+
+    def test_set_logging_during_flight_opens_immediately(self, tmp_path,
+                                                         session_factory):
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+        assert session.start()
+        session._update_phase_from_drone(proto.FlightState.HOVER,
+                                         proto.TlmState.FLAG_FLYING)
+        assert not session.logger.active
+
+        session.set_logging(True)              # 飛行中の ON → 即開く
+        assert session.logger.active
+
+    def test_landing_closes_log_and_auto_off(self, tmp_path, session_factory):
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+        session.set_logging(True)
+        assert session.start()
+        session._update_phase_from_drone(proto.FlightState.HOVER,
+                                         proto.TlmState.FLAG_FLYING)
+        assert session.logger.active
+
+        # 着陸(flying → connected)→ ファイル close + 予約フラグ自動 OFF
+        session._update_phase_from_drone(proto.FlightState.WAIT, 0)
+        assert session._phase == PHASE_CONNECTED
+        assert not session.logger.active
+        assert session._logging_enabled is False
+
+    def test_start_grace_expiry_closes_log_and_auto_off(self, tmp_path,
+                                                        session_factory):
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+        session.set_logging(True)
+        assert session.start()
+        assert session.logger.active
+
+        # START 猶予切れ(armed のまま地上状態が続く)→ close + 自動 OFF
+        clock.advance(session._start_grace_s + 0.1)
+        session._update_phase_from_drone(proto.FlightState.WAIT, 0)
+        assert session._phase == PHASE_CONNECTED
+        assert not session.logger.active
+        assert session._logging_enabled is False
+
+    def test_full_flight_log_scenario(self, tmp_path, session_factory):
+        """一連の動作: 接続→トグルON(未作成)→START(作成+行記録)→着陸(close+自動OFF)。"""
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+
+        # トグル ON は予約のみ — ファイルはまだ作られない
+        session.set_logging(True)
+        assert not session.logger.active
+        assert list(tmp_path.glob("*.csv")) == []
+
+        # START(CMD_START 受理)でファイルが開き、送信ごとに行が書かれる
+        assert session.start()
+        assert session.logger.active
+        log_file = session.logger.file_path
+        assert log_file is not None and log_file.exists()
+        session.posture.step(clock())
+        session._update_phase_from_drone(proto.FlightState.HOVER,
+                                         proto.TlmState.FLAG_FLYING)
+        session.posture.step(clock())
+
+        # 着陸イベント(flying → connected)→ close + 予約フラグ自動 OFF
+        session._update_phase_from_drone(proto.FlightState.WAIT, 0)
+        assert session._phase == PHASE_CONNECTED
+        assert not session.logger.active
+        assert session._logging_enabled is False
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 3                 # ヘッダ + 2行(armed/flying)
+
+    def test_teardown_closes_log_and_auto_off(self, tmp_path, session_factory):
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+        session.set_logging(True)
+        assert session.start()
+        assert session.logger.active
+
+        session.disconnect()                   # teardown 経路
+        assert not session.logger.active
+        assert session._logging_enabled is False

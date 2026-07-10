@@ -41,8 +41,8 @@
 
 (yaw側にあった `/api/yawlog` による専用 yaw ログは V2 では廃止し、飛行ログ+
 flight_log_viewer に統合した。`pc_server/data/yaw_eval_results/` は旧形式
-yawlog 用の置き場として残り、`data_analysis/analyze_yaw_eval.py` /
-`replay_yaw_ff.py` は旧形式のまま利用できる。)
+yawlog の置き場としてのみ残る。旧形式向け解析スクリプト
+(analyze_yaw_eval.py / replay_yaw_ff.py)は削除済み。)
 
 ## 1. ディレクトリ・ファイル構成(V2)
 
@@ -53,10 +53,14 @@ StampFly_Integrated_Control_V2/
     ff_params/
       __init__.py
       core.py                         # 純粋関数: 8ラン → プロファイルdict
-    make_ff_profile.py                # CLI
-    replay_yaw_ff.py                  # オフラインリプレイ(旧yawlog形式向け)
+                                      # (+ sequence meta → 単機ラン展開)
+    make_ff_profile.py                # 抽出CLI+対話モード(8本 or 全機4+sequence)
+    plot_sweep.py                     # スイープ校正解析+加算性検証グラフ(対話式)
+    plot_explog.py                    # Experiment計測ログ(exp_logs)グラフ化(対話式)
+    graphs/                           # グラフ出力先(生成物)
     tests/
       test_ff_extraction.py           # 受入テスト(6/12照合 + 付録A再現)
+      fixtures/results.json           # 受入テストの真値(6/12 feasibility 結果)
   pc_server/
     core/ffprofile.py                 # 抽出サブプロセス起動・適用・状態管理
     data/
@@ -155,7 +159,7 @@ StampFly_Integrated_Control_V2/
   `--plots`(検証図PNG、既定off)。memo 既定値は
   `"<notes.locationの多数派> <acquired_span> 取得8本"` を自動生成。
 
-### 3.2 計算(analyze_feasibility_20260612.py から忠実に移植)
+### 3.2 計算(旧 analyze_feasibility_20260612.py から忠実に移植・同スクリプトは削除済み)
 
 集計・フィットは feasibility スクリプトの関数を**そのまま**ライブラリ化する
 (`aggregate`: phase=='measure'、(duty,leg)別、n≥3 / `fit_affine`(アンカー込み) /

@@ -33,6 +33,7 @@ from . import config as cfg
 from .calibration import CalibrationManager, ack_detail, ack_ok
 from .experiment import ExperimentHub
 from .ffprofile import FfProfileManager
+from . import logger as logger_mod
 from .logger import FlightLogger
 from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
 from .multi import MultiControlManager
@@ -68,8 +69,6 @@ _START_REJECT_REASONS = frozenset({
     proto.Reason.START_REJECTED_LOW_VOLTAGE,
     proto.Reason.START_REJECTED_NOT_READY,
 })
-
-MS_PER_S = 1000.0
 
 # shutdown(Ctrl-C 経路)が _command_lock を待つ上限 [s](構造定数)。
 # FF 転送など長時間ロックを保持する操作の最中でも、プロセス終了を無期限に
@@ -206,6 +205,11 @@ class SessionManager:
             tlm_state_provider=self._tlm_state_snapshot)
         self.ffprofile = FfProfileManager(self.serial, self.experiment,
                                           self.calibration, notify=self.warn)
+        # 実験計測ログ(ExpRecorder)への供給線: 最新 TLM_STATE スナップ
+        # ショットと FF 適用状態(meta 用)。hub 構築時には ffprofile が
+        # まだ無いため、ここで配線する(依存注入)。
+        self.experiment.recorder.tlm_state_provider = self._tlm_state_snapshot
+        self.experiment.recorder.ff_state_provider = self._ff_state_snapshot
         # 複数機同時制御(MODE_MULTI)。ノード付き受信ハンドラは
         # MultiControlManager 自身が serial に登録する。
         self.multi = MultiControlManager(
@@ -326,8 +330,6 @@ class SessionManager:
             pass   # 複数機モード: multi_select(RLY_SET_PEERS)まで送信なし
         else:
             self._start_active_sender()
-        if self._logging_enabled:
-            self._start_log_file()
         self._supervisor_stop.clear()
         self._supervisor_thread = threading.Thread(
             target=self._supervisor_loop, name="session-supervisor", daemon=True)
@@ -641,8 +643,6 @@ class SessionManager:
                 pass   # multi_select(RLY_SET_PEERS)まで送信なし
             else:
                 self._start_active_sender()
-            if self._logging_enabled:
-                self._start_log_file()   # ファイル名にモードを含むため切替
         self.info(f"モード: {mode}")
         return True
 
@@ -750,6 +750,10 @@ class SessionManager:
         with self._lock:
             self._phase = PHASE_ARMED
             self._armed_since = self._clock()
+            logging_enabled = self._logging_enabled
+        if logging_enabled:
+            # 飛行ログの寿命は「START 受理 〜 飛行終了」(_finish_flight_log)
+            self._open_flight_log()
         if mode == MODE_POSITION:
             self.position.set_control_active(True)
         self.info("CMD_START 送信")
@@ -833,13 +837,30 @@ class SessionManager:
 
     @_ui_command
     def set_logging(self, enabled: bool) -> None:
-        """CSV ログの ON/OFF。接続中なら即座にファイルを開閉する。"""
+        """CSV ログ予約の ON/OFF。
+
+        _logging_enabled は「予約フラグ」: ON にしても即座にはファイルを
+        開かず、START(CMD_START 受理)/一斉開始(multi_start)でファイルを
+        開く。飛行中(単機 armed/flying、または複数機スロットの
+        armed/flying)に ON を受けたときのみ即座に開く(途中からの記録)。
+        OFF は従来どおり即座に閉じる。飛行終了時は _finish_flight_log が
+        ファイルを閉じてフラグを自動 OFF する。
+        """
         with self._lock:
             self._logging_enabled = bool(enabled)
-        if enabled and self.serial.is_connected:
-            self._start_log_file()
-        elif not enabled:
+            phase = self._phase
+        if enabled:
+            if phase in (PHASE_ARMED, PHASE_FLYING):
+                self._open_flight_log()   # 飛行中の途中から記録
+            elif self.multi.any_armed_or_flying():
+                # 複数機の飛行中 ON → 機体別ログを即開く(途中からの記録)
+                for name in self.multi.open_flight_logs():
+                    self.info(f"ログ開始: {name}")
+            else:
+                self.info("ログ予約: 次の飛行開始(START)から記録します")
+        else:
             self.logger.stop()
+            self.multi.close_flight_logs()
             self.info("ログ停止")
 
     def set_setpoint_deg(self, roll_deg: float, pitch_deg: float, alt_m: float,
@@ -928,7 +949,7 @@ class SessionManager:
 
     @_ui_command
     def multi_start(self) -> bool:
-        """選択済み全機の一斉離陸。"""
+        """選択済み全機の一斉離陸(ログ予約 ON なら機体別ログを開く)。"""
         with self._lock:
             mode = self._mode
         if mode != MODE_MULTI:
@@ -937,7 +958,15 @@ class SessionManager:
         ok, message = self.multi.start_all()
         if not ok:
             self.warn(f"一斉開始不可: {message}")
-        return ok
+            return False
+        with self._lock:
+            logging_enabled = self._logging_enabled
+        if logging_enabled:
+            # 飛行ログの寿命は単機と同じ「開始〜飛行終了」。閉じ側は
+            # 全機着陸の検知(supervise → _finish_flight_log)が担う
+            for name in self.multi.open_flight_logs():
+                self.info(f"ログ開始: {name}")
+        return True
 
     def multi_yaw(self, name: str, enabled=None, yaw_deg=None) -> bool:
         """機体別ヨー角制御 ON/OFF・ヨー目標 [deg](複数機モード)。"""
@@ -1076,6 +1105,49 @@ class SessionManager:
         return self.experiment.sequence.start(
             masks, pattern=pattern, notes=notes, min_start_vbat=min_start_vbat)
 
+    @_ui_command
+    def exp_record_start(self) -> dict:
+        """実験計測ログ(EKF/FF 性能ログ)の開始(T1-6)。
+
+        mode==experiment かつ MOTOR_TEST 有効のときのみ。スイープ/シーケンス
+        との排他は ExpRecorder.start が start_gate 下で最終判定する。
+        """
+        reason = self._experiment_ready()
+        if reason is not None:
+            self.warn(f"計測開始不可: {reason}")
+            return {"ok": False, "message": reason,
+                    **self.experiment.recorder.status()}
+        result = self.experiment.recorder.start()
+        if result.get("ok"):
+            self.info(f"計測開始: {result.get('file')}")
+        elif result.get("message"):
+            self.warn(f"計測開始不可: {result['message']}")
+        return result
+
+    @_ui_command
+    def exp_record_stop(self) -> dict:
+        """実験計測ログの手動停止(meta は aborted=false)。
+
+        前提チェックなしで常に受け付ける(モード離脱後などの取り残しも
+        確実に閉じられるように。未計測なら ok=False で無害)。
+        """
+        result = self.experiment.recorder.stop()
+        if result.get("ok"):
+            self.info(f"計測終了: {result.get('file')}"
+                      f"({result.get('samples')}サンプル)")
+        elif result.get("message"):
+            self.warn(f"計測停止不可: {result['message']}")
+        return result
+
+    def _ff_state_snapshot(self) -> Optional[dict]:
+        """FF 適用状態の抜粋(ExpRecorder の meta 用。取れなければ None)。"""
+        applied = self.ffprofile.status().get("applied")
+        if not isinstance(applied, dict):
+            return None
+        return {"profile": applied.get("name"),
+                "ff_mode": applied.get("ff"),
+                "est_mode": applied.get("est")}
+
     def shutdown(self) -> None:
         """サーバ終了時の後始末(Ctrl-C の lifespan 経路)。
 
@@ -1091,7 +1163,7 @@ class SessionManager:
                 self.warn("コマンド実行中のため強制シャットダウンします")
                 self._supervisor_stop.set()
                 self._stop_active_sender()
-                self.logger.stop()
+                self._finish_flight_log()
                 self.serial.disconnect()
         finally:
             if acquired:
@@ -1154,21 +1226,45 @@ class SessionManager:
         self.position.stop()
         self.mocap.shutdown()
 
-    def _start_log_file(self) -> None:
+    def _open_flight_log(self) -> None:
+        """単機の飛行ログファイルを開く(START 受理時/飛行中のログ ON)。"""
         with self._lock:
             mode = self._mode
         path = self.logger.start(mode)
         self.info(f"ログ開始: {path.name}")
 
+    def _finish_flight_log(self) -> None:
+        """飛行ログを閉じ、予約フラグを自動 OFF する(飛行終了の一元フック)。
+
+        armed/flying → connected へ戻る全経路(着陸、START 猶予切れ、
+        START 拒否)と teardown(切断/シリアル断/シャットダウン)、および
+        複数機モードの全機着陸検知(supervise)から呼ぶ。
+        RX スレッドからも安全(logger.stop() は内部ロックのみ、
+        events.put はブロックしない)。複数機(T3-5)の機体別ロガーも
+        ここで閉じる(このフックに集約)。
+        """
+        path = self.logger.file_path
+        self.logger.stop()
+        multi_names = self.multi.close_flight_logs()
+        with self._lock:
+            self._logging_enabled = False
+        if path is not None:
+            self.info(f"ログ終了: {path.name}(自動OFF)")
+        for name in multi_names:
+            self.info(f"ログ終了: {name}(自動OFF)")
+
     def _teardown_session(self, message: str) -> None:
         self._stop_active_sender()
+        # ログ(単機+複数機の機体別)を閉じ、予約フラグも下ろす。
+        # multi.deactivate より先に呼ぶ(ファイル名つきの終了通知のため。
+        # 閉じた後の 50Hz 送信スレッドの log_row は無視される)
+        self._finish_flight_log()
         # 複数機スロットを解放(シリアルはこの後閉じるためピア解除は送らない。
         # 各機体はセットポイント 500ms 途絶で自動着陸する)
         self.multi.deactivate(clear_peers=False)
         # 実験機能を停止(シリアルはこの後閉じるため CMD_MODE は送らない。
         # 機体側はモーターコマンド 1.5s 途絶で自動停止する)
         self.experiment.deactivate()
-        self.logger.stop()
         self.serial.disconnect()
         with self._lock:
             self._phase = PHASE_IDLE
@@ -1316,83 +1412,15 @@ class SessionManager:
                                 & proto.CmdSetpoint.FLAG_YAW_REF_VALID),
         }
 
-        # Position モードの診断列
-        filtered = meta.get("filtered_pos")
-        if filtered is not None:
-            row["pos_x"], row["pos_y"], row["pos_z"] = filtered
-        raw = meta.get("raw_pos")
-        if raw is not None:
-            row["raw_pos_x"], row["raw_pos_y"], row["raw_pos_z"] = raw
-        pid_components = meta.get("pid_components")
-        if pid_components is not None:
-            row["pid_x_p"] = pid_components["x"]["p"]
-            row["pid_x_i"] = pid_components["x"]["i"]
-            row["pid_x_d"] = pid_components["x"]["d"]
-            row["pid_y_p"] = pid_components["y"]["p"]
-            row["pid_y_i"] = pid_components["y"]["i"]
-            row["pid_y_d"] = pid_components["y"]["d"]
-        for key in ("error_x", "error_y", "target_x", "target_y", "target_z",
-                    "data_valid", "control_active", "mocap_dropout",
-                    "is_outlier", "used_prediction", "confidence",
-                    "consecutive_outliers", "data_source", "filter_threshold",
-                    "tracking_valid", "rb_error", "frame_number", "marker_count",
-                    "frame_dt_ms", "mocap_age_ms",
-                    "mocap_yaw_deg", "mocap_heading_deg",
-                    "traj_mode", "traj_phase_rad"):
-            if key in meta:
-                row[key] = meta[key]
-        if "marker_count" in meta:
-            row["rb_marker_count"] = meta["marker_count"]
+        # Position モードの診断列(meta 由来。logger の共通ヘルパで転記)
+        row.update(logger_mod.meta_to_row(meta))
 
         # 最新テレメトリのスナップショット
         with self._lock:
             tlm = self._tlm_state
             tlm_t = self._tlm_state_t
         if tlm is not None and tlm_t is not None:
-            row.update({
-                "tlm_age_ms": (self._clock() - tlm_t) * MS_PER_S,
-                "tlm_seq_echo": tlm.seq_echo,
-                "tlm_elapsed_ms": tlm.elapsed_ms,
-                "tlm_state": tlm.state,
-                "tlm_state_name": _state_name(tlm.state),
-                "tlm_flags": tlm.flags,
-                "tlm_reason": tlm.reason,
-                "tlm_reason_name": _reason_name(tlm.reason),
-                "tlm_roll_rad": tlm.roll,
-                "tlm_pitch_rad": tlm.pitch,
-                "tlm_yaw_rad": tlm.yaw,
-                "tlm_p_rad_s": tlm.p,
-                "tlm_q_rad_s": tlm.q,
-                "tlm_r_rad_s": tlm.r,
-                "tlm_roll_ref_rad": tlm.roll_ref,
-                "tlm_pitch_ref_rad": tlm.pitch_ref,
-                "tlm_alt_ref_m": tlm.alt_ref,
-                "tlm_altitude_tof_m": tlm.altitude_tof,
-                "tlm_altitude_est_m": tlm.altitude_est,
-                "tlm_alt_velocity_m_s": tlm.alt_velocity,
-                "tlm_z_dot_ref_m_s": tlm.z_dot_ref,
-                "tlm_voltage_v": tlm.voltage,
-                "tlm_duty_fr": tlm.duty_fr,
-                "tlm_duty_fl": tlm.duty_fl,
-                "tlm_duty_rr": tlm.duty_rr,
-                "tlm_duty_rl": tlm.duty_rl,
-                "tlm_ax_g": tlm.ax,
-                "tlm_ay_g": tlm.ay,
-                "tlm_az_g": tlm.az,
-                "tlm_loop_dt_us": tlm.loop_dt_us,
-                # v2: TLM_STATE 末尾拡張(ヨー推定/FF 診断)
-                "tlm_yaw_est_rad": tlm.yaw_est_rad,
-                "tlm_yaw_gyro_int_rad": tlm.yaw_gyro_int_rad,
-                "tlm_yaw_ref_rad": tlm.yaw_ref_rad,
-                "tlm_current_a": tlm.current_a,
-                "tlm_db_hat_x_ut": tlm.db_hat_x_ut,
-                "tlm_db_hat_y_ut": tlm.db_hat_y_ut,
-                "tlm_bm_x_ut": tlm.bm_x_ut,
-                "tlm_bm_y_ut": tlm.bm_y_ut,
-                "tlm_nis": tlm.nis,
-                "tlm_ffg": tlm.ffg,
-                "tlm_ff_status": tlm.ff_status,
-            })
+            row.update(logger_mod.tlm_state_to_row(tlm, self._clock() - tlm_t))
         return row
 
     # ==================================================================
@@ -1427,12 +1455,16 @@ class SessionManager:
         if event.state in (proto.FlightState.LANDING, proto.FlightState.WAIT):
             with self._lock:
                 self._stop_pending = None
-        # START 拒否 → armed を解除
+        # START 拒否 → armed を解除(飛行終了扱い: ログも閉じる)
         if event.reason in _START_REJECT_REASONS:
+            disarmed = False
             with self._lock:
                 if self._phase == PHASE_ARMED:
                     self._phase = PHASE_CONNECTED
                     self._armed_since = None
+                    disarmed = True
+            if disarmed:
+                self._finish_flight_log()
             self.warn(f"離陸拒否: {_reason_name(event.reason)}")
         self._update_phase_from_drone(event.state, 0)
         self.events.put(_json_safe({
@@ -1491,10 +1523,15 @@ class SessionManager:
         self.calibration.on_cal_data(cal, node_id=node_id)
 
     def _update_phase_from_drone(self, state: int, flags: int) -> None:
-        """ドローンの報告状態から armed/flying/connected フェーズを更新する。"""
+        """ドローンの報告状態から armed/flying/connected フェーズを更新する。
+
+        armed/flying → connected へ戻る遷移(着陸・START 猶予切れ)は
+        「飛行終了」の一元検知点でもあり、_finish_flight_log を呼ぶ
+        (飛行ログの寿命 = START〜飛行終了の閉じ側)。
+        """
         flying_flag = bool(flags & proto.TlmState.FLAG_FLYING)
         in_flight = flying_flag or state in _IN_FLIGHT_STATES
-        deactivate_control = False
+        flight_ended = False
         with self._lock:
             if self._phase == PHASE_ARMED:
                 if in_flight:
@@ -1506,11 +1543,11 @@ class SessionManager:
                     # START 後も離陸へ遷移しない → 受理されなかったとみなす
                     self._phase = PHASE_CONNECTED
                     self._armed_since = None
-                    deactivate_control = True
+                    flight_ended = True
             elif self._phase == PHASE_FLYING and not in_flight \
                     and state in _ON_GROUND_STATES:
                 self._phase = PHASE_CONNECTED
-                deactivate_control = True
+                flight_ended = True
             elif self._phase == PHASE_CONNECTED and in_flight:
                 # 接続先の機体が既に飛行中(例: ホバリング中に PC サーバを再起動
                 # して再接続)。connected のままだと飛行ガード(モード/プロファイル
@@ -1518,8 +1555,9 @@ class SessionManager:
                 # START 猶予(_armed_since)の判定は armed フェーズ限定なので
                 # この昇格とは干渉しない。
                 self._phase = PHASE_FLYING
-        if deactivate_control:
+        if flight_ended:
             self.position.set_control_active(False)
+            self._finish_flight_log()
 
     # ==================================================================
     # 内部: 監視スレッド(STOP再送 / MoCap途絶 / リンク断)
@@ -1598,6 +1636,13 @@ class SessionManager:
 
         # --- 複数機モード(スロットごとの STOP 再送 / MoCap 途絶 / 猶予) ---
         self.multi.supervise(now)
+
+        # --- 複数機の飛行終了検知(T3-5): 全機着陸で全ログ close + 自動OFF ---
+        # スロット phase は RX スレッド(TLM)と multi.supervise(途絶解放)
+        # が更新するため、multi.supervise の後に判定する。stop_all /
+        # 緊急停止後も着陸(全機 idle)を検知するまで記録は続く。
+        if self.multi.logging_active and not self.multi.any_armed_or_flying():
+            self._finish_flight_log()
 
     def _supervise_tlm_staleness(self, now: float) -> None:
         """単機経路のテレメトリ鮮度監視1周期(supervise から毎周期呼ばれる)。"""
@@ -1804,6 +1849,12 @@ class SessionManager:
         # 取るため)stop() と競合して None になり得る。一度だけ読んで使う
         # (20Hz 配信タスクを AttributeError で殺さないため)。
         log_path = self.logger.file_path
+        # 複数機の機体別ログ記録中は「先頭ファイル名 ×N機」を表示する(T3-6)
+        multi_log_names = self.multi.log_file_names()
+        if multi_log_names:
+            log_file = f"{multi_log_names[0]} ×{len(multi_log_names)}機"
+        else:
+            log_file = log_path.name if log_path else None
 
         session = {
             "mode": mode,
@@ -1813,7 +1864,7 @@ class SessionManager:
             "airframe": airframe["name"] if airframe else None,
             "relay_target_ok": relay_target_ok,
             "logging": logging_enabled,
-            "log_file": log_path.name if log_path else None,
+            "log_file": log_file,
             "target": target,
             "setpoint": {
                 "roll_deg": roll_rad * RAD_TO_DEG,
@@ -1843,6 +1894,8 @@ class SessionManager:
                 "sweep": self.experiment.sweep.status(),
                 "sequence": self.experiment.sequence.status(),
                 "cal3d": self.experiment.cal3d_status(),
+                # 計測ログ(EKF/FF 性能ログ)の状態(T1-6)
+                "recording": self.experiment.recorder.status(),
                 "exp_age_s": exp_age,
                 "exp": None if exp_sample is None else {
                     "current_a": exp_sample["current_a"],

@@ -21,7 +21,13 @@ multi_start / stop)と 20Hz supervisor から呼ばれる。
   / XY 誤差発散(飛行中の閉ループで divergence_error_m 超過が
   divergence_hold_s 継続したら当該機へ CMD_STOP — rigid_body_id 取り違えで
   他機の位置とループを閉じる交差結合の検知)。
-- スコープ: 静的目標のみ(円軌道なし)・CSV ログなし。ヨー角制御は機体別に
+- CSV フライトログは機体別に1ファイル(logs/flight_logs/
+  <ts>_multi_<機体名>.csv、全機同一タイムスタンプ)。寿命は単機と同じ
+  「一斉開始(start_all 成功)〜全機着陸」。開閉の指示は session が行う
+  (multi_start → open_flight_logs、飛行終了の一元フック
+  session._finish_flight_log → close_flight_logs)。deactivate は安全網
+  として必ず閉じる。
+- スコープ: 静的目標のみ(円軌道なし)。ヨー角制御は機体別に
   ON/OFF 可(set_yaw — 単機と同じ SetpointShaper 経路で ±180°目標を整形)。
   FF プロファイル適用も機体別に可(session.multi_ff_* → ffprofile の
   node_id/mac 版。適用状態は ff_state.json の applied_by_mac)。
@@ -29,12 +35,15 @@ multi_start / stop)と 20Hz supervisor から呼ばれる。
 
 from __future__ import annotations
 
+import re
 import threading
+from datetime import datetime
 from typing import Callable, Optional
 
 import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from . import config as cfg
+from .logger import FlightLogger, meta_to_row, tlm_state_to_row
 from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
 from .position import PositionController
 from .serial_link import SerialLink, SerialLinkError
@@ -75,6 +84,11 @@ SLOT_ARMED = "armed"
 SLOT_FLYING = "flying"
 
 
+def _sanitize_name(name: str) -> str:
+    """機体名 → ログファイル名用(英数と - _ 以外を - に置換)。"""
+    return re.sub(r"[^0-9A-Za-z_-]", "-", name)
+
+
 class DroneSlot:
     """機体1機ぶんの実行状態(MultiControlManager._lock で保護)。"""
 
@@ -103,6 +117,9 @@ class DroneSlot:
         # 最新テレメトリ(ノード帰属済み)
         self.tlm: Optional[proto.TlmState] = None
         self.tlm_t: Optional[float] = None
+        # 機体別フライトログ(開いている間のみ非 None。開閉は
+        # open_flight_logs / close_flight_logs。log_row 自体はスレッド安全)
+        self.logger: Optional[FlightLogger] = None
 
 
 class MultiControlManager:
@@ -163,6 +180,11 @@ class MultiControlManager:
         xy_mode = control_cfg.get("xy_command_mode", "pc")
         self._xy_onboard: bool = (xy_mode == "onboard")
         self._pos_err_clamp_m: float = control_cfg.get("pos_err_clamp_m", 2.0)
+
+        # 機体別フライトログ(T3-5)。logs_dir はテストが差し替え可能
+        self._flush_every_rows: int = \
+            server_config["logging"]["flush_every_rows"]
+        self.logs_dir = cfg.LOGS_DIR
 
         # スロット表(_lock 保護。RX スレッドの TLM ハンドラと UI コマンド、
         # supervisor が競合する)
@@ -266,6 +288,8 @@ class MultiControlManager:
 
     def deactivate(self, clear_peers: bool = True) -> None:
         """全スロットを停止・解放する(モード離脱・切断・選び直し時)。"""
+        # 機体別ログの安全網(通常は session._finish_flight_log が先に閉じる)
+        self.close_flight_logs()
         with self._lock:
             slots = self._slots
             self._slots = []
@@ -469,6 +493,116 @@ class MultiControlManager:
             return False
         self._info(f"CMD_STOP 送信({slot.name})")
         return True
+
+    # ==================================================================
+    # 機体別フライトログ(T3-5。開閉の指示は session が行う)
+    # ==================================================================
+
+    def open_flight_logs(self) -> list[str]:
+        """全スロットの機体別フライトログを開く(未開のスロットのみ)。
+
+        ファイル名は全機同一タイムスタンプの
+        <YYYYMMDD_HHMMSS>_multi_<機体名sanitize>.csv。
+        session.multi_start(一斉開始成功後、ログ予約 ON のとき)と
+        set_logging(飛行中の途中 ON)から呼ばれる。
+        戻り値は新たに開いたファイル名(スロット未選択なら空)。
+        """
+        with self._lock:
+            slots = [s for s in self._slots
+                     if s.logger is None or not s.logger.active]
+        if not slots:
+            return []
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        names: list[str] = []
+        for slot in slots:
+            logger = FlightLogger(logs_dir=self.logs_dir,
+                                  flush_every_rows=self._flush_every_rows)
+            path = logger.start(f"multi_{_sanitize_name(slot.name)}",
+                                stamp=stamp)
+            with self._lock:
+                slot.logger = logger
+            names.append(path.name)
+        return names
+
+    def close_flight_logs(self) -> list[str]:
+        """開いている機体別ログをすべて閉じる。閉じたファイル名を返す。
+
+        飛行終了の一元フック(session._finish_flight_log)・ログ OFF・
+        deactivate(安全網)から呼ばれる。50Hz 送信スレッドとは
+        FlightLogger 内部ロックで排他される(閉じた後の log_row は無視)。
+        """
+        with self._lock:
+            slots = list(self._slots)
+        names: list[str] = []
+        for slot in slots:
+            logger = slot.logger
+            if logger is None:
+                continue
+            path = logger.file_path
+            logger.stop()
+            with self._lock:
+                slot.logger = None
+            if path is not None:
+                names.append(path.name)
+        return names
+
+    @property
+    def logging_active(self) -> bool:
+        """いずれかのスロットの機体別ログが開いているか。"""
+        with self._lock:
+            return any(s.logger is not None and s.logger.active
+                       for s in self._slots)
+
+    def log_file_names(self) -> list[str]:
+        """開いている機体別ログのファイル名(node_id 順。status 表示用)。"""
+        with self._lock:
+            loggers = [s.logger for s in self._slots]
+        names: list[str] = []
+        for logger in loggers:
+            if logger is None:
+                continue
+            path = logger.file_path
+            if path is not None:
+                names.append(path.name)
+        return names
+
+    def _log_slot_row(self, slot: DroneSlot, logger: FlightLogger, *,
+                      seq: Optional[int], send_success: bool,
+                      roll_ref: float, pitch_ref: float, alt_ref: float,
+                      yaw_ref: float, yaw_ctrl_on: bool, meta: dict,
+                      extra: dict) -> None:
+        """機体別ログの1行を組み立てて書く(50Hz 送信スレッドから)。
+
+        列の語彙は単機(session._build_log_row)と同一。mode="multi"、
+        phase はスロット phase、tlm_* はそのスロットの最新 TLM_STATE。
+        """
+        with self._lock:
+            phase = slot.phase
+            tlm = slot.tlm
+            tlm_t = slot.tlm_t
+        row = {
+            "mode": "multi",
+            "phase": phase,
+            "command_sequence": seq,
+            "send_success": send_success,
+            "feedback_latency_ms": self._serial.node_latency_ms(slot.node_id),
+            "roll_ref_rad": roll_ref,
+            "pitch_ref_rad": pitch_ref,
+            "roll_ref_deg": roll_ref * RAD_TO_DEG,
+            "pitch_ref_deg": pitch_ref * RAD_TO_DEG,
+            "alt_ref_m": alt_ref,
+            "roll_bias_deg": slot.profile["roll_bias_deg"],
+            "pitch_bias_deg": slot.profile["pitch_bias_deg"],
+            # v2: ヨー指令(送信したヨー目標)
+            "cmd_yaw_ref_rad": yaw_ref,
+            "cmd_yaw_ref_deg": yaw_ref * RAD_TO_DEG,
+            "yaw_ctrl_on": yaw_ctrl_on,
+        }
+        row.update(meta_to_row(meta))
+        if tlm is not None and tlm_t is not None:
+            row.update(tlm_state_to_row(tlm, self._clock() - tlm_t))
+        row.update(extra)
+        logger.log_row(row)
 
     # ==================================================================
     # 受信ハンドラ(RX スレッド上: 状態更新とキュー投入のみ)
@@ -781,12 +915,20 @@ class MultiControlManager:
     # ==================================================================
 
     def _make_emit(self, node_id: int, profile: dict):
-        """スロット専用の setpoint/pos_err 送信クロージャ(50Hz スレッドから)。"""
+        """スロット専用の setpoint/pos_err 送信クロージャ(50Hz スレッドから)。
+
+        機体別ログが開いている間は、送信(成功/失敗を問わず)ごとに
+        1行を書く(単機の session._emit_setpoint / _emit_pos_err と同じ寿命)。
+        """
         bias_roll = profile["roll_bias_deg"] * DEG_TO_RAD
         bias_pitch = profile["pitch_bias_deg"] * DEG_TO_RAD
 
         def emit(roll_rad: float, pitch_rad: float, alt_m: float,
                  meta: dict) -> None:
+            # スロット参照(deactivate 後の残余ステップでは None → 送信のみ)
+            slot = self._slot_by_node(node_id)
+            logger = slot.logger if slot is not None else None
+            log_open = logger is not None and logger.active
             # ヨー角制御は機体別に選択可能(set_yaw)。単機の
             # session._emit_setpoint と同じ規約で meta から反映する
             # (OFF なら flags bit1=0 → 機体はレートダンピング)。
@@ -816,10 +958,29 @@ class MultiControlManager:
                 pos_err = proto.CmdPosErr(
                     err_x=err_x, err_y=err_y, alt_ref=alt_m, yaw_ref=yaw_ref,
                     mocap_yaw=float(heading or 0.0), flags=flags)
+                seq: Optional[int] = None
+                send_success = False
                 try:
-                    self._serial.send_pos_err_to(node_id, pos_err)
+                    seq = self._serial.send_pos_err_to(node_id, pos_err)
+                    send_success = True
                 except SerialLinkError:
                     pass   # 切断検知は serial の on_disconnect → supervisor
+                if log_open:
+                    # roll/pitch 指令は機体側で計算されるため 0(単機と同じ
+                    # 規約。実際の指令は tlm_roll_ref_rad 等に現れる)
+                    self._log_slot_row(
+                        slot, logger, seq=seq, send_success=send_success,
+                        roll_ref=0.0, pitch_ref=0.0, alt_ref=alt_m,
+                        yaw_ref=yaw_ref, yaw_ctrl_on=yaw_ctrl_on, meta=meta,
+                        extra={
+                            "xy_cmd_mode": "onboard",
+                            "cmd_err_x_m": err_x,
+                            "cmd_err_y_m": err_y,
+                            "cmd_xy_valid": xy_valid,
+                            "cmd_mocap_yaw_deg": (
+                                None if heading is None
+                                else heading * RAD_TO_DEG),
+                        })
                 return
             flags = proto.CmdSetpoint.FLAG_ALT_REF_VALID
             if yaw_ctrl_on:
@@ -831,9 +992,18 @@ class MultiControlManager:
                 yaw_ref=yaw_ref,
                 flags=flags,
             )
+            seq = None
+            send_success = False
             try:
-                self._serial.send_setpoint_to(node_id, setpoint)
+                seq = self._serial.send_setpoint_to(node_id, setpoint)
+                send_success = True
             except SerialLinkError:
                 pass   # 切断検知は serial の on_disconnect → supervisor が処理
+            if log_open:
+                self._log_slot_row(
+                    slot, logger, seq=seq, send_success=send_success,
+                    roll_ref=setpoint.roll_ref, pitch_ref=setpoint.pitch_ref,
+                    alt_ref=alt_m, yaw_ref=yaw_ref, yaw_ctrl_on=yaw_ctrl_on,
+                    meta=meta, extra={"xy_cmd_mode": "pc"})
 
         return emit

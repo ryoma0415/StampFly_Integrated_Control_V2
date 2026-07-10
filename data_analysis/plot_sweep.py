@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""StampFly Yaw 校正データ解析（bracket-baseline サンプルCSV → 9〜12枚の図）.
+"""StampFly スイープ結果のグラフ化（校正解析 + 加算性検証の統合スクリプト）.
 
-入力は pc_server が出力する samples-only CSV（サマリ/メタ無し）。
-測定行(phase=measure)には pc_server が前後ブラケット基準を時間補間して引いた
-ドリフト除去後の電流ノイズ dB_cor_{x,y,z} と、引いた基準 bx_base_cor.. が入っている。
-基準行(phase=baseline / 初期 base)には各duty の motor-off 基準磁場 b_cor が入る。
+旧 analyze_calibration.py（スイープ1本 → 9〜12枚の図）と
+旧 analyze_additivity.py（加算性シーケンス → 比較図 + 判定）を1本に統合したもの。
 
-新フォーマット（step_idx / leg 列つき、往復スイープ 0.1→1.0→0.1）の場合は
-さらに 図⑩ ヒステリシス（up/down分離）・図⑪ サンプル単位回帰・
-図⑫ 残差 vs IMU温度 を追加出力する（計12枚）。同じ stamp の
-sweep_<stamp>_meta.json があれば測定条件サマリを冒頭に表示し、
-baseline_flags（基準ジャンプ>閾値のステップ）を図③に赤×で重ねる。
-旧フォーマット CSV では従来どおり9枚を出力し、新機能は安全にスキップする。
+[1] スイープ1本のグラフ化（sweep_<stamp>_samples.csv）
+    入力は pc_server が出力する samples-only CSV（bracket-baseline 方式）。
+    測定行(phase=measure)にはドリフト除去後の電流ノイズ dB_cor_{x,y,z} が入る。
+    新フォーマット（step_idx / leg 列つき、往復スイープ）では
+    図⑩ ヒステリシス・図⑪ サンプル単位回帰・図⑫ 残差 vs IMU温度 を追加し
+    計12枚。旧フォーマットでは9枚。同じ stamp の meta JSON があれば
+    測定条件サマリを表示し、各図の下部にも条件を記載する。
+
+[2] 加算性シーケンスの検証グラフ（sequence_<runid>_meta.json）
+    モーター別スイープ（FL/FR/RL/RR 単機）の ΔB_m の和が全機同時スイープの
+    ΔB_all と一致するか（線形重ね合わせ）を検証する。対角ペア run があれば
+    該当2機の和とも比較。比較図（軸別 上段: 測定/予測, 下段: 残差±3σ）に加え、
+    判定サマリを PNG（00_verdict_summary.png）としても出力する。
 
 使い方:
-    python analyze_calibration.py                       # 一覧から対話選択
-    python analyze_calibration.py samples.csv [-o 出力ディレクトリ]
-    引数を省略すると ../pc_server/data/sweep_results/ 内の samples CSV を新しい順に
-    一覧表示し、番号を入力して1つ選ぶ（会話的選択）。図の出力先は既定で
-    data_analysis/graphs/analysis_<stem>/（この解析フォルダ配下）。
+    python plot_sweep.py                        # 対話: メニュー → ファイル番号選択
+    python plot_sweep.py <path> [-o 出力先] [--results-dir dir]
+        <path> は sweep_*_samples.csv（→スイープ解析）または
+        sequence_*_meta.json（→加算性検証）。拡張子/名前で自動判別する。
+    --results-dir はファイル一覧の探索先 / シーケンスの samples CSV の
+        ディレクトリ（既定: ../pc_server/data/sweep_results/）。
+
+出力先の既定:
+    data_analysis/graphs/sweep_<stamp>/          （スイープ解析）
+    data_analysis/graphs/additivity_<stem>/      （加算性検証）
 
 依存: numpy, matplotlib のみ。
 """
@@ -40,6 +50,9 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3d projection)
 
+# ダークテーマ（style 適用後にフォントを設定する: style がフォントを上書きするため）
+plt.style.use("dark_background")
+
 # 日本語フォント（macOS優先）。見つからなければ既定フォントのまま（英字は問題なし）。
 _INSTALLED = {f.name for f in fm.fontManager.ttflist}
 for _jp in ("Hiragino Sans", "Hiragino Maru Gothic Pro", "YuGothic", "Yu Gothic",
@@ -54,9 +67,19 @@ AXIS_LABEL = {"x": "ΔB_x", "y": "ΔB_y", "z": "ΔB_z"}
 FLIGHT_DUTY_LO = 0.5
 FLIGHT_DUTY_HI = 0.8
 
+SINGLES = ("FL", "FR", "RL", "RR")          # 単機 run のモーター名
+NOISE_SIGMA = 4.0                            # 判定: 最大|残差| ≤ max(4σ, 下限)
+NOISE_FLOOR_UT = 0.5                         # 判定しきい値の下限 [µT]（分解能スケール）
 
-# ---------------------------------------------------------------- load --------
-def _f(value: str) -> float:
+SWEEP_GLOB = "sweep_*_samples.csv"
+SEQ_GLOB = "sequence_*_meta.json"
+
+# 各図の下部に入れる測定条件サマリ（run_sweep / run_additivity が設定）
+_COND_FOOTER: str | None = None
+
+
+# ------------------------------------------------------------ common ----------
+def _f(value: str | None) -> float:
     """空欄/欠損は NaN。"""
     if value is None or value == "":
         return math.nan
@@ -66,25 +89,93 @@ def _f(value: str) -> float:
         return math.nan
 
 
+STR_COLS = ("phase", "motors", "leg")
+
+
 def load_samples(path: Path) -> dict:
+    """samples CSV を 列名→配列 の dict に読む（phase/motors/leg は文字列のまま）。"""
     rows = list(csv.DictReader(path.open(encoding="utf-8")))
     if not rows:
         sys.exit(f"空のCSVです: {path}")
-    cols = rows[0].keys()
-    out = {"phase": np.array([r.get("phase", "") for r in rows], dtype=object)}
-    for key in cols:
-        if key in ("phase", "motors"):
-            continue
-        if key == "leg":  # 新フォーマット: "up"/"down" の文字列列（数値化しない）
+    out = {}
+    for key in rows[0].keys():
+        if key in STR_COLS:
             out[key] = np.array([r.get(key) or "" for r in rows], dtype=object)
-            continue
-        out[key] = np.array([_f(r.get(key, "")) for r in rows], dtype=float)
+        else:
+            out[key] = np.array([_f(r.get(key, "")) for r in rows], dtype=float)
     return out
 
 
 def col(data: dict, name: str) -> np.ndarray:
     return data.get(name, np.full(len(data["phase"]), np.nan))
 
+
+def default_results_dir() -> Path:
+    """pc_server が結果を書き出す sweep_results フォルダ（既定）。"""
+    return Path(__file__).resolve().parent.parent / "pc_server" / "data" / "sweep_results"
+
+
+def graphs_dir() -> Path:
+    """グラフ出力のルート（data_analysis/graphs/）。"""
+    return Path(__file__).resolve().parent / "graphs"
+
+
+def _fmt_size(n: int) -> str:
+    return f"{n / 1024:.0f} KB" if n < 1024 * 1024 else f"{n / 1024 / 1024:.1f} MB"
+
+
+def _select_from_list(cands: list[Path], what: str, base_dir: Path) -> Path | None:
+    """候補ファイルを一覧表示し、番号で1つ選ばせる（会話的選択）。
+
+    Enter は最新（[1]）を選択、q で中止して None を返す。
+    パイプ等で対話入力が無い（EOF）場合は最新を自動選択する。
+    """
+    print(f"\n{base_dir} の {what} から、対象を選んでください:\n")
+    for i, p in enumerate(cands, 1):
+        st = p.stat()
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+        mark = "  ← 最新" if i == 1 else ""
+        print(f"  [{i}] {p.name}   {mtime}   {_fmt_size(st.st_size)}{mark}")
+    print()
+    while True:
+        try:
+            raw = input(f"番号を入力 [1-{len(cands)}]（Enter=最新 / q=中止）: ").strip()
+        except EOFError:
+            print("（対話入力なし → 最新を自動選択）")
+            return cands[0]
+        if raw == "":
+            return cands[0]
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(cands):
+            return cands[int(raw) - 1]
+        print(f"  '{raw}' は無効です。1〜{len(cands)} の番号を入力してください。")
+
+
+def _list_by_mtime(d: Path, pattern: str) -> list[Path]:
+    """d 内の pattern に一致するファイルを新しい順（mtime 降順）に返す。"""
+    if not d.is_dir():
+        return []
+    return sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _strip_suffix(stem: str, suffix: str) -> str:
+    return stem[: -len(suffix)] if stem.endswith(suffix) else stem
+
+
+def save_fig(fig, out: Path, name: str) -> None:
+    """全図共通の保存処理（条件フッター → レイアウト調整 → PNG 出力 → クローズ）。"""
+    fig.tight_layout()
+    if _COND_FOOTER:
+        fig.text(0.5, -0.005, _COND_FOOTER, ha="center", va="top",
+                 fontsize=8, color="lightgray")
+    fig.savefig(out / name, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ==============================================================================
+# [1] スイープ1本のグラフ化（旧 analyze_calibration.py）
+# ==============================================================================
 
 # ----------------------------------------------------------- aggregation ------
 def measure_mask(data: dict) -> np.ndarray:
@@ -274,9 +365,7 @@ def meta_path_for(samples: Path) -> Path:
     `..._samples.csv` → `..._meta.json`。それ以外の名前（合成CSV等）は
     `<stem>_meta.json` を隣に探す。
     """
-    stem = samples.stem
-    if stem.endswith("_samples"):
-        stem = stem[: -len("_samples")]
+    stem = _strip_suffix(samples.stem, "_samples")
     return samples.with_name(stem + "_meta.json")
 
 
@@ -294,6 +383,17 @@ def load_meta(samples: Path) -> dict | None:
 
 def _num(x) -> str:
     return f"{x:.3f}" if isinstance(x, (int, float)) else "-"
+
+
+def meta_condition_line(meta: dict) -> str:
+    """図の下部に入れる1行の測定条件サマリ（motors / pattern / notes）。"""
+    notes = meta.get("notes") or {}
+    parts = [f"motors={meta.get('motors', '-')}", f"pattern={meta.get('pattern', '-')}"]
+    for key in ("location", "orientation", "memo"):
+        v = notes.get(key)
+        if v:
+            parts.append(f"{key}={v}")
+    return "測定条件: " + " / ".join(parts)
 
 
 def print_meta_summary(meta: dict) -> None:
@@ -320,13 +420,6 @@ def print_meta_summary(meta: dict) -> None:
 
 
 # -------------------------------------------------------------- figures -------
-def save_fig(fig, out: Path, name: str) -> None:
-    """全図共通の保存処理（レイアウト調整 → PNG 出力 → クローズ）。"""
-    fig.tight_layout()
-    fig.savefig(out / name, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
 def fig1_vector_4d(data: dict, out: Path) -> None:
     cur, duty, dB = measure_arrays(data)
     fig = plt.figure(figsize=(13, 5.5))
@@ -352,11 +445,11 @@ def _scatter_dB_vs_I(axarr, data, pdm, idle, dB0, band=None):
     mean_I = np.array([pdm[d]["I"] for d in duties])
     for i, a in enumerate(AXES):
         ax = axarr[i]
-        ax.scatter(cur, dB[:, i], s=6, alpha=0.25, color="tab:gray", label="サンプル")
+        ax.scatter(cur, dB[:, i], s=6, alpha=0.3, color="silver", label="サンプル")
         mean_dB = np.array([pdm[d]["dB"][i] for d in duties])
         ax.scatter(mean_I, mean_dB, s=55, color="tab:red", zorder=5, label="duty平均")
         if band is None and np.isfinite(idle):
-            ax.scatter([idle], [dB0[i]], s=70, marker="D", color="tab:blue", zorder=6, label="duty=0")
+            ax.scatter([idle], [dB0[i]], s=70, marker="D", color="tab:cyan", zorder=6, label="duty=0")
         ax.set_xlabel("電流 I [A]"); ax.set_ylabel(f"{AXIS_LABEL[a]} [µT]")
         ax.grid(alpha=0.3)
     return duties, mean_I
@@ -501,7 +594,7 @@ def fig7_baseline_drift_3d(pdb: dict, out: Path, seq: list[dict] | None = None) 
     ax = fig.add_subplot(111, projection="3d")
     sc = ax.scatter(diffs[:, 0], diffs[:, 1], diffs[:, 2], c=color, cmap="viridis", s=60)
     ax.plot(diffs[:, 0], diffs[:, 1], diffs[:, 2], color="gray", lw=0.8, alpha=0.6)
-    ax.scatter([0], [0], [0], color="black", marker="x", s=80, label="初期 base")
+    ax.scatter([0], [0], [0], color="white", marker="x", s=80, label="初期 base")
     ax.set_xlabel("Δx [µT]"); ax.set_ylabel("Δy [µT]"); ax.set_zlabel("Δz [µT]")
     ax.set_title(title)
     fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1, label=clabel); ax.legend(fontsize=8)
@@ -676,7 +769,7 @@ def fig11_sample_level_fit(sf: dict, pdm, idle, dB0, out: Path) -> None:
         xs, ys = _fit_points(pdm, idle, dB0, i, duties, include_duty0=True)
         da, db_, dr2 = fit_line(xs, ys)
         ax = axarr[0, i]
-        ax.scatter(cur, f["y"], s=6, alpha=0.25, color="tab:gray", label="サンプル")
+        ax.scatter(cur, f["y"], s=6, alpha=0.3, color="silver", label="サンプル")
         xline = np.linspace(np.nanmin(cur), np.nanmax(cur), 50)
         ax.plot(xline, f["a"] * xline + f["b"], "g-", lw=2,
                 label=f"全サンプル a={f['a']:.3f}±{f['se']:.3f}\nR²={f['r2']:.3f}")
@@ -684,7 +777,7 @@ def fig11_sample_level_fit(sf: dict, pdm, idle, dB0, out: Path) -> None:
         ax.set_xlabel("電流 I [A]"); ax.set_ylabel(f"{AXIS_LABEL[a]} [µT]")
         ax.grid(alpha=0.3); ax.legend(fontsize=8)
         ax2 = axarr[1, i]
-        ax2.scatter(sf["t"], f["resid"], s=6, alpha=0.3, color="tab:blue")
+        ax2.scatter(sf["t"], f["resid"], s=6, alpha=0.35, color="tab:cyan")
         ax2.axhline(0, color="gray", lw=0.8)
         ax2.set_xlabel("時間 t [s]"); ax2.set_ylabel("残差 [µT]")
         ax2.set_title(f"{AXIS_LABEL[a]}: 残差 vs 時間"); ax2.grid(alpha=0.3)
@@ -703,7 +796,7 @@ def _temp_regression_panel(ax, temp, y, ylabel, title, color) -> tuple[float, fl
     ax.scatter(temp, y, s=6, alpha=0.3, color=color)
     if np.isfinite(slope):
         xline = np.linspace(np.nanmin(temp), np.nanmax(temp), 50)
-        ax.plot(xline, slope * xline + b, "k-", lw=2,
+        ax.plot(xline, slope * xline + b, "w-", lw=2,
                 label=f"傾き {slope:+.3f} µT/°C\nr={r:.3f}")
         ax.legend(fontsize=8)
     ax.axhline(0, color="gray", lw=0.8)
@@ -741,84 +834,10 @@ def fig12_residual_vs_temp(data: dict, sf: dict, out: Path) -> None:
     save_fig(fig, out, "12_residual_vs_temp.png")
 
 
-# ---------------------------------------------------------------- main --------
-SWEEP_GLOB = "sweep_*_samples.csv"
-
-
-def sweep_dir() -> Path:
-    """pc_server が CSV を書き出す sweep_results フォルダ。"""
-    return Path(__file__).resolve().parent.parent / "pc_server" / "data" / "sweep_results"
-
-
-def list_samples() -> list[Path]:
-    """sweep_results 内の samples CSV を新しい順（mtime 降順）に返す。"""
-    d = sweep_dir()
-    if not d.is_dir():
-        return []
-    return sorted(d.glob(SWEEP_GLOB), key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def _fmt_size(n: int) -> str:
-    return f"{n / 1024:.0f} KB" if n < 1024 * 1024 else f"{n / 1024 / 1024:.1f} MB"
-
-
-def choose_samples(cands: list[Path]) -> Path | None:
-    """利用可能な samples CSV を一覧表示し、番号で1つ選ばせる（会話的選択）。
-
-    Enter は最新（[1]）を選択、q で中止して None を返す。
-    パイプ等で対話入力が無い（EOF）場合は最新を自動選択する。
-    """
-    print(f"\n{sweep_dir()} の samples CSV から、グラフ化するものを選んでください:\n")
-    for i, p in enumerate(cands, 1):
-        st = p.stat()
-        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
-        mark = "  ← 最新" if i == 1 else ""
-        print(f"  [{i}] {p.name}   {mtime}   {_fmt_size(st.st_size)}{mark}")
-    print()
-    while True:
-        try:
-            raw = input(f"番号を入力 [1-{len(cands)}]（Enter=最新 / q=中止）: ").strip()
-        except EOFError:
-            print("（対話入力なし → 最新を自動選択）")
-            return cands[0]
-        if raw == "":
-            return cands[0]
-        if raw.lower() in ("q", "quit", "exit"):
-            return None
-        if raw.isdigit() and 1 <= int(raw) <= len(cands):
-            return cands[int(raw) - 1]
-        print(f"  '{raw}' は無効です。1〜{len(cands)} の番号を入力してください。")
-
-
-def default_out_dir(path: Path) -> Path:
-    """既定の出力先: data_analysis/graphs/analysis_<stem>/（この解析フォルダ配下）。
-
-    CSV ごとにサブフォルダを分けるので、別の CSV を選んでも上書きされない。
-    """
-    return Path(__file__).resolve().parent / "graphs" / f"analysis_{path.stem}"
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="StampFly Yaw 校正データ解析（9〜12枚の図）")
-    ap.add_argument("samples", nargs="?",
-                    help="samples CSV パス（省略時は sweep_results の一覧から対話選択）")
-    ap.add_argument("-o", "--out",
-                    help="出力ディレクトリ（省略時は data_analysis/graphs/analysis_<stem>/）")
-    args = ap.parse_args()
-
-    if args.samples:
-        path = Path(args.samples)
-    else:
-        cands = list_samples()
-        if not cands:
-            sys.exit(f"samples CSV が見つかりません: {sweep_dir()} に {SWEEP_GLOB} がありません。")
-        path = choose_samples(cands)
-        if path is None:
-            sys.exit("中止しました（CSV が選択されていません）。")
-    if not path.is_file():
-        sys.exit(f"samples CSV が見つかりません: {path}")
-
-    out = Path(args.out) if args.out else default_out_dir(path)
+# ------------------------------------------------------------ sweep main ------
+def run_sweep(path: Path, out: Path) -> None:
+    """スイープ1本の samples CSV から9〜12枚の図を出力する。"""
+    global _COND_FOOTER
     out.mkdir(parents=True, exist_ok=True)
 
     data = load_samples(path)
@@ -834,8 +853,10 @@ def main() -> None:
     meta = load_meta(path)
     if meta is not None:
         print_meta_summary(meta)
+        _COND_FOOTER = f"{path.name}  |  {meta_condition_line(meta)}"
     else:
         print("meta JSON なし（旧フォーマット）→ 条件サマリは省略します。")
+        _COND_FOOTER = path.name
     flags = (meta or {}).get("baseline_flags") or []
 
     fig1_vector_4d(data, out)
@@ -872,6 +893,384 @@ def main() -> None:
         print("\nleg 列が無い旧フォーマットCSVのため 図⑩〜⑫（ヒステリシス / サンプル単位回帰 / 残差vs温度）はスキップしました。")
 
     print(f"\n{n_figs}枚の図を {out} に出力しました。")
+
+
+# ==============================================================================
+# [2] 加算性シーケンスの検証グラフ（旧 analyze_additivity.py）
+# ==============================================================================
+
+# ----------------------------------------------------------- aggregation ------
+def aggregate_run(data: dict, idle: float, label: str, motors: str) -> dict:
+    """measure 行を duty 別に集計して run 辞書を作る。
+
+    各 duty の I と ΔB は up/down 両 leg の平均（leg ごとに平均 → 等重み平均）。
+    noise は統計誤差 std/√n と leg 間差/2（経験的再現性）の大きい方を軸別に持つ。
+    """
+    m = data["phase"] == "measure"
+    duty = data["duty_cmd"][m]
+    cur = data["current_a"][m]
+    leg = data["leg"][m] if "leg" in data else np.array([""] * int(m.sum()), dtype=object)
+    dB = np.column_stack([data[f"dB_cor_{a}"][m] for a in AXES])
+    pd_ = {}
+    for d in sorted(set(np.round(duty, 3))):
+        sel = np.isclose(duty, d)
+        legs = sorted({lg for lg in leg[sel] if lg})
+        if len(legs) >= 2:
+            leg_I = []
+            leg_dB = []
+            for lg in legs:
+                s2 = sel & (leg == lg)
+                leg_I.append(float(np.nanmean(cur[s2])))
+                leg_dB.append(np.nanmean(dB[s2], axis=0))
+            leg_dB = np.array(leg_dB)
+            I = float(np.mean(leg_I))
+            v = np.mean(leg_dB, axis=0)
+            leg_half = 0.5 * (np.max(leg_dB, axis=0) - np.min(leg_dB, axis=0))
+        else:
+            I = float(np.nanmean(cur[sel]))
+            v = np.nanmean(dB[sel], axis=0)
+            leg_half = np.zeros(3)
+        n = int(np.sum(sel))
+        sem = np.nanstd(dB[sel], axis=0) / max(1.0, math.sqrt(n))
+        pd_[float(d)] = {"I": I, "dB": v, "noise": np.maximum(sem, leg_half)}
+    return {"label": label, "motors": motors, "idle": float(idle), "pd": pd_}
+
+
+def load_sequence_runs(meta_path: Path, csv_dir: Path) -> tuple[list[dict], dict]:
+    """sequence meta JSON から完了済み run を全て読み込んで集計する。
+
+    返り値: (runs, sequence meta 辞書)。
+    """
+    seq = json.loads(meta_path.read_text(encoding="utf-8"))
+    if seq.get("schema") != "stampfly_sweep_sequence_meta":
+        print(f"警告: schema が想定外です: {seq.get('schema')!r}（続行します）")
+    runs = []
+    for r in seq.get("runs", []):
+        motors = r.get("motors", "?")
+        if r.get("phase") != "done" or r.get("aborted"):
+            print(f"  スキップ: {motors}（phase={r.get('phase')}, aborted={r.get('aborted')}）")
+            continue
+        spath = csv_dir / r["samples"]
+        if not spath.is_file():
+            sys.exit(f"samples CSV が見つかりません: {spath}（--results-dir でディレクトリを指定できます）")
+        data = load_samples(spath)
+        idle = math.nan
+        if r.get("meta"):
+            mpath = csv_dir / r["meta"]
+            if mpath.is_file():
+                idle = _f(str(json.loads(mpath.read_text(encoding="utf-8")).get("idle_current_a", "")))
+        if not math.isfinite(idle):  # フォールバック: base 行（duty=0）の平均電流
+            b = data["phase"] == "base"
+            idle = float(np.nanmean(data["current_a"][b])) if b.any() else math.nan
+        runs.append(aggregate_run(data, idle, label=spath.stem, motors=motors))
+    return runs, seq
+
+
+# ------------------------------------------------------------- analysis -------
+def fit_slope(run: dict) -> np.ndarray:
+    """ΔB = a·(I−idle) の原点通過最小二乗フィット（軸別）。a = Σxy/Σx²。"""
+    duties = sorted(run["pd"])
+    x = np.array([run["pd"][d]["I"] for d in duties]) - run["idle"]
+    Y = np.array([run["pd"][d]["dB"] for d in duties])
+    a = np.full(3, math.nan)
+    for i in range(3):
+        ok = np.isfinite(x) & np.isfinite(Y[:, i])
+        denom = float(np.sum(x[ok] ** 2))
+        if denom > 0:
+            a[i] = float(np.sum(x[ok] * Y[ok, i])) / denom
+    return a
+
+
+def compare_additivity(target: dict, singles: list[dict]):
+    """共通 duty での Σ単機予測 と 同時測定 を比較する。
+
+    返り値: (keys, meas[N,3], pred[N,3], resid[N,3], noise[N,3])
+    resid = pred − meas。noise は両者の合成（√和の二乗）。
+    """
+    common = set(target["pd"])
+    for s in singles:
+        common &= set(s["pd"])
+    keys = sorted(common)
+    if not keys:
+        sys.exit(f"共通 duty がありません: {target['motors']} と単機 run の duty 段を確認してください。")
+    meas = np.array([target["pd"][k]["dB"] for k in keys])
+    pred = np.array([np.sum([s["pd"][k]["dB"] for s in singles], axis=0) for k in keys])
+    noise = np.array([
+        np.sqrt(target["pd"][k]["noise"] ** 2
+                + np.sum([s["pd"][k]["noise"] ** 2 for s in singles], axis=0))
+        for k in keys
+    ])
+    return keys, meas, pred, pred - meas, noise
+
+
+def print_main_table(name: str, keys, meas, pred, resid) -> None:
+    print(f"\n=== 主検証（duty一致比較）: {name} ===")
+    print("    残差 = Σ単機予測 − 同時測定 [µT]")
+    print("  duty  | " + "  ".join(f"測定{a}{'':>4}予測{a}{'':>4}残差{a}{'':>2}" for a in AXES))
+    for j, k in enumerate(keys):
+        cells = "  ".join(f"{meas[j, i]:7.2f} {pred[j, i]:7.2f} {resid[j, i]:+6.2f}  "
+                          for i in range(3))
+        print(f"  {k:5.2f} | {cells}")
+    mean_abs = np.nanmean(np.abs(resid), axis=0)
+    max_abs = np.nanmax(np.abs(resid), axis=0)
+    print("  " + "-" * 70)
+    print("  平均|残差| [µT]: " + "  ".join(f"{a}={mean_abs[i]:.3f}" for i, a in enumerate(AXES)))
+    print("  最大|残差| [µT]: " + "  ".join(f"{a}={max_abs[i]:.3f}" for i, a in enumerate(AXES)))
+
+
+def print_slope_check(name: str, target: dict, singles: list[dict]) -> None:
+    """副検証: 電流空間の傾き a [µT/A] の整合チェック。
+
+    同時運転では各モーターが総電流のほぼ 1/機数 を分担するため、加算性が
+    成り立てば slope_同時 ≈ (Σ_m slope_m)/機数 になる（4機なら /4、ペアなら /2）。
+    """
+    tokens = [t for t in target["motors"].split("+") if t]
+    divisor = len(tokens) if len(tokens) > 1 else len(singles)
+    a_t = fit_slope(target)
+    a_sum = np.sum([fit_slope(s) for s in singles], axis=0) / divisor
+    print(f"\n=== 副検証（電流空間の傾き）: {name}  ΔB = a·(I−idle) [µT/A] ===")
+    print(f"    仮定: 同時運転時、各モーターは総電流のほぼ 1/{divisor} を分担")
+    print(f"  軸 | slope_同時   Σ単機slope/{divisor}      差")
+    for i, a in enumerate(AXES):
+        print(f"  {a}  | {a_t[i]:10.3f}   {a_sum[i]:13.3f}   {a_t[i] - a_sum[i]:+7.3f}")
+
+
+def print_current_check(name: str, target: dict, singles: list[dict], keys) -> None:
+    """電圧垂下の注意の定量化: 同 duty の電流 I_同時 と Σ(I_m−idle_m)+idle_同時 の比較。"""
+    print(f"\n=== 電圧垂下チェック（同 duty の電流比較）: {name} ===")
+    print("  duty  | I_同時 [A]  Σ(I_m−idle_m)+idle_同時 [A]    差 [A]")
+    diffs = []
+    for k in keys:
+        i_t = target["pd"][k]["I"]
+        i_pred = sum(s["pd"][k]["I"] - s["idle"] for s in singles) + target["idle"]
+        diffs.append(i_t - i_pred)
+        print(f"  {k:5.2f} | {i_t:9.3f}   {i_pred:21.3f}   {i_t - i_pred:+8.3f}")
+    diffs = np.array(diffs)
+    print(f"  差の平均 {np.nanmean(diffs):+.3f} A / 最大|差| {np.nanmax(np.abs(diffs)):.3f} A")
+    print("  注意: 同時運転は電圧垂下でモーター個別の電流が単機時より下がるため、")
+    print("        duty一致比較には系統差が乗り得る（差が大きいほど ΔB 比較にも影響）。")
+
+
+def verdict_info(name: str, resid: np.ndarray, noise: np.ndarray) -> dict:
+    """判定サマリ: 最大残差をノイズ由来のしきい値と比較して 成立/不成立 を返す。
+
+    しきい値 = max(NOISE_SIGMA × RMS(合成ノイズ), NOISE_FLOOR_UT)。
+    """
+    max_resid = float(np.nanmax(np.abs(resid)))
+    finite = noise[np.isfinite(noise)]
+    if finite.size:
+        noise_typ = float(np.sqrt(np.mean(finite ** 2)))  # 合成ノイズの RMS
+        thr = max(NOISE_SIGMA * noise_typ, NOISE_FLOOR_UT)
+        ok = max_resid <= thr
+        line = (f"加算性[{name}]: 最大残差 {max_resid:.2f} µT"
+                f"（測定ノイズ~{noise_typ:.2f} µT・しきい値 {thr:.2f} µT に対し"
+                f"{'成立' if ok else '不成立'}）")
+    else:
+        noise_typ = math.nan
+        thr = NOISE_FLOOR_UT
+        ok = max_resid <= thr
+        line = (f"加算性[{name}]: 最大残差 {max_resid:.2f} µT"
+                f"（測定ノイズ不明・しきい値 {NOISE_FLOOR_UT:.2f} µT に対し"
+                f"{'成立' if ok else '不成立'}）")
+    return {"name": name, "max_resid": max_resid, "noise_typ": noise_typ,
+            "thr": thr, "ok": ok, "line": line}
+
+
+# -------------------------------------------------------------- figures -------
+def fig_additivity(name: str, fname: str, keys, meas, pred, resid, noise,
+                   out: Path) -> None:
+    """軸別: 上段 duty vs 測定/予測の重ねプロット、下段 残差（±3σ ノイズ帯付き）。"""
+    fig, axarr = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
+    for i, a in enumerate(AXES):
+        ax = axarr[0, i]
+        ax.plot(keys, meas[:, i], "o-", color="tab:blue", label="同時測定 ΔB")
+        ax.plot(keys, pred[:, i], "s--", color="tab:red", label="Σ単機 予測")
+        ax.set_title(AXIS_LABEL[a])
+        ax.set_ylabel("ΔB [µT]")
+        ax.grid(alpha=0.3)
+        rx = axarr[1, i]
+        if np.isfinite(noise[:, i]).all():
+            rx.fill_between(keys, -3 * noise[:, i], 3 * noise[:, i],
+                            color="gray", alpha=0.35, label="±3σ ノイズ")
+        rx.plot(keys, resid[:, i], "o-", color="tab:green", label="残差（予測−測定）")
+        rx.axhline(0, color="gray", lw=0.8)
+        rx.set_xlabel("duty")
+        rx.set_ylabel("残差 [µT]")
+        rx.grid(alpha=0.3)
+    axarr[0, 0].legend(fontsize=8)
+    axarr[1, 0].legend(fontsize=8)
+    fig.suptitle(f"加算性検証 {name}: Σ単機 ΔB と同時スイープ ΔB の比較", fontsize=13)
+    save_fig(fig, out, fname)
+
+
+def fig_verdict_summary(verdicts: list[dict], out: Path) -> None:
+    """判定サマリを PNG として残す（00_verdict_summary.png）。"""
+    n = len(verdicts)
+    fig, ax = plt.subplots(figsize=(11, 1.6 + 1.0 * n))
+    ax.axis("off")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.text(0.02, 0.96, "加算性 判定サマリ", fontsize=15, fontweight="bold", va="top")
+    ax.text(0.02, 0.96 - 0.10, f"判定基準: 最大|残差| <= max({NOISE_SIGMA:.0f}σ×RMS(合成ノイズ), "
+            f"{NOISE_FLOOR_UT:.1f} µT)", fontsize=9, color="lightgray", va="top")
+    y = 0.96 - 0.24
+    dy = 0.72 / max(1, n)
+    for v in verdicts:
+        mark = "成立" if v["ok"] else "不成立"
+        color = "tab:green" if v["ok"] else "tab:red"
+        ax.text(0.02, y, f"[{mark}]", fontsize=12, fontweight="bold", color=color, va="top")
+        noise_s = f"{v['noise_typ']:.2f} µT" if math.isfinite(v["noise_typ"]) else "不明"
+        ax.text(0.13, y, f"{v['name']}\n最大残差 {v['max_resid']:.2f} µT / "
+                f"測定ノイズ~{noise_s} / しきい値 {v['thr']:.2f} µT",
+                fontsize=10, va="top")
+        y -= dy
+    save_fig(fig, out, "00_verdict_summary.png")
+
+
+# ------------------------------------------------------------- comparison -----
+def build_comparisons(runs: list[dict]) -> list[tuple[dict, list[dict]]]:
+    """run 一覧から (同時run, [構成する単機run...]) の比較ペアを組む。
+
+    4機同時（FL+FR+RL+RR 相当）→ 単機4本の和、対角ペア → 該当2機の和。
+    """
+    singles = {r["motors"]: r for r in runs if r["motors"] in SINGLES}
+    comps = []
+    for r in runs:
+        tokens = [t for t in r["motors"].split("+") if t]
+        if len(tokens) < 2:
+            continue
+        if all(t in singles for t in tokens):
+            comps.append((r, [singles[t] for t in tokens]))
+        else:
+            missing = [t for t in tokens if t not in singles]
+            print(f"  比較スキップ: {r['motors']}（単機 run が不足: {'+'.join(missing)}）")
+    return comps
+
+
+def analyze_comparisons(comps: list[tuple[dict, list[dict]]], out: Path) -> None:
+    """全比較ペアについて 主検証・副検証・電流チェック・図 を実行し判定サマリを出す。"""
+    verdicts = []
+    for idx, (target, singles) in enumerate(comps, 1):
+        name = f"{' + '.join(s['motors'] for s in singles)} → {target['motors']}"
+        keys, meas, pred, resid, noise = compare_additivity(target, singles)
+        print_main_table(name, keys, meas, pred, resid)
+        print_slope_check(name, target, singles)
+        print_current_check(name, target, singles, keys)
+        fname = f"{idx:02d}_additivity_{target['motors'].replace('+', '_')}.png"
+        fig_additivity(name, fname, keys, meas, pred, resid, noise, out)
+        verdicts.append(verdict_info(name, resid, noise))
+    print("\n=== 判定サマリ ===")
+    for v in verdicts:
+        print(f"  {v['line']}")
+    fig_verdict_summary(verdicts, out)
+    print(f"\n図 {len(comps) + 1} 枚（比較 {len(comps)} + 判定サマリ 1）を {out} に出力しました。")
+
+
+# ------------------------------------------------------- additivity main ------
+def run_additivity(meta_path: Path, csv_dir: Path, out: Path) -> None:
+    """sequence meta JSON から加算性検証の図と判定を出力する。"""
+    global _COND_FOOTER
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"入力: {meta_path}\nCSVディレクトリ: {csv_dir}\n出力: {out}")
+    runs, seq = load_sequence_runs(meta_path, csv_dir)
+    if not runs:
+        sys.exit("完了済み（phase=='done'）の run がありません。")
+    for r in runs:
+        print(f"  {r['label']}: motors={r['motors']} idle={r['idle']:.3f} A "
+              f"duty段数={len(r['pd'])}")
+    cond = [meta_path.name, f"pattern={seq.get('pattern', '-')}"]
+    if seq.get("notes"):
+        cond.append(f"notes={seq['notes']}")
+    _COND_FOOTER = "  |  ".join(cond)
+    comps = build_comparisons(runs)
+    if not comps:
+        sys.exit("比較できる組み合わせがありません（単機4本＋同時 run が必要です）。")
+    analyze_comparisons(comps, out)
+
+
+# ==============================================================================
+# エントリポイント（自動判別 + 対話メニュー）
+# ==============================================================================
+def detect_mode(path: Path) -> str:
+    """入力パスから解析モードを判別する（"sweep" / "sequence"）。"""
+    name = path.name.lower()
+    if name.endswith(".json") or "sequence" in name:
+        return "sequence"
+    if name.endswith(".csv"):
+        return "sweep"
+    sys.exit(f"入力の種類を判別できません: {path}\n"
+             f"sweep_*_samples.csv または sequence_*_meta.json を指定してください。")
+
+
+def interactive_select(results_dir: Path) -> tuple[str, Path] | None:
+    """メニュー → ファイル番号選択の対話フロー。返り値 (mode, path) または None。"""
+    print("\n=== plot_sweep: スイープ結果のグラフ化 ===")
+    print("  [1] スイープ1本のグラフ化        （sweep_*_samples.csv → 図 9〜12枚）")
+    print("  [2] 加算性シーケンスの検証グラフ（sequence_*_meta.json → 比較図＋判定）")
+    print()
+    while True:
+        try:
+            raw = input("メニュー番号を入力 [1-2]（q=中止）: ").strip()
+        except EOFError:
+            print("（対話入力なし → [1] スイープ1本のグラフ化 を自動選択）")
+            raw = "1"
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw in ("1", "2"):
+            break
+        print(f"  '{raw}' は無効です。1 か 2 を入力してください。")
+    if raw == "1":
+        cands = _list_by_mtime(results_dir, SWEEP_GLOB)
+        if not cands:
+            sys.exit(f"samples CSV が見つかりません: {results_dir} に {SWEEP_GLOB} がありません。")
+        path = _select_from_list(cands, "samples CSV", results_dir)
+        return ("sweep", path) if path else None
+    cands = _list_by_mtime(results_dir, SEQ_GLOB)
+    if not cands:
+        sys.exit(f"sequence meta が見つかりません: {results_dir} に {SEQ_GLOB} がありません。")
+    path = _select_from_list(cands, "sequence meta JSON", results_dir)
+    return ("sequence", path) if path else None
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="StampFly スイープ結果のグラフ化（校正解析 + 加算性検証）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="引数を省略すると対話メニュー（[1]スイープ1本 / [2]加算性シーケンス）で\n"
+               "対象ファイルを番号選択できます。")
+    ap.add_argument("path", nargs="?",
+                    help="sweep_*_samples.csv または sequence_*_meta.json"
+                         "（省略時は対話メニューで選択）")
+    ap.add_argument("-o", "--out",
+                    help="出力ディレクトリ（省略時は data_analysis/graphs/sweep_<stamp>/ "
+                         "または graphs/additivity_<stem>/）")
+    ap.add_argument("--results-dir",
+                    help="スイープ結果ディレクトリ（一覧の探索先 / シーケンスの samples CSV の場所。"
+                         "既定: ../pc_server/data/sweep_results/）")
+    args = ap.parse_args()
+
+    results_dir = Path(args.results_dir) if args.results_dir else default_results_dir()
+
+    if args.path:
+        path = Path(args.path)
+        if not path.is_file():
+            sys.exit(f"ファイルが見つかりません: {path}")
+        mode = detect_mode(path)
+    else:
+        sel = interactive_select(results_dir)
+        if sel is None:
+            sys.exit("中止しました（対象が選択されていません）。")
+        mode, path = sel
+
+    if mode == "sweep":
+        stem = _strip_suffix(path.stem, "_samples")
+        out = Path(args.out) if args.out else graphs_dir() / stem
+        run_sweep(path, out)
+    else:
+        # samples CSV の場所: --results-dir 指定があればそこ、無ければ meta と同じ場所
+        csv_dir = Path(args.results_dir) if args.results_dir else path.parent
+        stem = _strip_suffix(path.stem, "_meta")
+        out = Path(args.out) if args.out else graphs_dir() / f"additivity_{stem}"
+        run_additivity(path, csv_dir, out)
 
 
 if __name__ == "__main__":

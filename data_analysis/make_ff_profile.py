@@ -3,28 +3,40 @@
 
 仕様: docs/ff_pipeline_design.md §3。
 
-入力 (どちらか):
-  --folder <path>   フォルダ内の sweep_*_{meta.json,samples.csv} ちょうど8ペア (主)
+入力 (いずれか):
+  --folder <path>   フォルダ内の sweep_*_{meta.json,samples.csv} 8ペア、または
+                    4ペア + sequence_*_meta.json (参照先の単機4本が同フォルダか
+                    --results-dir に実在すること)。
                     (パスが存在しない場合は --results-dir 直下のサブフォルダ名として解決)
-  --stems S1 .. S8  stem 8個指定 (従)。--results-dir (既定 ../pc_server/data/sweep_results)
+  --stems T1 .. Tn  stem 指定。sweep stem 8個 (従来)、または sweep stem 4個 +
+                    sequence meta 1個 (stem / ファイル名 / パス) の5個など、
+                    sequence 展開後にちょうど8本になる組み合わせ。
+                    --results-dir (既定 ../pc_server/data/sweep_results)
+  引数なし          対話モード: sweep_results のサブフォルダ一覧 / stems 手動選択
+                    から番号で選び、name/memo を入力して生成 (q で中止)。
 
 自動分類: meta.motors が FL+FR+RL+RR = 全機ラン(4本、notes.orientation 4種必須。
 表記ゆれ Yaw=+-180°/±180° 許容)、FL/FR/RL/RR 単独 = 単機ラン(各1本必須)。
+sequence meta は完了済み (phase=done, aborted でない) の単機ランのみ展開する。
 
 出力: -o/--out (既定 ../pc_server/data/ff_profiles/<name>.json)
   name 既定: フォルダ指定時=フォルダ名 / それ以外 ff_<最初の全機ランの日付YYYYMMDD>
   memo 既定: "<notes.locationの多数派> <acquired_span> 取得8本"
 
 使用例:
+  .venv/bin/python make_ff_profile.py
   .venv/bin/python make_ff_profile.py --folder ../pc_server/data/sweep_results/DroneTest_20260629
   .venv/bin/python make_ff_profile.py --stems sweep_20260629_141809 ... (8個) \
       --name Drone-test_20260629 --memo "..."
+  .venv/bin/python make_ff_profile.py --stems sweep_A sweep_B sweep_C sweep_D \
+      sequence_20260701_120000   # 全機4本 + sequence meta (単機4本に展開)
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -47,11 +59,30 @@ def _find_pairs(folder: Path) -> list[str]:
     return stems
 
 
+def _collect_from_folder(folder: Path, results_dir: Path) -> list[tuple[str, Path]]:
+    """フォルダから (stem, dir) ペアを収集。
+
+    フォルダ直下の sweep ペアに加え、sequence_*_meta.json があれば参照先の
+    完了済み単機ランを展開して追加する (探索順: フォルダ → results_dir)。
+    重複 stem は先勝ちで除去。ValueError は呼び出し側で報告する。
+    """
+    pairs: list[tuple[str, Path]] = [(s, folder) for s in _find_pairs(folder)]
+    seen = {s for s, _ in pairs}
+    for mp in sorted(folder.glob("sequence_*_meta.json")):
+        for stem, d in core.expand_sequence_meta(mp, [folder, results_dir]):
+            if stem not in seen:
+                seen.add(stem)
+                pairs.append((stem, d))
+    return pairs
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="スイープ8ラン → FFプロファイルJSON 抽出")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--folder", help="8ペア(16ファイル)入りフォルダ (主)")
-    src.add_argument("--stems", nargs="+", help="stem 8個 (従)")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--folder",
+                     help="8ペア (または 4ペア + sequence meta) 入りフォルダ (主)")
+    src.add_argument("--stems", nargs="+",
+                     help="sweep stem 8個、または sequence meta 混在 (展開後8本)")
     ap.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR),
                     help="--stems 時の探索dir (既定 ../pc_server/data/sweep_results)")
     ap.add_argument("--name", help="プロファイル名 (既定: フォルダ名 or ff_<日付>)")
@@ -61,40 +92,57 @@ def main(argv=None) -> int:
     ap.add_argument("--plots", action="store_true", help="検証図PNGを出力 (既定off)")
     args = ap.parse_args(argv)
 
-    # --- 入力列挙 ---
+    if not args.folder and not args.stems:
+        return _interactive_main(args)
+    return _run(args)
+
+
+def _run(args) -> int:
+    """--folder / --stems (対話モードからも到達) の共通生成パス。"""
+    results_dir = Path(args.results_dir)
+
+    # --- 入力列挙: (stem, dir) ペアに正規化 ---
     if args.folder:
         folder = Path(args.folder)
         if not folder.is_dir():
-            cand = Path(args.results_dir) / args.folder
+            cand = results_dir / args.folder
             if cand.is_dir():
                 folder = cand
             else:
                 print(f"エラー: フォルダが見つからない: {args.folder}", file=sys.stderr)
                 return 2
-        stems = _find_pairs(folder)
-        if len(stems) != 8:
-            print(f"エラー: {folder} 内の sweep ペアが {len(stems)} 個 (ちょうど8必要): {stems}",
+        try:
+            pairs = _collect_from_folder(folder, results_dir)
+        except ValueError as e:
+            print(f"エラー: {e}", file=sys.stderr)
+            return 2
+        if len(pairs) != 8:
+            print(f"エラー: {folder} 内の sweep ペアが {len(pairs)} 本 "
+                  f"(sequence 展開込み。ちょうど8必要): {[s for s, _ in pairs]}",
                   file=sys.stderr)
             return 2
-        data_dir = folder
         default_name = folder.name
         source_dir = str(folder)
     else:
-        stems = args.stems
-        if len(stems) != 8:
-            print(f"エラー: --stems は8個必要 (指定 {len(stems)} 個)", file=sys.stderr)
+        try:
+            pairs = core.expand_stems(args.stems, results_dir)
+        except ValueError as e:
+            print(f"エラー: {e}", file=sys.stderr)
             return 2
-        data_dir = Path(args.results_dir)
+        if len(pairs) != 8:
+            print(f"エラー: --stems は展開後8本必要 "
+                  f"(指定 {len(args.stems)} 個 → 展開後 {len(pairs)} 本)", file=sys.stderr)
+            return 2
         default_name = None
-        source_dir = str(data_dir)
-        for stem in stems:
+        source_dir = str(results_dir)
+        for stem, d in pairs:
             for suf in ("_meta.json", "_samples.csv"):
-                if not (data_dir / f"{stem}{suf}").exists():
-                    print(f"エラー: {data_dir / (stem + suf)} が見つからない", file=sys.stderr)
+                if not (d / f"{stem}{suf}").exists():
+                    print(f"エラー: {d / (stem + suf)} が見つからない", file=sys.stderr)
                     return 2
 
     # --- 読み込み・分類 ---
-    runs = [core.load_run(stem, data_dir) for stem in stems]
+    runs = [core.load_run(stem, d) for stem, d in pairs]
     try:
         all_runs, motor_runs = core.classify_runs(runs)
     except ValueError as e:
@@ -163,6 +211,154 @@ def main(argv=None) -> int:
     if args.plots:
         _make_plots(profile, internals, name)
     return 0
+
+
+# ------------------------------------------------------------ interactive -----
+def _input(prompt: str) -> str | None:
+    """input() ラッパ。q/quit/exit または EOF で None (=中止)。"""
+    try:
+        raw = input(prompt).strip()
+    except EOFError:
+        print()
+        return None
+    if raw.lower() in ("q", "quit", "exit"):
+        return None
+    return raw
+
+
+def _stem_summary(stem: str, d: Path) -> str:
+    """一覧表示用: motors / orientation / 日付 を meta から拾う (失敗時は空)。"""
+    try:
+        meta = json.loads((d / f"{stem}_meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    motors = meta.get("motors", "?")
+    orient = core.normalize_orientation(
+        (meta.get("notes") or {}).get("orientation", ""))
+    parts = [f"motors={motors}"]
+    if orient:
+        parts.append(orient)
+    if meta.get("aborted"):
+        parts.append("中断")
+    return "  ".join(parts)
+
+
+def _choose_folder(results_dir: Path) -> tuple[str | None, bool]:
+    """サブフォルダ一覧 + 'stems 手動選択' を番号で選ばせる。
+
+    Returns: (フォルダパス or None, 手動選択フラグ)。中止は (None, False)。
+    """
+    subs = sorted((p for p in results_dir.iterdir() if p.is_dir()),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    print(f"\n{results_dir} から入力を選んでください:\n")
+    for i, p in enumerate(subs, 1):
+        n_pairs = len(_find_pairs(p))
+        n_seq = len(list(p.glob("sequence_*_meta.json")))
+        info = f"sweepペア {n_pairs}本" + (f" + sequence meta {n_seq}個" if n_seq else "")
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))
+        mark = "  ← 最新" if i == 1 else ""
+        print(f"  [{i}] {p.name}/   {mtime}   {info}{mark}")
+    manual_idx = len(subs) + 1
+    print(f"  [{manual_idx}] sweep_results 直下の stem を手動選択")
+    print()
+    while True:
+        raw = _input(f"番号を入力 [1-{manual_idx}]"
+                     f"（Enter={'最新' if subs else '手動選択'} / q=中止）: ")
+        if raw is None:
+            return None, False
+        if raw == "":
+            return (str(subs[0]), False) if subs else (None, True)
+        if raw.isdigit() and 1 <= int(raw) <= manual_idx:
+            idx = int(raw)
+            if idx == manual_idx:
+                return None, True
+            return str(subs[idx - 1]), False
+        print(f"  '{raw}' は無効です。1〜{manual_idx} の番号を入力してください。")
+
+
+def _choose_stems(results_dir: Path) -> list[str] | None:
+    """sweep_results 直下の sweep ペア + sequence meta から複数選択させる。
+
+    番号をスペース/カンマ区切りで入力 (sequence 展開後にちょうど8本必要)。
+    中止は None。
+    """
+    stems = _find_pairs(results_dir)
+    seqs = sorted(results_dir.glob("sequence_*_meta.json"))
+    items: list[tuple[str, str]] = []          # (token, 表示)
+    for s in stems:
+        items.append((s, f"{s}   {_stem_summary(s, results_dir)}"))
+    for mp in seqs:
+        try:
+            n = len(json.loads(mp.read_text(encoding='utf-8')).get("runs", []))
+        except (OSError, json.JSONDecodeError):
+            n = 0
+        items.append((mp.name, f"{mp.name}   sequence meta ({n} runs)"))
+    if not items:
+        print(f"エラー: {results_dir} に sweep ペア / sequence meta が無い",
+              file=sys.stderr)
+        return None
+    items.sort(key=lambda t: t[0], reverse=True)   # stem 名 = 日時なので新しい順
+    print(f"\n{results_dir} 直下から使用するものを選んでください "
+          "(全機4 + 単機4、または 全機4 + sequence meta 1):\n")
+    for i, (_tok, disp) in enumerate(items, 1):
+        print(f"  [{i}] {disp}")
+    print()
+    while True:
+        raw = _input("番号をスペース/カンマ区切りで入力（例: 1 2 3 4 5 / q=中止）: ")
+        if raw is None:
+            return None
+        nums = [t for t in raw.replace(",", " ").split() if t]
+        if not nums or not all(t.isdigit() and 1 <= int(t) <= len(items) for t in nums):
+            print(f"  無効な入力です。1〜{len(items)} の番号を入力してください。")
+            continue
+        idxs = list(dict.fromkeys(int(t) for t in nums))   # 重複除去 (順序維持)
+        tokens = [items[i - 1][0] for i in idxs]
+        try:
+            pairs = core.expand_stems(tokens, results_dir)
+        except ValueError as e:
+            print(f"  エラー: {e}")
+            continue
+        if len(pairs) != 8:
+            print(f"  選択 {len(tokens)} 個 → sequence 展開後 {len(pairs)} 本 "
+                  "(ちょうど8本必要)。選び直してください。")
+            continue
+        return tokens
+
+
+def _interactive_main(args) -> int:
+    """引数なし起動: フォルダ/stems を対話選択し name/memo を入力して生成。"""
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_dir():
+        print(f"エラー: sweep_results が見つからない: {results_dir}", file=sys.stderr)
+        return 2
+    folder, manual = _choose_folder(results_dir)
+    if folder is None and not manual:
+        print("中止しました。")
+        return 0
+    if manual:
+        tokens = _choose_stems(results_dir)
+        if tokens is None:
+            print("中止しました。")
+            return 0
+        args.stems = tokens
+    else:
+        args.folder = folder
+
+    default_name = Path(folder).name if folder else "(自動: ff_<日付>)"
+    raw = _input(f"プロファイル名 [Enter={default_name} / q=中止]: ")
+    if raw is None:
+        print("中止しました。")
+        return 0
+    if raw:
+        args.name = raw
+    raw = _input("メモ [Enter=自動生成 / q=中止]: ")
+    if raw is None:
+        print("中止しました。")
+        return 0
+    if raw:
+        args.memo = raw
+    print()
+    return _run(args)
 
 
 def _make_plots(profile: dict, internals: dict, name: str) -> None:

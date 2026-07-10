@@ -258,6 +258,18 @@
         <div id="expLive" class="mono exp-live">TLM_EXP: --</div>
       </div>
 
+      <!-- 計測(EKF/FF性能ログ) -->
+      <div class="exp-section">
+        <h3>計測(EKF/FF性能ログ) <span class="unit-h">TLM_EXP 25Hz → CSV</span></h3>
+        <p class="note">モーターテスト有効中に開始できます(スイープ/シーケンスとは排他)。
+          計測中は全モーター(FL+FR+RL+RR)のみ回転できます。</p>
+        <div class="preset-row">
+          <button id="btnExpRecStart" class="btn btn-small btn-primary" disabled>&#x25cf; 計測開始</button>
+          <button id="btnExpRecStop" class="btn btn-small btn-danger" disabled>&#x25a0; 計測停止</button>
+          <span id="expRecStatus" class="mono motor-status">停止中</span>
+        </div>
+      </div>
+
       <!-- スイープ -->
       <div class="exp-section">
         <h3>電流×磁場スイープ <span class="unit-h">ベンチ計測</span></h3>

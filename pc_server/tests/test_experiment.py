@@ -383,6 +383,240 @@ class TestSweepRunner:
         assert "過放電" in status["error"]
 
 
+class TestExpRecorder:
+    """実験計測ログ(EKF/FF 性能ログ): CSV/meta 出力・計測中ガード・自動停止。"""
+
+    # 仕様 T1-2 の列順(実装定数のリグレッション検知のため文字通りに固定)
+    EXPECTED_FIELDS = [
+        "t_s", "exp_elapsed_ms", "duty_cmd", "motors_mask", "motors",
+        "cv", "mag_fresh",
+        "current_a", "vbat_v", "shunt_uv",
+        "bx_raw", "by_raw", "bz_raw", "bx_cal", "by_cal", "bz_cal",
+        "imu_temp_c",
+        "roll_deg", "pitch_deg", "yaw_madgwick_deg",
+        "p_rad_s", "q_rad_s", "r_rad_s", "ax_g", "ay_g", "az_g",
+        "yaw_est_deg", "yaw_gyro_int_deg", "yaw_ref_deg",
+        "db_hat_x_ut", "db_hat_y_ut", "bm_x_ut", "bm_y_ut",
+        "nis", "ffg", "ff_status", "tlm_state_age_ms",
+    ]
+
+    @staticmethod
+    def _recorder(session, tmp_path):
+        session.experiment.recorder.logs_dir = tmp_path
+        return session.experiment.recorder
+
+    @staticmethod
+    def _push_samples(session, transport, count, **tlm_kwargs):
+        before = session.experiment.recorder.status()["samples"]
+        for _ in range(count):
+            transport.push(proto.MsgType.TLM_EXP,
+                           make_tlm_exp(**tlm_kwargs).to_payload())
+        assert wait_until(
+            lambda: session.experiment.recorder.status()["samples"]
+            >= before + count)
+
+    def test_record_writes_csv_and_meta(self, exp_session, tmp_path):
+        session, transport, clock, responder = exp_session
+        recorder = self._recorder(session, tmp_path)
+        # 最新 TLM_STATE スナップショット列の供給源
+        tlm_state = proto.TlmState(
+            state=proto.FlightState.WAIT, yaw_est_rad=0.5,
+            yaw_gyro_int_rad=0.25, yaw_ref_rad=-0.1,
+            db_hat_x_ut=1.5, db_hat_y_ut=-2.5, bm_x_ut=3.0, bm_y_ut=-4.0,
+            nis=1.25, ffg=3, ff_status=0x15)
+        transport.push(proto.MsgType.TLM_STATE, tlm_state.to_payload())
+        assert wait_until(lambda: session._tlm_state_snapshot()[0] is not None)
+
+        result = session.exp_record_start()
+        assert result["ok"], result
+        file_name = result["file"]
+        assert file_name.startswith("explog_") and file_name.endswith(".csv")
+
+        self._push_samples(session, transport, 3, current_a=1.25, vbat_v=3.85,
+                           roll=0.1, yaw=0.2, duty_cmd=0.4, motors_mask=0x0F)
+
+        # status payload(experiment.recording)にも状態が載る(T1-6)
+        recording = session.get_state_snapshot()["data"]["session"][
+            "experiment"]["recording"]
+        assert recording["active"] is True
+        assert recording["file"] == file_name
+        assert recording["samples"] >= 3
+
+        result = session.exp_record_stop()
+        assert result["ok"], result
+        assert not recorder.is_recording()
+
+        import csv as csv_mod
+        with (tmp_path / file_name).open() as fp:
+            rows = list(csv_mod.DictReader(fp))
+        assert list(rows[0].keys()) == self.EXPECTED_FIELDS
+        assert list(rows[0].keys()) == experiment.EXPLOG_FIELDS
+        row = rows[0]
+        assert float(row["current_a"]) == pytest.approx(1.25)
+        assert float(row["vbat_v"]) == pytest.approx(3.85)
+        assert row["cv"] == "1" and row["mag_fresh"] == "1"
+        assert row["motors_mask"] == "15" and row["motors"] == "FL+FR+RL+RR"
+        # 姿勢角は deg、角速度は rad/s のまま(T1-2)
+        assert float(row["roll_deg"]) == pytest.approx(math.degrees(0.1))
+        assert float(row["yaw_madgwick_deg"]) == pytest.approx(
+            math.degrees(0.2))
+        assert float(row["p_rad_s"]) == pytest.approx(0.0)
+        # TLM_STATE スナップショット列(deg 換算+鮮度)
+        assert float(row["yaw_est_deg"]) == pytest.approx(math.degrees(0.5))
+        assert float(row["yaw_gyro_int_deg"]) == pytest.approx(
+            math.degrees(0.25))
+        assert float(row["yaw_ref_deg"]) == pytest.approx(math.degrees(-0.1))
+        assert float(row["db_hat_x_ut"]) == pytest.approx(1.5)
+        assert float(row["nis"]) == pytest.approx(1.25)
+        assert row["ffg"] == "3" and row["ff_status"] == "21"
+        assert row["tlm_state_age_ms"] != ""
+
+        meta = json.loads(
+            (tmp_path / result["meta"]).read_text(encoding="utf-8"))
+        assert meta["schema"] == "stampfly_explog_meta"
+        assert meta["version"] == 1
+        assert meta["aborted"] is False
+        assert meta["sample_count"] == len(rows)
+        assert meta["started_at_epoch"] <= meta["ended_at_epoch"]
+        for key in ("started_at", "ended_at", "ff_state",
+                    "mag3d_file_info", "geomag_profile"):
+            assert key in meta, key
+
+    def test_tlm_state_columns_empty_when_missing(self, exp_session, tmp_path):
+        """TLM_STATE 未受信なら該当列は空欄(T1-2)。"""
+        session, transport, clock, responder = exp_session
+        self._recorder(session, tmp_path)
+        result = session.exp_record_start()
+        assert result["ok"], result
+        self._push_samples(session, transport, 1)
+        result = session.exp_record_stop()
+        assert result["ok"], result
+
+        import csv as csv_mod
+        with (tmp_path / result["file"]).open() as fp:
+            rows = list(csv_mod.DictReader(fp))
+        for key in ("yaw_est_deg", "yaw_ref_deg", "nis", "ffg",
+                    "ff_status", "tlm_state_age_ms"):
+            assert rows[0][key] == "", key
+        assert rows[0]["current_a"] != ""
+
+    def test_guards_while_recording(self, exp_session, tmp_path):
+        """計測中: スイープ/シーケンス開始と部分マスクの回転を拒否(T1-4)。"""
+        session, transport, clock, responder = exp_session
+        self._recorder(session, tmp_path)
+        transport.push(proto.MsgType.TLM_EXP, make_tlm_exp().to_payload())
+        assert wait_until(lambda: session.experiment.exp_age_s() is not None)
+        assert session.exp_record_start()["ok"]
+
+        result = session.sweep_start(0x0F, "up", None)
+        assert result["ok"] is False and "計測" in result["message"]
+        result = session.sequence_start([0x1], "up", None, 3.5)
+        assert result["ok"] is False and "計測" in result["message"]
+        # CMD_MOTOR_RUN は全モーター(0xF)のみ受理
+        result = session.motor_start(0.2, 0x01)
+        assert result["ok"] is False and "全モーター" in result["message"]
+        assert session.motor_start(0.2, 0x0F)["ok"] is True
+        # モーター停止は常に許可(緊急停止経路)
+        assert session.motor_stop()["ok"] is True
+        assert session.exp_record_stop()["ok"]
+
+    def test_full_recording_scenario(self, exp_session, tmp_path):
+        """一連の動作: 計測開始→TLM_EXP流入→行記録→スイープ拒否→
+        mask=0x3 拒否→0xF 受理→停止→meta 生成(aborted=false)。"""
+        session, transport, clock, responder = exp_session
+        recorder = self._recorder(session, tmp_path)
+
+        result = session.exp_record_start()
+        assert result["ok"], result
+        file_name = result["file"]
+
+        # TLM_EXP 流入 → 行が記録される
+        self._push_samples(session, transport, 5, duty_cmd=0.3,
+                           motors_mask=0x0F)
+        assert recorder.status()["samples"] >= 5
+
+        # 計測中の制限(サーバ側が正)
+        result = session.sweep_start(0x0F, "up", None)
+        assert result["ok"] is False and "計測" in result["message"]
+        result = session.motor_start(0.2, 0x03)         # FL+FR のみ → 拒否
+        assert result["ok"] is False and "全モーター" in result["message"]
+        assert session.motor_start(0.2, 0x0F)["ok"] is True  # 全モーターは受理
+        assert session.motor_stop()["ok"] is True
+
+        # 停止 → CSV と meta(aborted=false)が揃う
+        result = session.exp_record_stop()
+        assert result["ok"], result
+        assert not recorder.is_recording()
+
+        import csv as csv_mod
+        with (tmp_path / file_name).open() as fp:
+            rows = list(csv_mod.DictReader(fp))
+        assert len(rows) >= 5
+        assert list(rows[0].keys()) == experiment.EXPLOG_FIELDS
+        meta = json.loads(
+            (tmp_path / result["meta"]).read_text(encoding="utf-8"))
+        assert meta["aborted"] is False
+        assert meta["sample_count"] == len(rows)
+
+    def test_start_rejected_while_sweep_running(self, exp_session,
+                                                short_sweep, monkeypatch):
+        session, transport, clock, responder = exp_session
+        monkeypatch.setattr(experiment, "SWEEP_MEASURE_S", 5.0)
+        session.experiment.sweep.result_dir = short_sweep
+        self._recorder(session, short_sweep)
+        feeder = start_exp_feeder(session, transport)
+        try:
+            assert session.sweep_start(0x01, "up", None)["ok"]
+            assert wait_until(
+                lambda: session.experiment.sweep.status()["phase"]
+                in ("settle", "measure"), timeout=5.0)
+            result = session.exp_record_start()
+            assert result["ok"] is False
+            assert "実行中" in result["message"]
+            session.experiment.sweep.abort()
+            assert wait_until(
+                lambda: not session.experiment.sweep.is_running(), timeout=5.0)
+        finally:
+            feeder.set()
+
+    def test_mode_leave_aborts_recording(self, exp_session, tmp_path):
+        """モード離脱(実験無効化)で自動停止し meta に aborted=true(T1-5)。"""
+        session, transport, clock, responder = exp_session
+        recorder = self._recorder(session, tmp_path)
+        result = session.exp_record_start()
+        assert result["ok"], result
+        self._push_samples(session, transport, 1)
+        assert session.set_mode(MODE_POSTURE)
+        assert not recorder.is_recording()
+        meta_name = result["file"][:-len(".csv")] + "_meta.json"
+        meta = json.loads((tmp_path / meta_name).read_text(encoding="utf-8"))
+        assert meta["aborted"] is True
+        assert meta["sample_count"] >= 1
+
+    def test_space_stop_keeps_recording(self, exp_session, tmp_path):
+        """SPACE 緊急停止(CMD_STOP)では計測を止めない(T1-5)。"""
+        session, transport, clock, responder = exp_session
+        recorder = self._recorder(session, tmp_path)
+        assert session.exp_record_start()["ok"]
+        session.stop()   # モーター停止+実験無効化(hub.deactivate は通らない)
+        assert recorder.is_recording()
+        # 停止過渡のサンプルも記録され続ける
+        self._push_samples(session, transport, 1)
+        assert session.exp_record_stop()["ok"]
+
+    def test_disconnect_aborts_recording(self, exp_session, tmp_path):
+        """切断(teardown)で自動停止し meta に aborted=true(T1-5)。"""
+        session, transport, clock, responder = exp_session
+        recorder = self._recorder(session, tmp_path)
+        result = session.exp_record_start()
+        assert result["ok"], result
+        session.disconnect()
+        assert not recorder.is_recording()
+        meta_name = result["file"][:-len(".csv")] + "_meta.json"
+        meta = json.loads((tmp_path / meta_name).read_text(encoding="utf-8"))
+        assert meta["aborted"] is True
+
+
 class TestSequenceRunner:
     def test_two_mask_sequence(self, exp_session, short_sweep):
         session, transport, clock, responder = exp_session

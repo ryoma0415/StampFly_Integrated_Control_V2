@@ -2,7 +2,8 @@
 """FFプロファイル抽出の受入テスト (pytest不要、.venv/bin/python で直接実行).
 
   ① 6/12照合(厳密): 6/12 の 8 stem で抽出し、
-     graphs/feasibility_20260612/results.json の pooled_model.a/b・
+     tests/fixtures/results.json (旧 graphs/feasibility_20260612/results.json)
+     の pooled_model.a/b・
      additivity.per_motor_a_prop・duty_to_current_quadfit・lut_breakpoints.points
      と相対誤差 < 1e-6 で一致すること (同一コードパスの移植確認)。
   ② 付録A再現(新機体): 6/29+6/30 の 8本で抽出し、
@@ -26,7 +27,7 @@ import numpy as np  # noqa: E402
 from ff_params import core  # noqa: E402
 
 RESULTS_DIR = DATA_ANALYSIS.parent / "pc_server" / "data" / "sweep_results"
-FEAS_JSON = DATA_ANALYSIS / "graphs" / "feasibility_20260612" / "results.json"
+FEAS_JSON = HERE / "fixtures" / "results.json"
 
 STEMS_0612 = [
     # 全機 x 4姿勢
@@ -243,6 +244,87 @@ def test_assert_finite() -> None:
             print(f"  OK: {label} → ValueError = {msg}")
 
 
+# ============================================= ⑤ sequence meta 展開 ==========
+def _write_dummy_sequence_meta(tdir: Path, singles: list[str]) -> Path:
+    """単機4本 + 展開対象外 (対角ペア/aborted単機) を含むダミー sequence meta。"""
+    runs = [{"samples": f"{s}_samples.csv", "meta": f"{s}_meta.json",
+             "motors": m, "phase": "done", "aborted": False}
+            for s, m in zip(singles, core.MOTORS)]
+    runs.append({"samples": "sweep_fake_pair_samples.csv",
+                 "meta": "sweep_fake_pair_meta.json",
+                 "motors": "FL+RR", "phase": "done", "aborted": False})
+    runs.append({"samples": "sweep_fake_abort_samples.csv",
+                 "meta": "sweep_fake_abort_meta.json",
+                 "motors": "FL", "phase": "aborted", "aborted": True})
+    meta = {"schema": "stampfly_sweep_sequence_meta", "version": 1,
+            "run_id": "20260612_210000", "completed": True, "runs": runs}
+    mp = tdir / "sequence_20260612_210000_meta.json"
+    mp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return mp
+
+
+def test_sequence_expansion() -> None:
+    print("[展開] sequence meta → 単機4 stem (全機4 + sequence meta 1 ≡ 8本指定)")
+    import tempfile
+    all4, singles = STEMS_0612[:4], STEMS_0612[4:]
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        mp = _write_dummy_sequence_meta(tdir, singles)
+
+        # expand_sequence_meta: 完了済み単機4本のみ (ペア/aborted はスキップ)
+        got = core.expand_sequence_meta(mp, [tdir, RESULTS_DIR])
+        _check([s for s, _ in got] == singles,
+               f"展開 stem 不一致: {[s for s, _ in got]} != {singles}")
+        _check(all(d == RESULTS_DIR for _, d in got),
+               f"展開 dir が RESULTS_DIR でない: {[str(d) for _, d in got]}")
+        print(f"  OK: 単機4本のみ展開 (ペア run / aborted run はスキップ)")
+
+        # expand_stems: 全機4 stem + sequence meta パス → 8本 (順序: 指定順)
+        pairs = core.expand_stems(all4 + [str(mp)], RESULTS_DIR)
+        _check([s for s, _ in pairs] == STEMS_0612,
+               f"5ファイル指定の展開結果が8本指定と不一致: {[s for s, _ in pairs]}")
+        print(f"  OK: 5ファイル指定 → {len(pairs)}本 (指定順どおり)")
+
+        # 5ファイル指定の抽出値が8本指定と厳密一致
+        runs = [core.load_run(s, d) for s, d in pairs]
+        all_runs, motor_runs = core.classify_runs(runs)
+        prof5, _ = core.extract_profile(all_runs, motor_runs, name="test",
+                                        memo="test", source_dir=str(RESULTS_DIR))
+        prof8, _ = _extract(STEMS_0612)
+        same = (prof5["method_a"]["affine_ref"] == prof8["method_a"]["affine_ref"]
+                and prof5["method_a"]["lut"] == prof8["method_a"]["lut"]
+                and prof5["method_b"] == prof8["method_b"]
+                and prof5["stats"] == prof8["stats"]
+                and prof5["binding"] == prof8["binding"])
+        _check(same, "5ファイル指定の抽出結果が8本指定と不一致")
+        if same:
+            print("  OK: 抽出結果 (method_a/method_b/stats/binding) が8本指定と厳密一致")
+
+        # 参照先欠落 → ValueError (探索dir入り)
+        bad = json.loads(mp.read_text(encoding="utf-8"))
+        bad["runs"][0]["meta"] = "sweep_19990101_000000_meta.json"
+        bad["runs"][0]["samples"] = "sweep_19990101_000000_samples.csv"
+        bp = tdir / "sequence_19990101_000000_meta.json"
+        bp.write_text(json.dumps(bad), encoding="utf-8")
+        try:
+            core.expand_sequence_meta(bp, [tdir, RESULTS_DIR])
+            _check(False, "参照先欠落が ValueError にならなかった")
+        except ValueError as e:
+            _check("sweep_19990101_000000" in str(e),
+                   f"エラーメッセージに欠落 stem が無い: {e}")
+            print(f"  OK: 参照先欠落 → ValueError = {str(e)[:60]}...")
+
+        # schema 不一致 → ValueError
+        wrong = {"schema": "something_else", "runs": []}
+        wp = tdir / "sequence_wrong_meta.json"
+        wp.write_text(json.dumps(wrong), encoding="utf-8")
+        try:
+            core.expand_sequence_meta(wp, [tdir])
+            _check(False, "schema 不一致が ValueError にならなかった")
+        except ValueError as e:
+            print(f"  OK: schema 不一致 → ValueError = {str(e)[:60]}...")
+
+
 def main() -> int:
     test_0612_exact_match()
     print()
@@ -251,6 +333,8 @@ def main() -> int:
     test_reject_aborted_run()
     print()
     test_assert_finite()
+    print()
+    test_sequence_expansion()
     print()
     if _fail_count:
         print(f"NG: {_fail_count} 件の不一致")

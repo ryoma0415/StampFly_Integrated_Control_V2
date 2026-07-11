@@ -141,3 +141,36 @@ static const float FF_EKF_BM_DRIFT_WARN_HOLD_S = 10.0f;
 static const float FF_EKF_REJECT_INFLATE_AFTER_S = 3.0f;
 static const float FF_EKF_REJECT_INFLATE_RATE_PER_S = 1.02f;
 static const float FF_EKF_P_INFLATE_MAX_RATIO = 10.0f;
+
+// ---- V2 改修 (2026-07): チルト運動学予測 / NISロック脱出 / 再アンカー健全化 ----
+// (7/10 実験 explog_20260710_203534 の NISロック(t=82.3s〜)・再アンカー時
+//  −15° スナップ・ぐるぐる区間の予測誤差急拡大への対策)
+
+// [A] チルト運動学予測: 本ファームの姿勢規約では ψ̇ = ((r−b_g)·cosθ − p·sinθ)/cosφ
+// (導出と検証は yaw_estimator_kf.cpp の predict を参照)。cosφ(ロール) が
+// この値未満 (|roll| > 60°) では特異点 (cosφ→0) を避けて従来式 ψ̇ = r−b_g に
+// フォールバックする。
+static const float FF_EKF_TILT_KIN_COS_MIN = 0.5f;  // = cos(60°)
+// [A] ψ̇ の数値安全弁: ±720°/s にクランプ (異常姿勢・異常レート入力での暴走防止)
+static const float FF_EKF_PSI_DOT_CLAMP_RAD_S = 720.0f * DEG_TO_RAD;
+
+// [B-1] ソフト再捕捉: 最終「通常受理」からこの時間を超えて NIS 棄却が続き、かつ
+// 観測が norm/z/tilt ゲートを通過している (=NIS だけで弾かれている) とき、棄却の
+// 代わりに制限付き更新 (ffg bit7) で引き込みを再開する。飛行中も有効。
+static const float FF_EKF_RECAPTURE_AFTER_S = 5.0f;
+// [B-1] 制限付き更新の 1 更新あたり Δψ クランプ (3°/更新。磁気更新は実効 10Hz
+// なので最大 30°/s の引き込みレートに相当)
+static const float FF_EKF_RECAPTURE_MAX_STEP_RAD = 3.0f * DEG_TO_RAD;
+
+// [B-2] 地上自動再アンカー: モーター停止中・B0 窓 full で、最終受理からこの時間を
+// 超えて NIS 棄却が続いていたら ffFreezeAnchorFromWindow() を自動発動する
+// (ソフト再捕捉でも戻れない大乖離・磁場環境変化の最終救済)。
+static const float FF_EKF_AUTO_REANCHOR_AFTER_S = 10.0f;
+// [B-2] 自動再アンカーの連発防止クールダウン
+static const float FF_EKF_AUTO_REANCHOR_COOLDOWN_S = 30.0f;
+
+// [C] 再アンカー ψ0 の健全 EKF 判定: 最終受理からこの時間以内 (かつ nis<5.99・
+// 非凍結・アンカー有効) なら anchor_psi0 に EKF の現在 ψ を使う。停止直後の
+// リファレンスCF は過渡誤差 (リキャプチャ 2°/更新の引き込み遅れ、7/10 実測で
+// −15° 前後) を持ち得るため、健全な EKF を優先してスナップを防ぐ。
+static const float FF_EKF_ANCHOR_PSI0_FRESH_S = 1.0f;

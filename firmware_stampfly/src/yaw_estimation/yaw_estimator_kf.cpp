@@ -52,26 +52,69 @@ void YawEstimatorKf::reseedYaw(float psi_rad) {
     drift_warn_time_s_ = 0.0f;
 }
 
-void YawEstimatorKf::predict(float omega_z_rad_s, float dt_s) {
+void YawEstimatorKf::predict(
+    float omega_z_rad_s,
+    float roll_rate_rad_s,
+    float roll_rad,
+    float pitch_rad,
+    float dt_s
+) {
     if (dt_s <= 0.0f || dt_s > 0.2f) {
         dt_s = SENSOR_PERIOD_US * 1.0e-6f;
     }
 
     const float a = 1.0f - dt_s / FF_EKF_TAU_BM_S;  // Gauss-Markov 減衰
-    x_[0] = wrapPi(x_[0] + (omega_z_rad_s - x_[1]) * dt_s);
+
+    // ---- チルト運動学予測 (V2改修A) ----
+    // 教科書の航空規約では ψ̇=(q·sinφ+r·cosφ)/cosθ だが、本ファームは
+    // sensor.cpp で Madgwick に軸入替 (gx=q, gy=p, gz=−r, 対応accel) で入力し
+    // Roll_angle=getPitch / Pitch_angle=getRoll / Yaw_angle=−getYaw と取り出す
+    // ため、回転行列は R_earth←body = R_z(−ψ)·R_y(φ)·R_x(θ)·T (T=軸入替) となり、
+    // オイラー角レートは
+    //   ψ̇ = ((r − b_g)·cosθ − p·sinθ) / cosφ
+    // になる (q=ピッチレートは ψ̇ に現れず、代わりに p=ロールレートが入る。
+    // 特異点は cosφ=0 = ロール±90°)。7/10 実験ログ explog_20260710_203534 の
+    // Madgwick 姿勢差分から復元した機体レートとの照合 (3軸 corr 0.90-0.98) と、
+    // tilt>10° 区間の per-step 回帰 (本形: corr +0.69 / slope +0.89、教科書形:
+    // corr −0.30 で逆効果) で本形を検証済み。
+    // b_g は従来どおり Z軸レート ω_z のバイアスとしてのみモデル化を続ける
+    // (p のバイアスは非モデル化 — 水平近傍では sinθ≈0 で寄与が小さく、
+    //  4状態のまま増やさない設計判断)。
+    const float cos_phi = cosf(roll_rad);
+    float psi_dot;
+    float dpsidot_dbg;  // ∂ψ̇/∂b_g (F[0][1] = dpsidot_dbg·dt のヤコビアン用)
+    if (cos_phi >= FF_EKF_TILT_KIN_COS_MIN) {
+        const float cos_theta = cosf(pitch_rad);
+        const float sin_theta = sinf(pitch_rad);
+        const float inv_cos_phi = 1.0f / cos_phi;
+        psi_dot =
+            ((omega_z_rad_s - x_[1]) * cos_theta - roll_rate_rad_s * sin_theta) * inv_cos_phi;
+        dpsidot_dbg = -cos_theta * inv_cos_phi;
+    } else {
+        // ロール特異点近傍 (|φ|>60°, FF_EKF_TILT_KIN_COS_MIN): 従来式へフォールバック
+        psi_dot = omega_z_rad_s - x_[1];
+        dpsidot_dbg = -1.0f;
+    }
+    // 数値安全弁: ±720°/s にクランプ
+    if (psi_dot > FF_EKF_PSI_DOT_CLAMP_RAD_S) psi_dot = FF_EKF_PSI_DOT_CLAMP_RAD_S;
+    if (psi_dot < -FF_EKF_PSI_DOT_CLAMP_RAD_S) psi_dot = -FF_EKF_PSI_DOT_CLAMP_RAD_S;
+
+    x_[0] = wrapPi(x_[0] + psi_dot * dt_s);
     x_[2] *= a;
     x_[3] *= a;
 
-    // P⁻ = F·P·Fᵀ + Q·dt,  F = [[1,−dt,0,0],[0,1,0,0],[0,0,a,0],[0,0,0,a]]
+    // P⁻ = F·P·Fᵀ + Q·dt,  F = [[1,g,0,0],[0,1,0,0],[0,0,a,0],[0,0,0,a]],
+    // g = ∂(Δψ)/∂b_g = dpsidot_dbg·dt (従来の −dt はフォールバック時の特殊形)
+    const float g01 = dpsidot_dbg * dt_s;
     float FP[4][4];
     for (uint8_t c = 0; c < 4; c++) {
-        FP[0][c] = P_[0][c] - dt_s * P_[1][c];
+        FP[0][c] = P_[0][c] + g01 * P_[1][c];
         FP[1][c] = P_[1][c];
         FP[2][c] = a * P_[2][c];
         FP[3][c] = a * P_[3][c];
     }
     for (uint8_t r = 0; r < 4; r++) {
-        const float col0 = FP[r][0] - dt_s * FP[r][1];
+        const float col0 = FP[r][0] + g01 * FP[r][1];
         const float col2 = a * FP[r][2];
         const float col3 = a * FP[r][3];
         P_[r][0] = col0;
@@ -202,14 +245,30 @@ void YawEstimatorKf::update(
     const float nis = y0 * (inv00 * y0 + inv01 * y1) + y1 * (inv10 * y0 + inv11 * y1);
     nis_ = nis;
 
-    if (nis > FF_EKF_NIS_REJECT) {
+    // V2改修B-1: ソフト再捕捉。norm/z/tilt ゲートは通過しているのに NIS だけで
+    // FF_EKF_RECAPTURE_AFTER_S(5s) を超えて棄却され続けている (NISロック) 場合、
+    // 棄却する代わりに「制限付き更新」(bit7) で引き込みを再開する (飛行中も有効)。
+    // time_since_accept_s_ は通常受理 (NIS≤13.8) でのみリセットされるため、
+    // 引き込みが進んで NIS が下がれば自然に通常経路へ復帰する。
+    const bool recapture =
+        nis > FF_EKF_NIS_REJECT && time_since_accept_s_ > FF_EKF_RECAPTURE_AFTER_S;
+    if (nis > FF_EKF_NIS_REJECT && !recapture) {
         // bit1: NIS > χ²₂(99.9%) = 13.8 → 棄却
         gate_bits_ = bits | FF_EKF_GATE_NIS_REJECT;
         return;
     }
-    if (nis > FF_EKF_NIS_INFLATE) {
+    if (recapture) {
+        // 制限付き更新 (1/3): R を (NIS/13.8) 倍に膨張 — 実効 NIS≈13.8 相当まで
+        // ゲインを減衰させた上で、後段の Δψ クランプ・b_m ゲインゼロ化を適用する
+        r_eff *= nis / FF_EKF_NIS_REJECT;
+        bits |= FF_EKF_GATE_RECAPTURE;
+    } else if (nis > FF_EKF_NIS_INFLATE) {
         // bit0: NIS > χ²₂(95%) = 5.99 → R×(NIS/5.99) に膨張して採用
         r_eff *= nis / FF_EKF_NIS_INFLATE;
+        bits |= FF_EKF_GATE_R_INFLATED;
+    }
+    if (recapture || nis > FF_EKF_NIS_INFLATE) {
+        // 膨張後の R で S・S⁻¹ を再計算
         s00 = HP0[0] * dhx + HP0[2] + r_eff;
         s01 = HP0[0] * dhy + HP0[3];
         s10 = HP1[0] * dhx + HP1[2];
@@ -223,7 +282,6 @@ void YawEstimatorKf::update(
         inv01 = -s01 / det;
         inv10 = -s10 / det;
         inv11 = s00 / det;
-        bits |= FF_EKF_GATE_R_INFLATED;
     }
 
     // K = P⁻·Hᵀ·S⁻¹ (4×2)。P·Hᵀ の列は HP の転置。
@@ -234,11 +292,34 @@ void YawEstimatorKf::update(
         K[r][0] = ph0 * inv00 + ph1 * inv10;
         K[r][1] = ph0 * inv01 + ph1 * inv11;
     }
+    if (recapture) {
+        // 制限付き更新 (2/3): バイアス (b_g/b_mx/b_my) への補正はゼロ — 大乖離を
+        // バイアスに吸収させず、ψ の引き込みのみ行う (b_g を許すと巨大イノベー
+        // ションが b_g を蹴り、再捕捉後に ψ が逆側へ数°オーバーシュートして
+        // 数十秒残ることを合成シミュレーションで確認済み)。
+        // 状態・共分散の両方で同じ制限ゲインを使い整合を保つ。
+        K[1][0] = 0.0f;
+        K[1][1] = 0.0f;
+        K[2][0] = 0.0f;
+        K[2][1] = 0.0f;
+        K[3][0] = 0.0f;
+        K[3][1] = 0.0f;
+    }
 
     const float bm_prev_x = x_[2];
     const float bm_prev_y = x_[3];
+    float dx[4];
     for (uint8_t r = 0; r < 4; r++) {
-        x_[r] += K[r][0] * y0 + K[r][1] * y1;
+        dx[r] = K[r][0] * y0 + K[r][1] * y1;
+    }
+    if (recapture) {
+        // 制限付き更新 (3/3): Δψ を ±FF_EKF_RECAPTURE_MAX_STEP_RAD(3°)/更新に
+        // クランプ (磁気更新は実効 10Hz → 最大 30°/s の引き込みレート)
+        if (dx[0] > FF_EKF_RECAPTURE_MAX_STEP_RAD) dx[0] = FF_EKF_RECAPTURE_MAX_STEP_RAD;
+        if (dx[0] < -FF_EKF_RECAPTURE_MAX_STEP_RAD) dx[0] = -FF_EKF_RECAPTURE_MAX_STEP_RAD;
+    }
+    for (uint8_t r = 0; r < 4; r++) {
+        x_[r] += dx[r];
     }
     x_[0] = wrapPi(x_[0]);
 
@@ -265,6 +346,13 @@ void YawEstimatorKf::update(
         for (uint8_t c = 0; c < 4; c++) {
             P_[r][c] = 0.5f * (newP[r][c] + newP[c][r]);
         }
+    }
+
+    if (recapture) {
+        // ソフト再捕捉中は「通常受理」ではない: time_since_accept_s_ は保持し、
+        // b_m 不変のため凍結/ドリフト判定もスキップする。
+        gate_bits_ = bits;
+        return;
     }
 
     time_since_accept_s_ = 0.0f;

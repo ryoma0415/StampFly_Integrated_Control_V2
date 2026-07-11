@@ -158,7 +158,9 @@ v2 は**末尾追加のみ**: 既存オフセット 0–96 は v1 と不変
 bit0 R_INFLATED(NIS>5.99 → R 膨張適用中)、bit1 NIS_REJECT(NIS>13.8 棄却)、
 bit2 NORM_REJECT(ノルム逸脱 >20µT 棄却)、bit3 Z_REJECT(z 成分逸脱 >12µT 棄却)、
 bit4 TILT_SKIP(tilt>25° スキップ)、bit5 BM_FROZEN(‖b_m‖>20µT → 磁気更新凍結、
-要再アンカー)、bit6 DRIFT_WARN(|db_m/dt|>0.3µT/s 10s 継続の警告)。
+要再アンカー)、bit6 DRIFT_WARN(|db_m/dt|>0.3µT/s 10s 継続の警告)、
+bit7 RECAPTURE(NIS 棄却が 5s 超継続 → 制限付き更新=ソフト再捕捉適用中。
+FF_PIPELINE.md §5.5 改修B-1。ワイヤ形式は不変 — 既存の予約 bit を使用)。
 
 `ff_status` ビット:
 bit0-1 ff_mode(0-2)、bit2 est_mode(1=EKF)、bit3 anchor_valid、

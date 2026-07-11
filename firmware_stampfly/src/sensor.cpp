@@ -337,6 +337,8 @@ float sensor_read(void) {
         SensorHubFfInputs ff_in;
         // ω_z = −gyro_z − 起動offset(yaw側と同一の未フィルタ規約で渡す)
         ff_in.yaw_rate_rad_s = Yaw_rate_raw - Yaw_rate_offset;
+        // p = gyro_y − 起動offset(EKFチルト運動学予測用。ω_z と同じ未フィルタ規約)
+        ff_in.roll_rate_rad_s = Roll_rate_raw - Roll_rate_offset;
         ff_in.roll_rad = sensor_state.Roll_angle;
         ff_in.pitch_rad = sensor_state.Pitch_angle;
         ff_in.dt_s = flight_control_state.timing.Interval_time;

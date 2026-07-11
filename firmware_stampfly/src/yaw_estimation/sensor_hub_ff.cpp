@@ -15,6 +15,7 @@
 
 #include <math.h>
 
+#include "../comm.hpp"  // 地上自動再アンカー(V2改修B-2)の LOG_TEXT 通知
 #include "angle_utils.hpp"
 #include "persistence.hpp"
 #include "yaw_config.hpp"
@@ -91,6 +92,20 @@ bool ffFreezeAnchorFromWindow() {
     if (!g_ff_anchor_window.full()) {
         return false;
     }
+    // V2改修C: 再アンカー ψ0 の健全化。EKF が直近まで観測を通常受理できている
+    // (=健全) なら ψ0 に EKF の現在 ψ を使う。停止直後のリファレンスCF は
+    // リキャプチャ上限 2°/更新の引き込み遅れで過渡誤差 (7/10 実測 −15° 前後) を
+    // 持ち得るため、健全時は EKF 継続でスナップ≈0 とし、EKF が壊れている
+    // (NIS棄却継続・凍結・未アンカー・FF停止) ときだけ従来どおり CF で矯正する。
+    // ブート直後の初回は anchorValid()=false なので従来どおり CF になる。
+    // 注意: ffReseedCorrectedEstimators() が yaw_kf.reseedYaw() で ψ/nis/
+    // time_since_accept を消すため、判定と ψ の読み出しは必ずこの位置で行う。
+    const YawEstimatorKf& kf = g_yaw_est.yaw_kf;
+    const bool ekf_psi0_ok = sensorHubFfCorrectionActive() && kf.anchorValid() &&
+                             kf.timeSinceAccept() < FF_EKF_ANCHOR_PSI0_FRESH_S &&
+                             kf.nis() < FF_EKF_NIS_INFLATE && !kf.magFrozen();
+    const float psi0 = ekf_psi0_ok ? kf.yaw() : g_yaw_est.yaw_estimator.yaw();
+
     MagVector b0;
     float i_idle = 0.0f;
     g_ff_anchor_window.mean(b0, i_idle);
@@ -98,11 +113,11 @@ bool ffFreezeAnchorFromWindow() {
     g_yaw_est.ff.anchor_b0 = b0;
     g_yaw_est.ff.anchor_b0h_x = b0h.x;
     g_yaw_est.ff.anchor_b0h_y = b0h.y;
-    g_yaw_est.ff.anchor_psi0 = g_yaw_est.yaw_estimator.yaw();
+    g_yaw_est.ff.anchor_psi0 = psi0;
     g_yaw_est.ff.anchor_i_idle = i_idle;
     g_yaw_est.ff.anchor_valid = true;
     ffReseedCorrectedEstimators();
-    g_yaw_est.yaw_kf.reanchor(g_yaw_est.ff.anchor_psi0, b0h.x, b0h.y, b0);
+    g_yaw_est.yaw_kf.reanchor(psi0, b0h.x, b0h.y, b0);
     return true;
 }
 
@@ -114,6 +129,7 @@ bool ffFreezeAnchorFromWindow() {
 void ffAnchorService(bool motors_running) {
     static uint32_t last_push_ms = 0;
     static bool prev_running = false;
+    static uint32_t last_auto_reanchor_ms = 0;  // V2改修B-2 のクールダウン起点
     const bool running = motors_running;
 
     if (running && !prev_running) {
@@ -141,6 +157,24 @@ void ffAnchorService(bool motors_running) {
     g_ff_anchor_window.push(g_yaw_est.frame.mag_cal_body, g_yaw_est.current_sample.current_a);
     if (!g_ff_boot_anchor_done && g_ff_anchor_window.full()) {
         g_ff_boot_anchor_done = ffFreezeAnchorFromWindow();
+    }
+
+    // V2改修B-2: 地上自動再アンカー。モーターOFF・B0 窓 full で、EKF が最終受理
+    // から FF_EKF_AUTO_REANCHOR_AFTER_S(10s) を超えて観測を受理できていない
+    // (NIS棄却や b_m 凍結が続いている) 場合、アンカーを自動で取り直して
+    // B0/ψ0 を現在の磁場環境に合わせ直す (ソフト再捕捉 B-1 でも戻れない
+    // 大乖離・環境変化の最終救済)。FF_EKF_AUTO_REANCHOR_COOLDOWN_S(30s) の
+    // クールダウンで連発を防ぐ。EKF が実際に駆動されている (FF補正有効かつ
+    // アンカー有効 = time_since_accept が進む条件) ときのみ発動する。
+    if (g_ff_anchor_window.full() && g_yaw_est.ff.anchor_valid &&
+        sensorHubFfCorrectionActive() &&
+        g_yaw_est.yaw_kf.timeSinceAccept() > FF_EKF_AUTO_REANCHOR_AFTER_S &&
+        now_ms - last_auto_reanchor_ms >=
+            static_cast<uint32_t>(FF_EKF_AUTO_REANCHOR_COOLDOWN_S * 1000.0f)) {
+        if (ffFreezeAnchorFromWindow()) {
+            last_auto_reanchor_ms = now_ms;
+            comm_send_log("EKF自動再アンカー(NIS棄却継続のため)");
+        }
     }
 }
 
@@ -361,7 +395,9 @@ void sensorHubFfUpdate(const SensorHubFfInputs& in) {
         );
         // EKF: 予測は毎tick(dt実測)、更新は fresh 磁気サンプルのみ
         // (hold値での二重実行を mag_sample_fresh で防ぐ)。
-        g_yaw_est.yaw_kf.predict(in.yaw_rate_rad_s, dt_s);
+        // V2改修A: チルト運動学予測用に p(ロールレート)とレベル化と同じ
+        // マウントオフセット適用後の roll/pitch を渡す。
+        g_yaw_est.yaw_kf.predict(in.yaw_rate_rad_s, in.roll_rate_rad_s, roll_rad, pitch_rad, dt_s);
         if (frame.mag_sample_fresh && g_yaw_est.ff.anchor_valid) {
             g_yaw_est.yaw_kf.update(
                 frame.mag_corr_filtered_body,

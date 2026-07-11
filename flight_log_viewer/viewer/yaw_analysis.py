@@ -30,7 +30,12 @@ from .constants import (  # noqa: E402
     NIS_REJECT_THRESHOLD,
     YAW_SOURCES,
 )
-from .loader import YAW_ESTIMATOR_KEYS, FlightLog, unwrap_deg, wrap_deg  # noqa: E402
+from .loader import (  # noqa: E402
+    YAW_ESTIMATOR_KEYS,
+    FlightLog,
+    unwrap_deg,
+    wrapped_plot_series,
+)
 from .style import legend_dark, new_fig, save_fig  # noqa: E402
 
 # 系統キー → (表示名, 色) の索引
@@ -181,9 +186,10 @@ def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
     for key, label, color in available:
         # ±180 パネルはここでラップして描く(生の deg 列はソース範囲を保持して
         # いる — ジャイロ積算は無制限、旧ログの Madgwick は 0..-360 — ため、
-        # そのままでは軸外にクリップされて見えなくなる)
-        ax.plot(t, wrap_deg(df[f"yaw_{key}_deg"].to_numpy(dtype=float)),
-                color=color, linewidth=0.9, alpha=0.9, label=label)
+        # そのままでは軸外にクリップされて見えなくなる)。ラップ跨ぎには
+        # NaN を挿入して縦線を防ぐ。
+        tw, yw = wrapped_plot_series(t, df[f"yaw_{key}_deg"].to_numpy(dtype=float))
+        ax.plot(tw, yw, color=color, linewidth=0.9, alpha=0.9, label=label)
     ax.set_ylim(-185.0, 185.0)
     ax.set_ylabel("ヨー角 [deg](±180)", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
@@ -338,14 +344,18 @@ def _fig_yaw_tracking(log: FlightLog, out_dir: Path, stats: dict) -> Path | None
                         height_ratios=[2.0, 1.0])
 
     ax = axes[0]
+    # ±180° ラップ+ラップ跨ぎ NaN 挿入で描く(縦線防止)
     if log.has("cmd_yaw_ref_deg"):
-        ax.plot(t, df["cmd_yaw_ref_deg"], color=COLORS["yaw_cmd"], linewidth=1.0,
+        tw, yw = wrapped_plot_series(t, df["cmd_yaw_ref_deg"].to_numpy(dtype=float))
+        ax.plot(tw, yw, color=COLORS["yaw_cmd"], linewidth=1.0,
                 linestyle="--", alpha=0.9, label="ヨー指令(PC 送信)")
     if log.has("tlm_yaw_ref_deg"):
-        ax.plot(t, df["tlm_yaw_ref_deg"], color=COLORS["yaw_ref_applied"],
+        tw, yw = wrapped_plot_series(t, df["tlm_yaw_ref_deg"].to_numpy(dtype=float))
+        ax.plot(tw, yw, color=COLORS["yaw_ref_applied"],
                 linewidth=1.0, alpha=0.9, label="機体適用目標(ラッチ含む)")
     if log.has("yaw_ekf_deg"):
-        ax.plot(t, df["yaw_ekf_deg"], color=COLORS["yaw_ekf"], linewidth=1.0,
+        tw, yw = wrapped_plot_series(t, df["yaw_ekf_deg"].to_numpy(dtype=float))
+        ax.plot(tw, yw, color=COLORS["yaw_ekf"], linewidth=1.0,
                 alpha=0.9, label="実測(アクティブ推定器)")
     if log.has("yaw_ctrl_on"):
         on = df["yaw_ctrl_on"].to_numpy(dtype=float) > 0

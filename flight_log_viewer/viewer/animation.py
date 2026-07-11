@@ -37,7 +37,7 @@ from .constants import (  # noqa: E402
     MULTI_DRONE_COLORS,
     YAW_SOURCES,
 )
-from .loader import FlightLog  # noqa: E402
+from .loader import FlightLog, wrapped_plot_series  # noqa: E402
 
 # 既定の出力設定
 DEFAULT_ANIM_FPS = 20.0        # 動画なし時のフレームレート
@@ -222,15 +222,20 @@ def _legend(ax, **kwargs) -> None:
 
 
 def _build_ts_panel(ax, df: pd.DataFrame, ylabel: str,
-                    specs: tuple[tuple[str, str, str, str], ...]) -> list:
+                    specs: tuple[tuple[str, str, str, str], ...],
+                    wrap_angle: bool = False) -> list:
     """時系列パネルの Line2D 群を作る。specs=(列名, 表示名, 色, 線種)。
 
     データが無い列はスキップし、y 範囲は全データから固定する
     (フレーム毎の再計算を避ける)。単機・複数機アニメで共用。
+    wrap_angle=True では値を ±180° にラップし、ラップ跨ぎに NaN を
+    挿入して縦線を防ぐ(ヨー系パネル用。線ごとに時間軸が伸びるため、
+    戻り値は (Line2D, 時間配列, 値配列) のタプルのリスト)。
     """
     _style_ax(ax)
     ax.set_ylabel(ylabel, fontsize=9)
     ax.set_xlabel("時間 [s]", fontsize=8)
+    t = df["elapsed_time"].to_numpy(dtype=float)
     lines = []
     for col, label, color, linestyle in specs:
         if col not in df.columns:
@@ -238,11 +243,15 @@ def _build_ts_panel(ax, df: pd.DataFrame, ylabel: str,
         values = df[col].to_numpy(dtype=float)
         if not np.isfinite(values).any():
             continue
+        if wrap_angle:
+            t_line, values = wrapped_plot_series(t, values)
+        else:
+            t_line = t
         (line,) = ax.plot([], [], color=color, linewidth=1.2, alpha=0.9,
                           linestyle=linestyle, label=label)
-        lines.append((line, values))
+        lines.append((line, t_line, values))
     if lines:
-        all_values = np.concatenate([v for _, v in lines])
+        all_values = np.concatenate([v for _, _, v in lines])
         finite = all_values[np.isfinite(all_values)]
         if finite.size:
             low, high = float(np.min(finite)), float(np.max(finite))
@@ -250,6 +259,17 @@ def _build_ts_panel(ax, df: pd.DataFrame, ylabel: str,
             ax.set_ylim(low - pad, high + pad)
         _legend(ax, ncol=max(1, len(lines) // 2))
     return lines
+
+
+def _update_ts_panels(ts_panels, now: float) -> None:
+    """時系列パネル群を時刻 now までの表示窓に更新する(単機・複数機共用)。"""
+    window_lo = now - TRAIL_WINDOW_S
+    for ax, lines in ts_panels:
+        for line, t_line, values in lines:
+            lo = int(np.searchsorted(t_line, window_lo))
+            hi = int(np.searchsorted(t_line, now, side="right"))
+            line.set_data(t_line[lo:hi], values[lo:hi])
+        ax.set_xlim(window_lo, now + TRAIL_WINDOW_S * 0.1)
 
 
 class _AnimationBuilder:
@@ -332,12 +352,14 @@ class _AnimationBuilder:
         # --- ヨー4系統パネル ---
         slot_yaw = gs[1, 3] if video_frames else gs[1, 2:]
         self.ax_yaw = self.fig.add_subplot(slot_yaw)
+        # ラップ表示のため補間はアンラップ列で行い、描画時に ±180° へ畳む
         yaw_specs = []
         for key, _col, label, color, _deg in YAW_SOURCES:
             yaw_specs.append((f"yaw_{key}_unwrap_deg", label, color, "-"))
         yaw_specs.append(("cmd_yaw_ref_deg", "指令", COLORS["yaw_cmd"], "--"))
         self.yaw_lines = self._make_ts_panel(
-            self.ax_yaw, "ヨー4系統 [deg]", tuple(yaw_specs))
+            self.ax_yaw, "ヨー4系統 [deg]（±180）", tuple(yaw_specs),
+            wrap_angle=True)
 
         # --- 姿勢パネル ---
         self.ax_att = self.fig.add_subplot(gs[2, 0:2])
@@ -380,9 +402,10 @@ class _AnimationBuilder:
         self.title = self.fig.suptitle("", fontsize=13, color="white")
 
     def _make_ts_panel(self, ax, ylabel: str,
-                       specs: tuple[tuple[str, str, str, str], ...]) -> list:
+                       specs: tuple[tuple[str, str, str, str], ...],
+                       wrap_angle: bool = False) -> list:
         """時系列パネルの Line2D 群を作る。specs=(列名, 表示名, 色, 線種)。"""
-        return _build_ts_panel(ax, self.df, ylabel, specs)
+        return _build_ts_panel(ax, self.df, ylabel, specs, wrap_angle=wrap_angle)
 
     def update(self, frame_idx: int):
         """FuncAnimation のフレーム更新コールバック。"""
@@ -401,13 +424,7 @@ class _AnimationBuilder:
             if np.isfinite(px) and np.isfinite(py):
                 self.pt_current.set_data([px], [py])
 
-        window_lo = now - TRAIL_WINDOW_S
-        start = int(np.searchsorted(self.t, window_lo))
-        sl = slice(start, frame_idx + 1)
-        for ax, lines in self.ts_panels:
-            for line, values in lines:
-                line.set_data(self.t[sl], values[sl])
-            ax.set_xlim(window_lo, now + TRAIL_WINDOW_S * 0.1)
+        _update_ts_panels(self.ts_panels, now)
 
         self.title.set_text(
             f"{self.log.name}   t={now:6.2f}s   モード: {self.log.mode}")
@@ -588,12 +605,14 @@ class _MultiAnimationBuilder:
                  ("tlm_altitude_tof_m", "ToF", COLORS["alt_tof"], "-")))
             ax_alt.set_title(f"{name} 高度", fontsize=10, color=color)
 
+            # ラップ表示のため補間はアンラップ列で行い、描画時に ±180° へ畳む
             ax_yaw = self.fig.add_subplot(gs[i, 3])
             yaw_lines = _build_ts_panel(
-                ax_yaw, df, "ヨー [deg]",
+                ax_yaw, df, "ヨー [deg]（±180）",
                 (("yaw_ekf_unwrap_deg", "EKF", COLORS["yaw_ekf"], "-"),
                  ("yaw_mocap_unwrap_deg", "MoCap", COLORS["yaw_mocap"], "-"),
-                 ("cmd_yaw_ref_deg", "指令", COLORS["yaw_cmd"], "--")))
+                 ("cmd_yaw_ref_deg", "指令", COLORS["yaw_cmd"], "--")),
+                wrap_angle=True)
             ax_yaw.set_title(f"{name} ヨー", fontsize=10, color=color)
 
             self.ts_panels += [(ax_alt, alt_lines), (ax_yaw, yaw_lines)]
@@ -617,13 +636,7 @@ class _MultiAnimationBuilder:
             if np.isfinite(px) and np.isfinite(py):
                 point.set_data([px], [py])
 
-        window_lo = now - TRAIL_WINDOW_S
-        start = int(np.searchsorted(self.t, window_lo))
-        sl = slice(start, frame_idx + 1)
-        for ax, lines in self.ts_panels:
-            for line, values in lines:
-                line.set_data(self.t[sl], values[sl])
-            ax.set_xlim(window_lo, now + TRAIL_WINDOW_S * 0.1)
+        _update_ts_panels(self.ts_panels, now)
 
         self.title.set_text(
             f"複数機同時制御   t={now:6.2f}s   機体: {self._names}")

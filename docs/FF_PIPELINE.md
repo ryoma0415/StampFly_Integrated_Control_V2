@@ -272,9 +272,12 @@ yaw側は float を `%.9g` テキスト化して UDP 送信していたが、V2 
   完了まで窓を開始しない)、`b_cal` と `I_total` の直近2s移動平均を常時更新
   (20Hzリングバッファ、40サンプル。`FF_ANCHOR_PERIOD_MS`/`FF_ANCHOR_WINDOW_SAMPLES`)。
 - **モーター始動遷移(停止→回転)で凍結**: `B0`(3軸), `I_idle`, `B0_horiz=levelMag(B0,roll,pitch)_xy`,
-  `ψ0=リファレンス推定器の現在yaw`。b_m←0、EKF P←P0、補正系EMA・norm_ref再初期化。
+  `ψ0=健全なEKFの現在ψ(不健全時はリファレンスCFの現在yaw。§5.5 改修C)`。
+  b_m←0、EKF P←P0、補正系EMA・norm_ref再初期化。
   離陸(CMD_START)とモーターテスト開始の両方が「始動遷移」。
 - CMD_FF_ANCHOR で手動再取得(停止時のみ)。ブート後は窓が満ちた時点で自動初回取得。
+- **地上自動再アンカー(2026-07改修B-2)**: モーターOFF・窓full で EKF が 10s 超
+  観測を受理できていないとき自動で再取得(30s クールダウン。§5.5 参照)。
 - アンカー有効フラグはテレメトリ ff_status bit3(anchor_valid)で公開。
 - **CMD_MAG3D_SET(適用/クリア)時**: FF係数は旧 b_cal 空間で無効になるため、アンカー無効化+
   窓リセット+補正系再シード+**ff_mode=0(NVS保存)** を行う。係数blobはNVSに残す
@@ -294,8 +297,18 @@ yaw側は float を `%.9g` テキスト化して UDP 送信していたが、V2 
 ### 5.5 4状態EKF(yaw_estimator_kf、ff_two_methods §4 準拠)
 
 - 状態 `x=[ψ, b_g, b_mx, b_my]`、内部単位 rad / rad/s / µT。
-- 予測: sensorHub tick毎(400Hz, dt実測)。`ψ⁻=wrap(ψ+(ω_z−b_g)·dt)`;
-  `b_m⁻=(1−dt/τ_bm)·b_m`; `P⁻=F·P·Fᵀ+Q·dt`。ω_z は既存規約(−gyro_z−起動offset)。
+- 予測: sensorHub tick毎(400Hz, dt実測)。**チルト運動学予測(2026-07改修A)**:
+  本ファームの姿勢規約(sensor.cpp の Madgwick 軸入替)でのオイラー角レートは
+  `ψ̇=((ω_z−b_g)·cosθ−p·sinθ)/cosφ`(φ/θ=マウントオフセット適用後の Madgwick
+  roll/pitch=レベル化と同一値、p=ロールレート未フィルタ・起動offset減算後)。
+  `cosφ<cos60°`(`FF_EKF_TILT_KIN_COS_MIN`、ロール特異点 cosφ=0 のガード)では
+  従来式 `ψ̇=ω_z−b_g` にフォールバックし、ψ̇ は ±720°/s にクランプ
+  (`FF_EKF_PSI_DOT_CLAMP_RAD_S`)。ヤコビアンは `F[0][1]=−cosθ/cosφ·dt`
+  (フォールバック時 `−dt`)。b_g は従来どおり ω_z のバイアスとしてのみ
+  モデル化(p のバイアスは非モデル化)。導出・実データ検証(7/10 実験ログとの
+  per-step 回帰)は `yaw_estimator_kf.cpp` の predict コメント参照。
+  `ψ⁻=wrap(ψ+ψ̇·dt)`; `b_m⁻=(1−dt/τ_bm)·b_m`; `P⁻=F·P·Fᵀ+Q·dt`。
+  ω_z は既存規約(−gyro_z−起動offset)。
 - 更新: freshな磁気サンプルのみ(実効10Hz)。観測 `z=(ℓx,ℓy)`(補正EMA後→レベル化)。
   `h(x)=R_z(ψ−ψ0)·B0_horiz+b_m`(R_z は標準CCW: atan2がψとともに増える向き)。
   `H=[R_z'(ψ−ψ0)·B0_horiz, 0, I₂]`。NIS=yᵀS⁻¹y。
@@ -304,8 +317,34 @@ yaw側は float を `%.9g` テキスト化して UDP 送信していたが、V2 
   bit0: NIS>5.99→R×(NIS/5.99)膨張(適用中)、bit1: NIS>13.8→棄却、
   bit2: |‖b_corr,filt‖−‖B0‖|>20µT→棄却(8-20µTはR膨張=bit0扱い)、
   bit3: |b_corr,filt.z−B0.z|>12µT→棄却、bit4: tilt>25°→スキップ、
-  bit5: ‖b_m‖>20µT→磁気更新凍結(要再アンカー)、bit6: |db_m/dt|>0.3µT/s 10s継続警告。
+  bit5: ‖b_m‖>20µT→磁気更新凍結(要再アンカー)、bit6: |db_m/dt|>0.3µT/s 10s継続警告、
+  bit7: ソフト再捕捉(制限付き更新)適用中(下記 B-1)。
   連続棄却>3s: P のψ・b_m対角を1.02/s で緩膨張(それぞれ P0 の10倍上限)。
+- **NISロック脱出(2026-07改修B、2段)**:
+  - **B-1 ソフト再捕捉(ffg bit7、飛行中も有効)**: 最終「通常受理」
+    (NIS≤13.8 での採用)から `FF_EKF_RECAPTURE_AFTER_S`(5s)を超えて
+    NIS>13.8 の棄却が続き、かつ観測が norm/z/tilt/凍結ゲートを通過している
+    (=NIS だけで弾かれている)とき、棄却の代わりに制限付き更新を行う:
+    (1) R を (NIS/13.8) 倍に膨張してゲイン減衰、(2) b_g/b_mx/b_my のゲインは
+    ゼロ(大乖離をバイアスに吸収させない。状態・共分散とも同じ制限ゲイン)、
+    (3) Δψ を `FF_EKF_RECAPTURE_MAX_STEP_RAD`(3°)/更新にクランプ
+    (磁気更新は実効10Hz→最大30°/s の引き込み)。time_since_accept は通常受理
+    でのみリセットされるため、引き込みが進んで NIS が下がれば自然に通常経路へ
+    復帰する。報告される nis 値は膨張前の基本 R での値。
+  - **B-2 地上自動再アンカー**: `ffAnchorService` 内、モーターOFF・B0 窓 full・
+    FF補正有効・アンカー有効で、EKF の time_since_accept が
+    `FF_EKF_AUTO_REANCHOR_AFTER_S`(10s)を超えていたら
+    `ffFreezeAnchorFromWindow()` を自動発動(NIS棄却・b_m凍結の継続に対する
+    最終救済)。`FF_EKF_AUTO_REANCHOR_COOLDOWN_S`(30s)のクールダウンで連発
+    防止。発動時は LOG_TEXT「EKF自動再アンカー(NIS棄却継続のため)」を送出。
+- **再アンカー ψ0 の選択(2026-07改修C)**: `ffFreezeAnchorFromWindow()` は
+  EKF が健全(FF補正有効 && anchor_valid && time_since_accept <
+  `FF_EKF_ANCHOR_PSI0_FRESH_S`(1s) && nis<5.99 && 非凍結)なら anchor_psi0 に
+  **EKF の現在 ψ**、そうでなければ従来どおり**リファレンスCF の yaw** を使う。
+  停止直後のリファレンスCF はリキャプチャ上限 2°/更新の引き込み遅れで過渡誤差
+  (7/10 実測 −15° 前後)を持ち得るため、健全時は EKF 継続でスナップ≈0 とし、
+  EKF が壊れているときだけ CF で矯正する。ブート初回は EKF 未アンカーで必ず CF。
+  B-2 発動時は time_since_accept>10s のため必ず CF 側になる。
 - 定数(`yaw_config.hpp`、rad系に換算して定義): q_ψ=5e-4 deg²/s, q_bg=1e-8 (°/s)²/s,
   q_bm=0.02 µT²/s, τ_bm=120s, P0=diag((10°)²,(0.5°/s)²,(4µT)²,(4µT)²),
   R_base=4.0µT², σ_rz=3.5µT, κ_ff=0.03, τ_resid=0.05s, σ_diff係数=0.3×30µT/A。

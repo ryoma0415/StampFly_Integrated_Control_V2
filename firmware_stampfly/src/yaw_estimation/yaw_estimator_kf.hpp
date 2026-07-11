@@ -26,6 +26,8 @@ enum FfEkfGateBits : uint8_t {
     FF_EKF_GATE_TILT_SKIP = 1u << 4,   // tilt>25° → スキップ
     FF_EKF_GATE_BM_FROZEN = 1u << 5,   // ‖b_m‖>20µT → 磁気更新凍結(要再アンカー)
     FF_EKF_GATE_DRIFT_WARN = 1u << 6,  // |db_m/dt|>0.3µT/s 10s 継続の警告
+    FF_EKF_GATE_RECAPTURE = 1u << 7,   // NIS棄却が5s超継続 → 制限付き更新(ソフト再捕捉)適用中
+                                       // (R×(NIS/13.8)膨張・Δψ≤3°/更新・b_g/b_m補正ゼロ)
 };
 
 class YawEstimatorKf {
@@ -38,7 +40,19 @@ public:
     // 現在 yaw に合わせ、P を P0 へ戻す。
     void reseedYaw(float psi_rad);
     // 予測ステップ (400Hz, dt 実測)。ω_z は既存規約 (−gyro_z − 起動offset)。
-    void predict(float omega_z_rad_s, float dt_s);
+    // V2改修A: チルト運動学予測。本ファームの姿勢規約では
+    //   ψ̇ = ((ω_z − b_g)·cosθ − p·sinθ) / cosφ
+    // (p = ロールレート gyro_y 未フィルタ・offset減算後、φ/θ = Madgwick の
+    //  roll/pitch にマウントオフセット適用後 = レベル化と同じ姿勢)。
+    // cosφ < cos(60°) では従来式 ψ̇ = ω_z − b_g にフォールバック。
+    // 導出・実データ検証は .cpp の predict 冒頭コメント参照。
+    void predict(
+        float omega_z_rad_s,
+        float roll_rate_rad_s,
+        float roll_rad,
+        float pitch_rad,
+        float dt_s
+    );
     // 更新ステップ (fresh 磁気サンプルのみ呼ぶこと — hold 値で二重実行しない)。
     // b_corr_filt は FF 補正後 EMA の 3軸磁場、σ は FF 層の自己申告 [µT]。
     void update(
@@ -58,6 +72,11 @@ public:
     float nis() const { return nis_; }
     uint8_t gateBits() const { return gate_bits_; }
     bool anchorValid() const { return anchor_valid_; }
+    // 最終「通常受理」(NIS<13.8 での採用) からの経過秒。ソフト再捕捉 (bit7) では
+    // リセットされない。地上自動再アンカー (B-2)・再アンカーψ0健全判定 (C) が参照。
+    float timeSinceAccept() const { return time_since_accept_s_; }
+    // ‖b_m‖>20µT による磁気更新凍結中か (bit5 の内部状態。再アンカーで解除)
+    bool magFrozen() const { return mag_frozen_; }
 
 private:
     void resetCovariance();

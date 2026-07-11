@@ -50,6 +50,27 @@ def wrap_deg(angle_deg: np.ndarray | float) -> np.ndarray | float:
     return (np.asarray(angle_deg) + 180.0) % 360.0 - 180.0
 
 
+def wrapped_plot_series(t: np.ndarray, deg: np.ndarray,
+                        jump_deg: float = 180.0) -> tuple[np.ndarray, np.ndarray]:
+    """±180° ラップ表示用の (t, y) を返す(data_analysis/plot_explog.py と同実装)。
+
+    wrap_deg した系列の隣接差が jump_deg を超える箇所(ラップ跨ぎ)に
+    NaN 点を挿入し、プロット時に縦線が入らないよう線を切る。
+    表示専用: 統計計算(ドリフト率など)には使わないこと。
+    """
+    t = np.asarray(t, dtype=float)
+    w = np.asarray(wrap_deg(np.asarray(deg, dtype=float)))
+    if len(w) < 2:
+        return t, w
+    d = np.abs(np.diff(w))
+    jumps = np.where(np.isfinite(d) & (d > jump_deg))[0]
+    if jumps.size == 0:
+        return t, w
+    t2 = np.insert(t, jumps + 1, (t[jumps] + t[jumps + 1]) / 2.0)
+    y2 = np.insert(w, jumps + 1, np.nan)
+    return t2, y2
+
+
 def unwrap_deg(values: np.ndarray) -> np.ndarray:
     """NaN を保持したままアンラップする(有限区間のみ np.unwrap)。"""
     values = np.asarray(values, dtype=float)

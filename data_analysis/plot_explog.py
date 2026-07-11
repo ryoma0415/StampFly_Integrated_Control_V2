@@ -7,11 +7,11 @@ pc_server/data/exp_logs/explog_<YYYYMMDD_HHMMSS>.csv（≈25Hz）を読み、
 まとめる。必要な列が無い / 全欠損の図は自動でスキップする。
 
 出力図:
-    01_yaw_comparison.png   ヨー3系統（ジャイロ積分 / EKF推定 / Madgwick）重畳 + duty
+    01_yaw_comparison.png   ヨー3系統（±180°ラップ絶対値）+ 磁気方位(FF補正後) + duty
     02_yaw_error.png        基準に対する各系統の誤差時系列（RMS/最大を凡例に）
     03_current_duty.png     電流 / バッテリ電圧 / duty
     04_mag_ff.png           校正済み磁場変化 Δb_cal と FF推定外乱 db_hat の重畳
-    05_ekf_diagnostics.png  NIS（閾値 2.0 / 5.99 / 13.8）+ ffg 7ゲートのタイムライン
+    05_ekf_diagnostics.png  NIS（閾値 2.0 / 5.99 / 13.8）+ ffg 8ゲートのタイムライン
     06_ff_status.png        ff_status（ff_mode + フラグビット）のタイムライン
 
 使い方:
@@ -86,6 +86,7 @@ GATE_BITS = [
     ("tilt>25°", "#94a3b8"),
     ("b_m凍結", "#dc2626"),
     ("ドリフト警告", "#0ea5e9"),
+    ("再捕捉中", "#4ade80"),
 ]
 
 # ff_status: 下位2bit = ff_mode(0=off,1=A,2=B)、bit2-6 = フラグ
@@ -207,6 +208,72 @@ def relative(a: np.ndarray) -> tuple[np.ndarray, float]:
     return u - off, off
 
 
+def circ_mean_deg(a: np.ndarray) -> float:
+    """円周平均 [deg]。±180 付近でも破綻しない平均角。"""
+    fin = a[np.isfinite(a)]
+    if fin.size == 0:
+        return math.nan
+    r = np.deg2rad(fin)
+    return math.degrees(math.atan2(float(np.mean(np.sin(r))),
+                                   float(np.mean(np.cos(r)))))
+
+
+def wrapped_plot_series(t: np.ndarray, deg: np.ndarray,
+                        jump_deg: float = 180.0) -> tuple[np.ndarray, np.ndarray]:
+    """±180° ラップ表示用の (t, y)。
+
+    wrap180 した系列の隣接差が jump_deg を超える箇所（ラップ跨ぎ）に
+    NaN 点を挿入し、プロット時に縦線が入らないよう線を切る。
+    """
+    w = wrap180(deg)
+    if len(w) < 2:
+        return t, w
+    d = np.abs(np.diff(w))
+    jumps = np.where(np.isfinite(d) & (d > jump_deg))[0]
+    if jumps.size == 0:
+        return t, w
+    t2 = np.insert(t.astype(float), jumps + 1, (t[jumps] + t[jumps + 1]) / 2.0)
+    y2 = np.insert(w, jumps + 1, np.nan)
+    return t2, y2
+
+
+def tilt_deg_series(data: dict) -> np.ndarray:
+    """チルト角 [deg] = acos(cos(roll)·cos(pitch))。roll/pitch 欠損は NaN。"""
+    r = np.deg2rad(col(data, "roll_deg"))
+    p = np.deg2rad(col(data, "pitch_deg"))
+    c = np.clip(np.cos(r) * np.cos(p), -1.0, 1.0)
+    return np.degrees(np.arccos(c))
+
+
+def mag_yaw_deg(data: dict, subtract_ff: bool, tilt_mask_deg: float = 15.0) -> np.ndarray:
+    """磁気方位 [deg]（ファーム yaw_estimation と同一規約）。
+
+    ファーム実装（firmware_stampfly/src/yaw_estimation/）:
+      - FF補正は水平2軸のみ: b_corr = (bx_cal − db_hat_x, by_cal − db_hat_y, bz_cal)
+      - levelMagVectorBody(angle_utils.hpp): 独自符号のチルト補償
+            lx = mx·cp + mz·sp
+            ly = mx·sr·sp + my·cr + mz·sr·cp
+      - yaw_mag = atan2(ly, lx)  （yaw_estimator.cpp:133。ψ とともに増える CCW 規約）
+    tilt > tilt_mask_deg の区間は NaN でマスク（レベル化の信頼性低下）。
+    """
+    bx = col(data, "bx_cal").copy()
+    by = col(data, "by_cal").copy()
+    bz = col(data, "bz_cal")
+    if subtract_ff:
+        bx = bx - np.nan_to_num(col(data, "db_hat_x_ut"))
+        by = by - np.nan_to_num(col(data, "db_hat_y_ut"))
+    r = np.deg2rad(col(data, "roll_deg"))
+    p = np.deg2rad(col(data, "pitch_deg"))
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    lx = bx * cp + bz * sp
+    ly = bx * sr * sp + by * cr + bz * sr * cp
+    yaw = np.degrees(np.arctan2(ly, lx))
+    tilt = tilt_deg_series(data)
+    yaw[np.isfinite(tilt) & (tilt > tilt_mask_deg)] = np.nan
+    return yaw
+
+
 # --------------------------------------------------------------- derive -------
 def time_axis(data: dict) -> np.ndarray:
     """時間軸 [s]（開始=0）。exp_elapsed_ms 優先、無ければ t_s、最後は行番号/25Hz。"""
@@ -279,19 +346,32 @@ def fig01_yaw_comparison(data: dict, t: np.ndarray, on: np.ndarray,
         2, 1, figsize=(13, 7.5), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
     _motor_spans(ax, t, on)
     for key, lab, color in streams:
-        rel, off = relative(col(data, key))
-        ax.plot(t, rel, "-", lw=1.5, color=color,
-                label=f"{lab} ({key}, 開始 {off:.1f}° 基準)")
+        tw, yw = wrapped_plot_series(t, col(data, key))
+        ax.plot(tw, yw, "-", lw=1.5, color=color, label=f"{lab} ({key})")
+
+    # 第4トレース: FF補正後の磁気方位（ファーム規約, 開始10サンプルで EKF に位置合わせ）
+    if usable(data, "bx_cal", "by_cal", "bz_cal") and usable(data, "yaw_est_deg"):
+        ym = mag_yaw_deg(data, subtract_ff=True, tilt_mask_deg=15.0)
+        ye = col(data, "yaw_est_deg")
+        both = np.isfinite(ym) & np.isfinite(ye)
+        idx = np.where(both)[0][:10]
+        if idx.size:
+            off = circ_mean_deg(wrap180(ye[idx] - ym[idx]))
+            tw, yw = wrapped_plot_series(t, ym + off)
+            ax.plot(tw, yw, ":", lw=1.0, color="#4ade80", alpha=0.55,
+                    label="磁気方位(FF補正後, 開始点合わせ) [tilt>15°マスク]")
+
     yr = col(data, "yaw_ref_deg")
     if np.isfinite(yr).any():
-        rel, off = relative(yr)
-        ax.plot(t, rel, "--", lw=1.0, color="#e6e9ef", alpha=0.6,
-                label=f"目標 yaw_ref (開始 {off:.1f}° 基準)")
+        tw, yw = wrapped_plot_series(t, yr)
+        ax.plot(tw, yw, "--", lw=1.0, color="#e6e9ef", alpha=0.6, label="目標 yaw_ref")
     ax.axhline(0, ls=":", lw=0.8, color="#6b7280")
-    ax.set_ylabel("相対 Yaw [deg]（開始10サンプル平均を0）")
+    ax.set_ylim(-190, 190)
+    ax.set_yticks(np.arange(-180, 181, 90))
+    ax.set_ylabel("Yaw [deg]（±180° ラップ・絶対値）")
     ax.grid(alpha=0.3)
     ax.legend(loc="best", fontsize=8)
-    ax.set_title("① ヨー3系統の比較（開始時点オフセット減算・unwrap 済み）" + tsuffix,
+    ax.set_title("① ヨー3系統の比較（±180° ラップ表示・UIと同じ絶対値）" + tsuffix,
                  fontsize=12)
     _duty_panel(ax2, t, data, on)
     save_fig(fig, out, "01_yaw_comparison.png")
@@ -447,7 +527,7 @@ def fig05_ekf_diagnostics(data: dict, t: np.ndarray, on: np.ndarray,
     else:
         ax.text(0.5, 0.5, "nis 列なし/全欠損", ha="center", va="center",
                 transform=ax.transAxes, color="#aab2c0")
-    ax.set_title("⑤ EKF健全性: NIS と ffg 7ゲート発火タイムライン" + tsuffix, fontsize=12)
+    ax.set_title("⑤ EKF健全性: NIS と ffg 8ゲート発火タイムライン" + tsuffix, fontsize=12)
 
     if has_ffg:
         ffg = np.nan_to_num(col(data, "ffg")).astype(int)
@@ -501,13 +581,52 @@ def fig06_ff_status(data: dict, t: np.ndarray, on: np.ndarray,
 
 
 # -------------------------------------------------------------- summary -------
-def drift_rate_deg_per_min(t: np.ndarray, rel: np.ndarray) -> float:
-    """相対ヨー系列の線形フィット傾き [deg/min]。"""
-    fin = np.isfinite(t) & np.isfinite(rel)
-    if fin.sum() < 2 or float(np.ptp(t[fin])) <= 0:
-        return math.nan
-    slope = np.polyfit(t[fin], rel[fin], 1)[0]  # deg/s
-    return float(slope * 60.0)
+STILL_GYRO_THRESH_RAD_S = 0.05   # |r| < 0.05 rad/s (≈2.9°/s) を静止とみなす
+STILL_MIN_SEG_S = 3.0            # ドリフトフィットに使う静止区間の最短長
+STILL_ENOUGH_S = 10.0            # これ未満なら「静止区間不足のため参考値」
+
+
+def stationary_mask(data: dict, on: np.ndarray) -> np.ndarray:
+    """静止区間: モーターOFF かつ |r_rad_s| < 閾値（r 欠損時は OFF のみ）。"""
+    m = ~on
+    r = col(data, "r_rad_s")
+    if np.isfinite(r).any():
+        m = m & np.isfinite(r) & (np.abs(r) < STILL_GYRO_THRESH_RAD_S)
+    return m
+
+
+def contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """True 連続区間の (開始, 終了) index（両端含む）リスト。"""
+    m = mask.astype(int)
+    edges = np.diff(np.concatenate([[0], m, [0]]))
+    starts = np.where(edges == 1)[0]
+    ends = np.where(edges == -1)[0] - 1
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def stationary_drift_deg_per_min(t: np.ndarray, rel: np.ndarray,
+                                 still: np.ndarray) -> tuple[float, float]:
+    """静止区間のみのドリフト率 [deg/min] と、使用した静止時間合計 [s]。
+
+    STILL_MIN_SEG_S 以上の静止区間ごとに線形フィットし、区間長で加重平均する
+    （意図的回転を含むログで全区間フィットが無意味な値になるのを避ける）。
+    """
+    slopes: list[float] = []
+    weights: list[float] = []
+    for s, e in contiguous_runs(still):
+        seg_t = t[s:e + 1]
+        seg_y = rel[s:e + 1]
+        fin = np.isfinite(seg_t) & np.isfinite(seg_y)
+        if fin.sum() < 5:
+            continue
+        dur = float(np.ptp(seg_t[fin]))
+        if dur < STILL_MIN_SEG_S:
+            continue
+        slopes.append(float(np.polyfit(seg_t[fin], seg_y[fin], 1)[0]) * 60.0)
+        weights.append(dur)
+    if not slopes:
+        return math.nan, 0.0
+    return float(np.average(slopes, weights=weights)), float(sum(weights))
 
 
 def write_summary(data: dict, t: np.ndarray, on: np.ndarray, path: Path,
@@ -532,17 +651,53 @@ def write_summary(data: dict, t: np.ndarray, on: np.ndarray, path: Path,
                 add(f"meta.{k}: {meta[k]}")
 
     add("")
-    add("--- ヨー各系統のドリフト（開始10サンプル平均基準・線形フィット） ---")
+    still = stationary_mask(data, on)
+    still_runs = [(s, e) for s, e in contiguous_runs(still)
+                  if float(t[e] - t[s]) >= STILL_MIN_SEG_S]
+    still_total = float(sum(t[e] - t[s] for s, e in still_runs))
+    add(f"--- ヨー各系統のドリフト（静止区間のみ: モーターOFF かつ "
+        f"|r|<{math.degrees(STILL_GYRO_THRESH_RAD_S):.1f}°/s・区間毎線形フィット加重平均） ---")
+    add(f"静止区間  : {len(still_runs)} 区間 / 合計 {still_total:.1f} s"
+        f"（{STILL_MIN_SEG_S:.0f} s 未満の区間は除外）")
     for key, lab, _ in YAW_STREAMS:
         if not usable(data, key):
             add(f"{lab:24s}: 列なし/全欠損")
             continue
         rel, _ = relative(col(data, key))
         fin = rel[np.isfinite(rel)]
-        rate = drift_rate_deg_per_min(t, rel)
-        add(f"{lab:24s}: ドリフト率 {rate:+.3f} °/min  "
-            f"(最終値 {fin[-1]:+.2f}° / 最大|ずれ| {np.max(np.abs(fin)):.2f}°)"
-            if fin.size else f"{lab:24s}: 有効値なし")
+        if not fin.size:
+            add(f"{lab:24s}: 有効値なし")
+            continue
+        rate, used_s = stationary_drift_deg_per_min(t, rel, still)
+        if math.isnan(rate):
+            add(f"{lab:24s}: 静止区間不足のため算出不可 "
+                f"(最終値 {fin[-1]:+.2f}° / 最大|ずれ| {np.max(np.abs(fin)):.2f}°)")
+            continue
+        note = "（静止区間不足のため参考値）" if used_s < STILL_ENOUGH_S else ""
+        add(f"{lab:24s}: ドリフト率 {rate:+.3f} °/min{note}  "
+            f"(静止 {used_s:.1f} s 使用 / 最終値 {fin[-1]:+.2f}° / "
+            f"最大|ずれ| {np.max(np.abs(fin)):.2f}°)")
+
+    # 開始静止 vs 終了静止の生磁気方位差（機体が物理的に元の向きへ戻ったかの指標）
+    if usable(data, "bx_cal", "by_cal", "bz_cal"):
+        ym_raw = mag_yaw_deg(data, subtract_ff=False, tilt_mask_deg=15.0)
+        if len(still_runs) >= 2:
+            s0, e0 = still_runs[0]
+            s1, e1 = still_runs[-1]
+            h0 = circ_mean_deg(ym_raw[s0:e0 + 1])
+            h1 = circ_mean_deg(ym_raw[s1:e1 + 1])
+            src = (f"開始静止 t={t[s0]:.1f}–{t[e0]:.1f}s vs "
+                   f"終了静止 t={t[s1]:.1f}–{t[e1]:.1f}s")
+        else:
+            h0 = circ_mean_deg(ym_raw[:10])
+            h1 = circ_mean_deg(ym_raw[-10:])
+            src = "静止区間が2つ未満のため先頭/末尾10サンプルで代用（参考値）"
+        if math.isnan(h0) or math.isnan(h1):
+            add("生磁気方位差: tilt>15° 等で有効サンプルなし")
+        else:
+            dh = wrap180(np.array([h1 - h0]))[0]
+            add(f"生磁気方位差（{src}）: {dh:+.1f}°"
+                f"  ※FF補正なし・ファーム規約 atan2 準拠。0°に近いほど物理的に元の向き")
 
     add("")
     add("--- 電流 / 電圧 ---")

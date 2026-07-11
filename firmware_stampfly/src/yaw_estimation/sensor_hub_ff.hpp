@@ -69,6 +69,8 @@ struct FfState {
 // sensorHubFfUpdate() への 1tick 分の入力(ベース sensor.cpp が組み立てる)
 struct SensorHubFfInputs {
     float yaw_rate_rad_s = 0.0f;   // ω_z = −gyro_z − 起動offset(既存規約のまま渡す)
+    float roll_rate_rad_s = 0.0f;  // p = ロールレート(gyro_y − 起動offset、未フィルタ)。
+                                   // EKF チルト運動学予測(V2改修A)専用の追加入力
     float roll_rad = 0.0f;         // Madgwick ロール [rad](マウントオフセット適用前)
     float pitch_rad = 0.0f;        // Madgwick ピッチ [rad]
     float dt_s = 0.0f;             // 実測tick周期 [s]

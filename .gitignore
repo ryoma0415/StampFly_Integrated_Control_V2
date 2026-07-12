@@ -23,6 +23,9 @@ pc_server/data/sweep_results/*
 !pc_server/data/sweep_results/.gitkeep
 pc_server/data/exp_logs/*
 !pc_server/data/exp_logs/.gitkeep
+!pc_server/data/exp_logs/videos/
+pc_server/data/exp_logs/videos/*
+!pc_server/data/exp_logs/videos/.gitkeep
 pc_server/data/yaw_eval_results/*
 !pc_server/data/yaw_eval_results/.gitkeep
 flight_log_viewer/output/*

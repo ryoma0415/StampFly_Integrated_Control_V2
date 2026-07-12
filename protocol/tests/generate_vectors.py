@@ -325,6 +325,12 @@ def build_vectors() -> dict:
     frames.append(frame_vector(
         "cmd_ff_anchor_empty_payload", "NONE", sp.MsgType.CMD_FF_ANCHOR, 35, {}, b""))
 
+    # --- v2.2 計測中 LED インジケータ(0x25)---
+    led_mode = sp.CmdLedMode(mode=sp.CmdLedMode.MODE_RECORDING)
+    frames.append(frame_vector(
+        "cmd_led_mode_recording", "CMD_LED_MODE", sp.MsgType.CMD_LED_MODE, 36,
+        {"mode": 1}, led_mode.to_payload()))
+
     # --- v2 新規下りメッセージ(0x32–0x34)---
     ack = sp.TlmAck(acked_type=int(sp.MsgType.CMD_FF_COMMIT), acked_seq=33,
                     status=sp.TlmAck.STATUS_OK)

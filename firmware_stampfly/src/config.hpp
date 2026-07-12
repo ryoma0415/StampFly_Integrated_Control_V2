@@ -147,6 +147,7 @@ struct FlightConfig {
     uint16_t led_show_divider = 16;         // LED更新 25Hz
     uint16_t led_blink_period_ticks = 200;  // 点滅の半周期(0.5s @400Hz)
     uint16_t led_cycle_step_ticks = 21;     // WAITイルミネーションの色送り間隔
+    uint32_t led_recording_failsafe_ms = 3000;  // CMD_LED_MODE(1) 途絶で AUTO 復帰 [ms]
 
     // --- 起動 ---
     uint32_t boot_serial_wait_ms = 1500;    // USBシリアル安定待ち [ms]

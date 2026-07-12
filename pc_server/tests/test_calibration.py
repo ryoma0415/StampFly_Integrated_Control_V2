@@ -188,28 +188,34 @@ class TestQuickCal:
         # 「機体の現在オフセット + 現在の推定ヨー」の逆算値を送る
         responder.cal_data.yawzero_offset_rad = 0.25
         responder.cal_data.valid_flags |= proto.TlmCalData.VALID_YAWZERO
-        tlm = proto.TlmState(yaw_est_rad=0.5,
-                             ff_status=proto.TlmState.FF_STATUS_MAG_FRESH)
-        transport.push(proto.MsgType.TLM_STATE, tlm.to_payload())
+        responder.auto_tlm_state = True
+        responder.yaw_est_rad = 0.5
+        transport.push(proto.MsgType.TLM_STATE,
+                       responder.make_tlm_state().to_payload())
         assert wait_until(
             lambda: session._tlm_state_snapshot()[0] is not None)
-        assert session.calibration.yaw_zero()["ok"]
+        result = session.calibration.yaw_zero()
+        assert result["ok"], result
         sent = proto.CmdYawzeroSet.from_payload(
             transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)[0].payload)
         assert sent.valid == 1
         assert sent.offset_rad == pytest.approx(0.25 + 0.5)
+        # ff_mode=0 のためモード切替なし。アンカー再取得だけ行われる
+        assert not transport.frames_of_type(proto.MsgType.CMD_FF_MODE)
+        assert len(transport.frames_of_type(proto.MsgType.CMD_FF_ANCHOR)) == 1
 
-        assert session.calibration.yaw_zero_clear()["ok"]
+        result = session.calibration.yaw_zero_clear()
+        assert result["ok"], result
         assert not (responder.cal_data.valid_flags
                     & proto.TlmCalData.VALID_YAWZERO)
 
     def test_yaw_zero_guards(self, cal_session):
-        """Yaw 0 の前提: TLM_STATE 鮮度・磁気鮮度・ff_mode=0 を検証する。"""
+        """Yaw 0 の前提: TLM_STATE 鮮度・磁気鮮度を検証する。"""
         session, transport, clock, responder, tmp_path = cal_session
         # TLM_STATE 未受信 → 拒否
         result = session.calibration.yaw_zero()
         assert not result["ok"]
-        assert "TLM_STATE" in result["message"]
+        assert "新鮮" in result["message"]
         # 磁気サンプルが新鮮でない(ff_status bit6 なし)→ 拒否
         transport.push(proto.MsgType.TLM_STATE,
                        proto.TlmState(yaw_est_rad=0.1).to_payload())
@@ -218,22 +224,171 @@ class TestQuickCal:
         result = session.calibration.yaw_zero()
         assert not result["ok"]
         assert "磁気" in result["message"]
-        # ff_mode≠0(アクティブ推定器が補正系)→ 拒否
-        transport.push(proto.MsgType.TLM_STATE, proto.TlmState(
-            yaw_est_rad=0.1,
-            ff_status=proto.TlmState.FF_STATUS_MAG_FRESH | 0x01).to_payload())
-        responder.cal_data.ff_mode = 1
-        assert wait_until(lambda: (session._tlm_state_snapshot()[0] or
-                                   proto.TlmState()).ff_status != 0)
-        result = session.calibration.yaw_zero()
-        assert not result["ok"]
-        assert "FF" in result["message"]
         # TLM_STATE が古い(> telemetry_fresh_s)→ 拒否
-        responder.cal_data.ff_mode = 0
         clock.advance(1.0)
         result = session.calibration.yaw_zero()
         assert not result["ok"]
         assert "新鮮" in result["message"]
+        # ガードで弾かれた場合はコマンドを一切送らない
+        assert not transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)
+
+
+class TestYawZeroSequence:
+    """ワンクリック・ヨーゼロ自動シーケンス
+    (CAL_GET → FF一時off → 設定 → FF復元 → アンカー再取得)。"""
+
+    SEQ_TYPES = (proto.MsgType.CMD_CAL_GET, proto.MsgType.CMD_FF_MODE,
+                 proto.MsgType.CMD_YAWZERO_SET, proto.MsgType.CMD_FF_ANCHOR)
+
+    @staticmethod
+    def prime(session, transport, responder, yaw_est=0.5,
+              ff_mode=2, est_mode=1, offset=0.25):
+        """FF 有効(ff=2/est=EKF)の機体状態と新鮮な TLM_STATE を用意する。"""
+        responder.auto_tlm_state = True
+        responder.yaw_est_rad = yaw_est
+        responder.cal_data.ff_mode = ff_mode
+        responder.cal_data.est_mode = est_mode
+        responder.cal_data.yawzero_offset_rad = offset
+        transport.push(proto.MsgType.TLM_STATE,
+                       responder.make_tlm_state().to_payload())
+        assert wait_until(
+            lambda: session._tlm_state_snapshot()[0] is not None)
+        transport.clear_sent()
+
+    def test_full_sequence_from_ff_on(self, cal_session):
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder)
+        result = session.calibration.yaw_zero()
+        assert result["ok"], result
+        assert result["warnings"] == []
+        frames = [f for f in transport.sent_frames if f.type in self.SEQ_TYPES]
+        assert [f.type for f in frames] == [
+            proto.MsgType.CMD_CAL_GET,
+            proto.MsgType.CMD_FF_MODE,      # FF 一時 off
+            proto.MsgType.CMD_YAWZERO_SET,  # 逆算オフセット設定
+            proto.MsgType.CMD_FF_MODE,      # FF 復元
+            proto.MsgType.CMD_FF_ANCHOR,    # アンカー再取得
+        ]
+        ff_off = proto.CmdFfMode.from_payload(frames[1].payload)
+        assert (ff_off.ff_mode, ff_off.est_mode) == (0, 1)   # est_mode は維持
+        sent = proto.CmdYawzeroSet.from_payload(frames[2].payload)
+        assert sent.valid == 1
+        assert sent.offset_rad == pytest.approx(0.25 + 0.5)
+        restore = proto.CmdFfMode.from_payload(frames[3].payload)
+        assert (restore.ff_mode, restore.est_mode) == (2, 1)
+        # 機体状態: ヨーゼロ設定済み+FFモード復元済み
+        assert responder.cal_data.valid_flags & proto.TlmCalData.VALID_YAWZERO
+        assert responder.cal_data.ff_mode == 2
+
+    def test_clear_wraps_same_sequence(self, cal_session):
+        session, transport, clock, responder, tmp_path = cal_session
+        responder.cal_data.valid_flags |= proto.TlmCalData.VALID_YAWZERO
+        self.prime(session, transport, responder)
+        result = session.calibration.yaw_zero_clear()
+        assert result["ok"], result
+        frames = [f for f in transport.sent_frames if f.type in self.SEQ_TYPES]
+        assert [f.type for f in frames] == [
+            proto.MsgType.CMD_CAL_GET, proto.MsgType.CMD_FF_MODE,
+            proto.MsgType.CMD_YAWZERO_SET, proto.MsgType.CMD_FF_MODE,
+            proto.MsgType.CMD_FF_ANCHOR]
+        sent = proto.CmdYawzeroSet.from_payload(frames[2].payload)
+        assert sent.valid == 0
+        assert not (responder.cal_data.valid_flags
+                    & proto.TlmCalData.VALID_YAWZERO)
+        assert responder.cal_data.ff_mode == 2   # 復元済み
+
+    def test_yawzero_nack_restores_ff_mode(self, cal_session):
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder)
+        responder.ack_status_overrides[int(proto.MsgType.CMD_YAWZERO_SET)] = \
+            proto.TlmAck.STATUS_BAD_STATE
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "CMD_YAWZERO_SET" in result["message"]
+        assert "復元しました" in result["message"]
+        ff_frames = transport.frames_of_type(proto.MsgType.CMD_FF_MODE)
+        assert len(ff_frames) == 2   # off → 復元
+        restore = proto.CmdFfMode.from_payload(ff_frames[-1].payload)
+        assert (restore.ff_mode, restore.est_mode) == (2, 1)
+        assert responder.cal_data.ff_mode == 2
+        # 失敗時はアンカー再取得まで進まない
+        assert not transport.frames_of_type(proto.MsgType.CMD_FF_ANCHOR)
+
+    def test_anchor_busy_is_warning_not_failure(self, cal_session,
+                                                monkeypatch):
+        from core import calibration as calibration_mod
+        monkeypatch.setattr(calibration_mod, "YAWZERO_ANCHOR_RETRIES", 3)
+        monkeypatch.setattr(calibration_mod, "YAWZERO_ANCHOR_RETRY_S", 0.01)
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder)
+        responder.ack_status_overrides[int(proto.MsgType.CMD_FF_ANCHOR)] = \
+            proto.TlmAck.STATUS_BUSY
+        result = session.calibration.yaw_zero()
+        assert result["ok"], result
+        assert any("アンカー" in w for w in result["warnings"])
+        assert "アンカー" in result["message"]
+        # busy リトライは上限回数まで
+        assert len(transport.frames_of_type(proto.MsgType.CMD_FF_ANCHOR)) == 3
+        assert responder.cal_data.ff_mode == 2   # FF は復元済み
+
+    def test_rejects_recording_sweep_and_motor(self, cal_session):
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder)
+        # 計測(ExpRecorder)実行中 → 拒否
+        session.experiment.recorder.logs_dir = tmp_path / "explogs"
+        assert session.experiment.recorder.start()["ok"]
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "計測" in result["message"]
+        session.experiment.recorder.stop()
+        # スイープ実行中 → 拒否
+        with session.experiment.sweep.lock:
+            session.experiment.sweep.running = True
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "スイープ" in result["message"]
+        with session.experiment.sweep.lock:
+            session.experiment.sweep.running = False
+        # モーター回転中 → 拒否(クリアも同じガード)
+        with session.experiment.lock:
+            session.experiment.motor_running = True
+        result = session.calibration.yaw_zero()
+        assert not result["ok"]
+        assert "モーター" in result["message"]
+        result = session.calibration.yaw_zero_clear()
+        assert not result["ok"]
+        assert "モーター" in result["message"]
+        with session.experiment.lock:
+            session.experiment.motor_running = False
+        # 拒否時はキャリブ系コマンドを一切送らない
+        assert not transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)
+        assert not transport.frames_of_type(proto.MsgType.CMD_FF_MODE)
+
+    def test_ff_off_path_skips_mode_commands(self, cal_session):
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder, yaw_est=0.3,
+                   ff_mode=0, est_mode=0, offset=0.0)
+        result = session.calibration.yaw_zero()
+        assert result["ok"], result
+        frames = [f for f in transport.sent_frames if f.type in self.SEQ_TYPES]
+        assert [f.type for f in frames] == [
+            proto.MsgType.CMD_CAL_GET,
+            proto.MsgType.CMD_YAWZERO_SET,
+            proto.MsgType.CMD_FF_ANCHOR]
+        sent = proto.CmdYawzeroSet.from_payload(frames[1].payload)
+        assert sent.offset_rad == pytest.approx(0.3)
+
+    def test_offset_new_wraps_into_pi_range(self, cal_session):
+        """offset_cur + yaw_est が +π を超えるケースで wrap_pi が効くこと。"""
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder, yaw_est=1.0, offset=3.0)
+        result = session.calibration.yaw_zero()
+        assert result["ok"], result
+        frames = transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)
+        assert len(frames) == 1
+        sent = proto.CmdYawzeroSet.from_payload(frames[0].payload)
+        assert sent.offset_rad == pytest.approx(3.0 + 1.0 - 2.0 * math.pi)
+        assert -math.pi <= sent.offset_rad <= math.pi
 
 
 class TestGeomag:

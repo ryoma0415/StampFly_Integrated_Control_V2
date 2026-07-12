@@ -18,3 +18,8 @@ void indicators_update(void);
 
 // 状態遷移の通知(遷移に応じたビープを開始する。ブロックしない)
 void indicators_notify_transition(uint8_t state, uint8_t prev_state, uint8_t reason);
+
+// CMD_LED_MODE の適用(400Hzループ専用)。mode: 0=AUTO(通常の状態表示)、
+// 1=RECORDING(計測中: MOTOR_TEST 中のみマゼンタ常灯)。mode=1 はキープアライブを
+// 兼ねる(最終受信から led_recording_failsafe_ms で自動的に AUTO へ復帰)。
+void indicators_set_led_mode(uint8_t mode);

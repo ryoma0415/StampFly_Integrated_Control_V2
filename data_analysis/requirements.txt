@@ -1,2 +1,5 @@
 numpy
 matplotlib
+# opencv-python は plot_explog.py のアニメ動画同期(--video / メニュー[2])時のみ必要。
+# 静止画グラフ・動画なしアニメは numpy+matplotlib(+ffmpeg)だけで動く。
+opencv-python

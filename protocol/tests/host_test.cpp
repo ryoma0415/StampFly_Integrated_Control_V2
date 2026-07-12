@@ -433,6 +433,11 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.est_mode = ju8(f, "est_mode");
     ok = serialize(m, buf, sizeof(buf));
     n = CmdFfMode::PAYLOAD_SIZE;
+  } else if (kind == "CMD_LED_MODE") {
+    CmdLedMode m;
+    m.mode = ju8(f, "mode");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdLedMode::PAYLOAD_SIZE;
   } else if (kind == "TLM_ACK") {
     TlmAck m;
     m.acked_type = ju8(f, "acked_type");
@@ -676,6 +681,10 @@ std::vector<uint8_t> reserialize_payload(const std::string& kind,
     CmdFfMode m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
     n = CmdFfMode::PAYLOAD_SIZE;
+  } else if (kind == "CMD_LED_MODE") {
+    CmdLedMode m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdLedMode::PAYLOAD_SIZE;
   } else if (kind == "TLM_ACK") {
     TlmAck m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));

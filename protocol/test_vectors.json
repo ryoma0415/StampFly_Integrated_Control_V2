@@ -583,6 +583,18 @@
       "wire_hex": "0402232301010103a38c00"
     },
     {
+      "name": "cmd_led_mode_recording",
+      "payload_kind": "CMD_LED_MODE",
+      "type": 37,
+      "seq": 36,
+      "fields": {
+        "mode": 1
+      },
+      "payload_hex": "01",
+      "logical_hex": "022524000000010170b9",
+      "wire_hex": "04022524010105010170b900"
+    },
+    {
       "name": "tlm_ack_ff_commit_ok",
       "payload_kind": "TLM_ACK",
       "type": 50,

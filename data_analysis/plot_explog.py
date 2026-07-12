@@ -14,16 +14,25 @@ pc_server/data/exp_logs/explog_<YYYYMMDD_HHMMSS>.csv（≈25Hz）を読み、
     05_ekf_diagnostics.png  NIS（閾値 2.0 / 5.99 / 13.8）+ ffg 8ゲートのタイムライン
     06_ff_status.png        ff_status（ff_mode + フラグビット）のタイムライン
 
+アニメーション（7枠レイアウト・スマホ動画同期）:
+    メニュー [2]/[3] または --animation で、全期間固定軸+移動カーソル方式の
+    MP4（1920x1080, libx264/yuv420p）を生成する。スマホ動画（正方形前提。
+    非正方形は中央クロップ）は「LED がマゼンタに変わった瞬間 = 計測開始(t_s=0)」
+    でカット済みの前提で先頭から同期する。動画は
+    ../pc_server/data/exp_logs/videos/ に置くと対話メニューから番号選択できる。
+
 使い方:
-    python plot_explog.py                    # ../pc_server/data/exp_logs/ から対話選択
-    python plot_explog.py explog_xxx.csv [-o 出力ディレクトリ]
+    python plot_explog.py                    # 対話: [1]静止画 [2]アニメ(動画同期) [3]アニメ(動画なし)
+    python plot_explog.py explog_xxx.csv [-o 出力ディレクトリ]      # 静止画（従来）
+    python plot_explog.py explog_xxx.csv --animation                # アニメ（動画なし, 20fps）
+    python plot_explog.py explog_xxx.csv --video 動画.mp4 [--fps N] [--start S] [--end E]
     引数を省略すると explog CSV を新しい順に一覧表示し、番号で1つ選ぶ
     （Enter=最新 / q=中止）。出力先は既定で data_analysis/graphs/explog_<stamp>/。
 
 同じ stamp の explog_<stamp>_meta.json があれば、ff_state
 （プロファイル名 / ff_mode / est_mode）を図タイトルとサマリに表示する。
 
-依存: numpy, matplotlib のみ。
+依存: numpy, matplotlib（アニメ MP4 出力に ffmpeg、動画同期時のみ opencv-python）。
 """
 from __future__ import annotations
 
@@ -31,6 +40,8 @@ import argparse
 import csv
 import json
 import math
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -761,6 +772,370 @@ def write_summary(data: dict, t: np.ndarray, on: np.ndarray, path: Path,
     print("\n" + text)
 
 
+# ----------------------------------------------------------- animation --------
+# 7枠レイアウト（3行×4列）: 左2×2=①スマホ動画、右上②ヨー ③duty+電流、
+# 右中④磁場x ⑤磁場y、下段⑥b_m ⑦IMU温度（幅広）。
+# 全期間固定軸+移動カーソル方式: 背景（時系列全体）を一度だけ描画し、
+# フレーム毎はカーソル縦線・現在値テキスト・動画フレームのみ blit 更新する。
+ANIM_FPS_NO_VIDEO = 20.0        # 動画なし時のフレームレート
+ANIM_FIGSIZE = (19.2, 10.8)     # 1920x1080 @ dpi100
+ANIM_DPI = 100
+VIDEO_PANEL_MAX_PX = 720        # 動画フレームの縮小上限（正方形一辺）
+VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv")
+CURSOR_COLOR = "#f8fafc"
+
+
+def videos_dir() -> Path:
+    """同期用スマホ動画の置き場: pc_server/data/exp_logs/videos/。"""
+    return explog_dir() / "videos"
+
+
+def _import_cv2():
+    """cv2 の遅延 import（動画同期時のみ必要）。無ければ日本語で案内して終了。"""
+    try:
+        import cv2
+        return cv2
+    except ImportError:
+        sys.exit(
+            "スマホ動画の同期合成には opencv-python が必要です。\n"
+            "  data_analysis/.venv/bin/pip install opencv-python\n"
+            "を実行してください（requirements.txt のコメント参照）。")
+
+
+def _require_ffmpeg() -> None:
+    if shutil.which("ffmpeg") is None:
+        sys.exit("ffmpeg が見つかりません。MP4 出力には ffmpeg が必要です"
+                 "（macOS: brew install ffmpeg）。")
+
+
+class _VideoReader:
+    """スマホ動画を順次デコードし、中央クロップ正方形 RGB フレームを返す。
+
+    動画は「LED マゼンタ点灯 = 計測開始(t_s=0)」でカット済みの前提なので、
+    動画フレーム index = round(t × video_fps) の単純対応で同期する。
+    順次 grab() で進め、必要フレームのみ retrieve()（全読み込みしない省メモリ構成）。
+    """
+
+    def __init__(self, path: Path) -> None:
+        cv2 = _import_cv2()
+        self._cv2 = cv2
+        self._cap = cv2.VideoCapture(str(path))
+        if not self._cap.isOpened():
+            sys.exit(f"動画ファイルを開けません: {path}")
+        self.fps = float(self._cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        self.n_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.duration_s = self.n_frames / self.fps if self.fps > 0 else 0.0
+        self._pos = 0            # 次に grab されるフレーム index
+        self._last: np.ndarray | None = None
+
+    def _process(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """中央クロップで正方形化 → 縮小 → RGB 化。"""
+        cv2 = self._cv2
+        h, w = frame_bgr.shape[:2]
+        if w != h:  # 正方形前提。非正方形は中央クロップ
+            s = min(h, w)
+            y0, x0 = (h - s) // 2, (w - s) // 2
+            frame_bgr = frame_bgr[y0:y0 + s, x0:x0 + s]
+        if frame_bgr.shape[0] > VIDEO_PANEL_MAX_PX:
+            frame_bgr = cv2.resize(frame_bgr,
+                                   (VIDEO_PANEL_MAX_PX, VIDEO_PANEL_MAX_PX))
+        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+    def frame_at(self, idx: int) -> np.ndarray | None:
+        """フレーム idx を返す（末尾超過は最終フレームを保持。巻き戻しはシーク）。"""
+        idx = max(0, min(idx, self.n_frames - 1))
+        if idx < self._pos - 1:  # 逆行（--start 変更等）はシーク
+            self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, idx)
+            self._pos = idx
+        while self._pos <= idx:
+            if not self._cap.grab():
+                return self._last  # デコード終端: 最後のフレームを使い続ける
+            self._pos += 1
+            if self._pos == idx + 1:
+                ok, frame = self._cap.retrieve()
+                if ok:
+                    self._last = self._process(frame)
+        return self._last
+
+    def release(self) -> None:
+        self._cap.release()
+
+
+def _interp_series(t: np.ndarray, v: np.ndarray,
+                   frame_times: np.ndarray) -> np.ndarray:
+    """有限値のみで線形補間（NaN を拡散させない。範囲外は NaN）。"""
+    fin = np.isfinite(t) & np.isfinite(v)
+    if fin.sum() < 2:
+        return np.full(len(frame_times), np.nan)
+    return np.interp(frame_times, t[fin], v[fin], left=np.nan, right=np.nan)
+
+
+def _fmt_val(v: float, fmt: str = "{:+.1f}") -> str:
+    return fmt.format(v) if np.isfinite(v) else "--"
+
+
+def _window_ylim(ax, t: np.ndarray, arrays: list[np.ndarray],
+                 t0: float, t1: float, pad_ratio: float = 0.12) -> None:
+    """アニメ範囲 [t0, t1] 内の有限値から固定 y 軸を決める。"""
+    win = (t >= t0) & (t <= t1)
+    vals: list[np.ndarray] = []
+    for a in arrays:
+        m = win & np.isfinite(a)
+        if m.any():
+            vals.append(a[m])
+    if not vals:
+        return
+    allv = np.concatenate(vals)
+    lo, hi = float(allv.min()), float(allv.max())
+    pad = max((hi - lo) * pad_ratio, 1e-3)
+    ax.set_ylim(lo - pad, hi + pad)
+
+
+def _anim_panel(ax, title: str, ylabel: str, t0: float, t1: float) -> dict:
+    """1枠の共通装飾 + 移動カーソル + 現在値テキスト（animated=True）を作る。"""
+    ax.set_xlim(t0, t1)
+    ax.set_title(title, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_xlabel("時間 [s]", fontsize=8)
+    ax.tick_params(labelsize=8)
+    ax.grid(alpha=0.3)
+    cursor = ax.axvline(t0, color=CURSOR_COLOR, lw=1.1, alpha=0.9,
+                        zorder=10, animated=True)
+    text = ax.text(0.02, 0.965, "", transform=ax.transAxes, va="top", ha="left",
+                   fontsize=8, zorder=11, animated=True,
+                   bbox=dict(facecolor="#1c2230", edgecolor="#3a4152",
+                             alpha=0.85, boxstyle="round,pad=0.25"))
+    return {"ax": ax, "cursor": cursor, "text": text, "fmt": lambda i: ""}
+
+
+def _legend_small(ax) -> None:
+    ax.legend(loc="upper right", fontsize=7, framealpha=0.7)
+
+
+def render_animation(path: Path, out: Path, data: dict, t: np.ndarray,
+                     tsuffix: str, video_path: Path | None,
+                     fps_arg: float | None, start_s: float | None,
+                     end_s: float | None) -> None:
+    """全期間固定軸+移動カーソル方式の 7枠アニメ MP4 を生成する。
+
+    同期規約: 「LED がマゼンタに変わった瞬間 = 計測開始(t_s=0) = 動画のカット位置」。
+    動画あり時は出力 fps=動画 fps（既定30）、長さ=min(動画, ログ, --end)。
+    データ(≈23.5Hz)は各フレーム時刻へ線形補間して現在値表示に使う。
+    """
+    _require_ffmpeg()
+
+    t_end_log = float(np.nanmax(t))
+    t0 = max(0.0, float(start_s)) if start_s is not None else 0.0
+    t1 = min(t_end_log, float(end_s)) if end_s is not None else t_end_log
+
+    reader: _VideoReader | None = None
+    if video_path is not None:
+        reader = _VideoReader(video_path)
+        print(f"動画: {video_path.name}  {reader.fps:.2f}fps / "
+              f"{reader.n_frames}フレーム / {reader.duration_s:.1f}s")
+        t1 = min(t1, reader.duration_s)  # 長さ = min(動画, ログ, --end)
+        fps = float(fps_arg) if fps_arg else reader.fps
+    else:
+        fps = float(fps_arg) if fps_arg else ANIM_FPS_NO_VIDEO
+
+    if t1 - t0 < 0.5:
+        sys.exit(f"アニメ範囲が不正です: start={t0:.2f}s, end={t1:.2f}s")
+    n_frames = int((t1 - t0) * fps)
+    frame_times = t0 + np.arange(n_frames) / fps
+
+    # --- フレーム時刻への線形補間（現在値テキスト用） ---
+    iv: dict[str, np.ndarray] = {}
+    for name in ("duty_cmd", "current_a", "bx_cal", "by_cal",
+                 "db_hat_x_ut", "db_hat_y_ut", "bm_x_ut", "bm_y_ut",
+                 "imu_temp_c"):
+        iv[name] = _interp_series(t, col(data, name), frame_times)
+    for name in ("yaw_madgwick_deg", "yaw_est_deg"):  # 角度は unwrap 補間→ラップ
+        iv[name] = wrap180(_interp_series(t, unwrap_deg(col(data, name)),
+                                          frame_times))
+
+    # --- Figure / 7枠レイアウト ---
+    fig = plt.figure(figsize=ANIM_FIGSIZE, dpi=ANIM_DPI)
+    gs = fig.add_gridspec(3, 4, left=0.045, right=0.985, top=0.90, bottom=0.06,
+                          wspace=0.30, hspace=0.55,
+                          height_ratios=[1.0, 1.0, 0.9])
+    fig.suptitle(f"Experiment 計測アニメーション: {path.name}"
+                 + (tsuffix.replace("\n", "   ") if tsuffix else ""),
+                 fontsize=13)
+    time_text = fig.text(0.985, 0.975, "", ha="right", va="top", fontsize=12,
+                         color=CURSOR_COLOR, animated=True)
+
+    # ① スマホ動画（左2×2）
+    ax_video = fig.add_subplot(gs[0:2, 0:2])
+    ax_video.set_title("① スマホ動画（LEDマゼンタ点灯=計測開始 t=0 でカット済み前提）",
+                       fontsize=10)
+    ax_video.axis("off")
+    im_video = None
+    if reader is not None:
+        first = reader.frame_at(int(round(t0 * reader.fps)))
+        if first is None:
+            sys.exit("動画の最初のフレームを読み込めませんでした。")
+        im_video = ax_video.imshow(first, animated=True)
+    else:
+        ax_video.text(0.5, 0.5, "動画なし\n（--video または メニュー[2] で同期合成）",
+                      transform=ax_video.transAxes, ha="center", va="center",
+                      fontsize=13, color="#6b7280")
+
+    panels: list[dict] = []
+
+    # ② Yaw（±180ラップ + ラップ跨ぎ NaN 切断）
+    p = _anim_panel(fig.add_subplot(gs[0, 2]), "② ヨー（±180°ラップ）",
+                    "Yaw [deg]", t0, t1)
+    for key, lab, color in (("yaw_madgwick_deg", "Madgwick", "#f472b6"),
+                            ("yaw_est_deg", "EKF推定", "#38bdf8")):
+        if usable(data, key):
+            tw, yw = wrapped_plot_series(t, col(data, key))
+            p["ax"].plot(tw, yw, "-", lw=1.1, color=color, label=lab)
+    p["ax"].set_ylim(-190, 190)
+    p["ax"].set_yticks(np.arange(-180, 181, 90))
+    _legend_small(p["ax"])
+    p["fmt"] = lambda i: (f"Mdg {_fmt_val(iv['yaw_madgwick_deg'][i])}° / "
+                          f"EKF {_fmt_val(iv['yaw_est_deg'][i])}°")
+    panels.append(p)
+
+    # ③ duty + 電流（twinx。カーソル/テキストは上に重なる twin 側）
+    ax3 = fig.add_subplot(gs[0, 3])
+    ax3.set_title("③ duty + 電流", fontsize=10)
+    ax3.set_xlabel("時間 [s]", fontsize=8)
+    ax3.set_ylabel("duty", fontsize=9, color="#aab2c0")
+    ax3.tick_params(labelsize=8)
+    ax3.tick_params(axis="y", labelcolor="#aab2c0")
+    ax3.grid(alpha=0.3)
+    ax3.set_xlim(t0, t1)
+    ax3.plot(t, col(data, "duty_cmd"), "-", lw=1.1, color="#aab2c0",
+             label="duty_cmd")
+    _window_ylim(ax3, t, [col(data, "duty_cmd")], t0, t1)
+    ax3t = ax3.twinx()
+    ax3t.plot(t, col(data, "current_a"), "-", lw=1.1, color="#4ade80",
+              label="電流 [A]")
+    ax3t.set_ylabel("電流 [A]", fontsize=9, color="#4ade80")
+    ax3t.tick_params(labelsize=8, axis="y", labelcolor="#4ade80")
+    _window_ylim(ax3t, t, [col(data, "current_a")], t0, t1)
+    h1, l1 = ax3.get_legend_handles_labels()
+    h2, l2 = ax3t.get_legend_handles_labels()
+    ax3t.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=7, framealpha=0.7)
+    cursor3 = ax3t.axvline(t0, color=CURSOR_COLOR, lw=1.1, alpha=0.9,
+                           zorder=10, animated=True)
+    text3 = ax3t.text(0.02, 0.965, "", transform=ax3t.transAxes, va="top",
+                      ha="left", fontsize=8, zorder=11, animated=True,
+                      bbox=dict(facecolor="#1c2230", edgecolor="#3a4152",
+                                alpha=0.85, boxstyle="round,pad=0.25"))
+    panels.append({"ax": ax3t, "cursor": cursor3, "text": text3,
+                   "fmt": lambda i: (f"duty {_fmt_val(iv['duty_cmd'][i], '{:.3f}')} / "
+                                     f"{_fmt_val(iv['current_a'][i], '{:.2f}')} A")})
+
+    # ④⑤ 磁場 x/y: b*_cal と FF補正後（b*_cal − db_hat_*）
+    for slot, axis_name, bkey, dkey, color in (
+            (gs[1, 2], "x", "bx_cal", "db_hat_x_ut", "#60a5fa"),
+            (gs[1, 3], "y", "by_cal", "db_hat_y_ut", "#4ade80")):
+        num = "④" if axis_name == "x" else "⑤"
+        p = _anim_panel(fig.add_subplot(slot),
+                        f"{num} 磁場{axis_name}（校正済み と FF補正後）",
+                        f"B_{axis_name} [µT]", t0, t1)
+        bcal = col(data, bkey)
+        p["ax"].plot(t, bcal, "-", lw=1.1, color=color, label=bkey)
+        has_ff = usable(data, dkey)
+        if has_ff:
+            bcorr = bcal - np.nan_to_num(col(data, dkey))
+            p["ax"].plot(t, bcorr, "-", lw=1.1, color="#e6e9ef", alpha=0.85,
+                         label=f"{bkey} − db_hat_{axis_name}")
+            _window_ylim(p["ax"], t, [bcal, bcorr], t0, t1)
+        else:
+            _window_ylim(p["ax"], t, [bcal], t0, t1)
+        _legend_small(p["ax"])
+
+        def _fmt_mag(i, _b=bkey, _d=dkey, _has=has_ff):
+            raw = iv[_b][i]
+            if not _has:
+                return f"cal {_fmt_val(raw)} µT"
+            corr = raw - (iv[_d][i] if np.isfinite(iv[_d][i]) else 0.0)
+            return f"cal {_fmt_val(raw)} / 補正後 {_fmt_val(corr)} µT"
+        p["fmt"] = _fmt_mag
+        panels.append(p)
+
+    # ⑥ b_m（EKF 磁気基準ベクトル水平2成分, 下段幅広）
+    p = _anim_panel(fig.add_subplot(gs[2, 0:2]), "⑥ b_m（EKF磁気基準・水平2成分）",
+                    "b_m [µT]", t0, t1)
+    for key, lab, color in (("bm_x_ut", "bm_x", "#a78bfa"),
+                            ("bm_y_ut", "bm_y", "#fbbf24")):
+        if usable(data, key):
+            p["ax"].plot(t, col(data, key), "-", lw=1.1, color=color, label=lab)
+    _window_ylim(p["ax"], t, [col(data, "bm_x_ut"), col(data, "bm_y_ut")], t0, t1)
+    _legend_small(p["ax"])
+    p["fmt"] = lambda i: (f"x {_fmt_val(iv['bm_x_ut'][i])} / "
+                          f"y {_fmt_val(iv['bm_y_ut'][i])} µT")
+    panels.append(p)
+
+    # ⑦ IMU温度（下段幅広）
+    p = _anim_panel(fig.add_subplot(gs[2, 2:4]), "⑦ IMU温度", "温度 [°C]", t0, t1)
+    if usable(data, "imu_temp_c"):
+        p["ax"].plot(t, col(data, "imu_temp_c"), "-", lw=1.1, color="#f87171",
+                     label="imu_temp_c")
+        _window_ylim(p["ax"], t, [col(data, "imu_temp_c")], t0, t1)
+        _legend_small(p["ax"])
+    p["fmt"] = lambda i: f"{_fmt_val(iv['imu_temp_c'][i], '{:.1f}')} °C"
+    panels.append(p)
+
+    # --- 背景を一度だけ描画 → フレーム毎は動的 Artist のみ blit ---
+    canvas = fig.canvas
+    canvas.draw()  # animated=True の Artist は背景に含まれない
+    background = canvas.copy_from_bbox(fig.bbox)
+    w_px, h_px = canvas.get_width_height()
+
+    stem = path.stem[len("explog_"):] if path.stem.startswith("explog_") else path.stem
+    out_name = (f"explog_{stem}_animation"
+                + ("_with_video" if reader is not None else "") + ".mp4")
+    out_path = out / out_name
+    print(f"\nアニメーション生成: {n_frames}フレーム @ {fps:.2f}fps "
+          f"({t0:.1f}–{t1:.1f}s, {w_px}x{h_px}) → {out_path}")
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w_px}x{h_px}",
+           "-r", f"{fps:.6f}", "-i", "-",
+           "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
+           str(out_path)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    last_pct = -10
+    try:
+        for i, tf in enumerate(frame_times):
+            canvas.restore_region(background)
+            if im_video is not None and reader is not None:
+                frame = reader.frame_at(int(round(tf * reader.fps)))
+                if frame is not None:
+                    im_video.set_data(frame)
+                ax_video.draw_artist(im_video)
+            for pnl in panels:
+                pnl["cursor"].set_xdata([tf, tf])
+                pnl["text"].set_text(pnl["fmt"](i))
+                pnl["ax"].draw_artist(pnl["cursor"])
+                pnl["ax"].draw_artist(pnl["text"])
+            time_text.set_text(f"t = {tf:6.2f} s")
+            fig.draw_artist(time_text)
+            canvas.blit(fig.bbox)
+            proc.stdin.write(bytes(canvas.buffer_rgba()))
+            pct = int(100 * (i + 1) / n_frames)
+            if pct >= last_pct + 10:
+                last_pct = pct
+                print(f"  進捗: {pct}% ({i + 1}/{n_frames})")
+        proc.stdin.close()
+        ret = proc.wait()
+        if ret != 0:
+            sys.exit(f"ffmpeg がエラー終了しました (exit={ret})。")
+    except BrokenPipeError:
+        proc.wait()
+        sys.exit("ffmpeg への書き込みに失敗しました（パイプ切断）。")
+    finally:
+        if reader is not None:
+            reader.release()
+        plt.close(fig)
+    print(f"アニメーション生成完了: {out_path}")
+
+
 # ---------------------------------------------------------------- main --------
 def explog_dir() -> Path:
     """pc_server が Experiment ログを書き出す exp_logs フォルダ。"""
@@ -807,6 +1182,78 @@ def choose_explog(cands: list[Path]) -> Path | None:
         print(f"  '{raw}' は無効です。1〜{len(cands)} の番号を入力してください。")
 
 
+def choose_mode() -> str | None:
+    """出力モードを対話選択する。戻り値: 'static' / 'anim_video' / 'anim_only' / None(中止)。
+
+    Enter は [1]（従来の静止画）。EOF（パイプ等）も [1] を自動選択し、
+    従来の「引数なし実行=静止画」挙動を保つ。
+    """
+    print("\n出力の種類を選んでください:\n")
+    print("  [1] 静止画グラフ一式（従来: PNG 6枚 + summary.txt）")
+    print("  [2] アニメーション（スマホ動画同期, MP4）")
+    print("  [3] アニメーション（動画なし, MP4）")
+    print()
+    modes = {"1": "static", "2": "anim_video", "3": "anim_only"}
+    while True:
+        try:
+            raw = input("番号を入力 [1-3]（Enter=1 / q=中止）: ").strip()
+        except EOFError:
+            print("（対話入力なし → [1] 静止画を自動選択）")
+            return "static"
+        if raw == "":
+            return "static"
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw in modes:
+            return modes[raw]
+        print(f"  '{raw}' は無効です。1〜3 の番号を入力してください。")
+
+
+def list_videos() -> list[Path]:
+    """videos/ 内の動画を新しい順（mtime 降順）に返す。"""
+    d = videos_dir()
+    if not d.is_dir():
+        return []
+    vids = [p for p in d.iterdir()
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+    return sorted(vids, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def choose_video() -> Path | None:
+    """同期用スマホ動画を番号選択（パス直接入力も可）。None は中止。"""
+    cands = list_videos()
+    if cands:
+        print(f"\n{videos_dir()} の動画から、同期するものを選んでください"
+              "（動画ファイルのパス直接入力も可）:\n")
+        for i, p in enumerate(cands, 1):
+            st = p.stat()
+            mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+            mark = "  ← 最新" if i == 1 else ""
+            print(f"  [{i}] {p.name}   {mtime}   {_fmt_size(st.st_size)}{mark}")
+        print()
+        prompt = f"番号またはパスを入力 [1-{len(cands)}]（Enter=最新 / q=中止）: "
+    else:
+        print(f"\n{videos_dir()} に動画がありません。"
+              "動画ファイルのパスを直接入力してください。")
+        prompt = "動画パスを入力（q=中止）: "
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            print("（対話入力なし → 中止）")
+            return None
+        if raw == "" and cands:
+            return cands[0]
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw.isdigit() and cands and 1 <= int(raw) <= len(cands):
+            return cands[int(raw) - 1]
+        p = Path(raw).expanduser()
+        if p.is_file():
+            return p
+        print(f"  '{raw}' は番号でも既存ファイルでもありません。")
+
+
 def default_out_dir(path: Path) -> Path:
     """既定の出力先: data_analysis/graphs/explog_<stamp>/。"""
     stem = path.stem
@@ -817,12 +1264,39 @@ def default_out_dir(path: Path) -> Path:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="StampFly Experiment 計測ログ（explog CSV）のグラフ化（PNG 6枚 + summary.txt）")
+        description="StampFly Experiment 計測ログ（explog CSV）のグラフ化"
+                    "（PNG 6枚 + summary.txt / アニメ MP4）")
     ap.add_argument("explog", nargs="?",
                     help="explog CSV パス（省略時は exp_logs の一覧から対話選択）")
     ap.add_argument("-o", "--out",
                     help="出力ディレクトリ（省略時は data_analysis/graphs/explog_<stamp>/）")
+    ap.add_argument("--animation", action="store_true",
+                    help="アニメ MP4 を生成（--video なしは動画なしアニメ 20fps）")
+    ap.add_argument("--video", metavar="PATH",
+                    help="同期するスマホ動画（指定すると --animation を含意。"
+                         "LEDマゼンタ点灯=計測開始でカット済み前提）")
+    ap.add_argument("--fps", type=float,
+                    help="アニメ出力 fps（既定: 動画あり=動画fps / なし=20）")
+    ap.add_argument("--start", type=float, metavar="S",
+                    help="アニメ開始時刻 [s]（ログ時間軸基準, 既定0）")
+    ap.add_argument("--end", type=float, metavar="S",
+                    help="アニメ終了時刻 [s]（既定: ログ末尾。動画があれば min も取る）")
     args = ap.parse_args()
+
+    # --- モード決定（CLI フラグ優先。引数なしは対話メニュー） ---
+    video_path = Path(args.video).expanduser() if args.video else None
+    if args.animation or video_path is not None:
+        mode = "anim_video" if video_path is not None else "anim_only"
+    elif args.explog:
+        mode = "static"  # 従来の CLI 挙動を維持
+    else:
+        mode = choose_mode()
+        if mode is None:
+            sys.exit("中止しました。")
+    if mode == "static" and (args.fps or args.start is not None
+                             or args.end is not None):
+        print("警告: --fps/--start/--end はアニメ専用のため無視します"
+              "（--animation を付けてください）。")
 
     if args.explog:
         path = Path(args.explog)
@@ -835,6 +1309,13 @@ def main() -> None:
             sys.exit("中止しました（CSV が選択されていません）。")
     if not path.is_file():
         sys.exit(f"explog CSV が見つかりません: {path}")
+
+    if mode == "anim_video" and video_path is None:
+        video_path = choose_video()
+        if video_path is None:
+            sys.exit("中止しました（動画が選択されていません）。")
+    if video_path is not None and not video_path.is_file():
+        sys.exit(f"動画ファイルが見つかりません: {video_path}")
 
     out = Path(args.out) if args.out else default_out_dir(path)
     out.mkdir(parents=True, exist_ok=True)
@@ -852,6 +1333,11 @@ def main() -> None:
         print("meta JSON なし → ff_state 表示は省略します。")
     elif ffl:
         print(f"FF状態: {ffl}")
+
+    if mode in ("anim_video", "anim_only"):
+        render_animation(path, out, data, t, tsuffix, video_path,
+                         args.fps, args.start, args.end)
+        return
 
     n_figs = 0
     n_figs += fig01_yaw_comparison(data, t, on, out, tsuffix)

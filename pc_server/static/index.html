@@ -262,7 +262,8 @@
       <div class="exp-section">
         <h3>計測(EKF/FF性能ログ) <span class="unit-h">TLM_EXP 25Hz → CSV</span></h3>
         <p class="note">モーターテスト有効中に開始できます(スイープ/シーケンスとは排他)。
-          計測中は全モーター(FL+FR+RL+RR)のみ回転できます。</p>
+          計測中は全モーター(FL+FR+RL+RR)のみ回転できます。
+          LED: 計測中=マゼンタ常灯(動画のカット目印。マゼンタに変わった瞬間が t=0)。</p>
         <div class="preset-row">
           <button id="btnExpRecStart" class="btn btn-small btn-primary" disabled>&#x25cf; 計測開始</button>
           <button id="btnExpRecStop" class="btn btn-small btn-danger" disabled>&#x25a0; 計測停止</button>
@@ -364,8 +365,8 @@
           <div class="preset-row wrap">
             <button class="btn btn-small" data-quickcal-action="attitude_zero">Attitude 0</button>
             <button class="btn btn-small" data-quickcal-action="attitude_clear">Attitude Clear</button>
-            <button class="btn btn-small" data-quickcal-action="yaw_zero">Yaw 0</button>
-            <button class="btn btn-small" data-quickcal-action="yaw_clear">Yaw Clear</button>
+            <button class="btn btn-small" data-quickcal-action="yaw_zero" title="FF を一時停止してヨーゼロを設定し、FFモード復元+アンカー再取得まで自動実行します">Yaw 0</button>
+            <button class="btn btn-small" data-quickcal-action="yaw_clear" title="FF を一時停止してヨーゼロを解除し、FFモード復元+アンカー再取得まで自動実行します">Yaw Clear</button>
           </div>
           <div class="exp-msg" id="quickcalMsg">現在姿勢/ヨーをゼロ基準として機体に設定します</div>
         </div>

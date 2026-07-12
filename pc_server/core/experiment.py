@@ -98,6 +98,12 @@ EXPLOG_FIELDS = [
 
 MS_PER_S = 1000.0   # 単位変換(tlm_state_age_ms 列)
 
+# 計測中 LED(CMD_LED_MODE mode=1、マゼンタ常灯)のキープアライブ再送間隔 [s]。
+# 機体側は最後の mode=1 受信から 3 秒(config.hpp led_recording_failsafe_ms)
+# で AUTO へ自動復帰するため、その 1/3 の周期で再送してリンク断に備える。
+# 再送は session の supervisor(20Hz)に相乗りし、専用スレッドは作らない。
+LED_KEEPALIVE_INTERVAL_S = 1.0
+
 
 def clamp_motor_mask(value: Any, default: int = MOTOR_MASK_ALL) -> int:
     """リクエスト値を 4bit のモーターマスクに矯正する。"""
@@ -502,6 +508,25 @@ class ExperimentHub:
                     pass
 
     # ------------------------------------------------------------------
+    # 計測中 LED(CMD_LED_MODE)
+    # ------------------------------------------------------------------
+
+    def send_led_mode(self, mode: int) -> bool:
+        """CMD_LED_MODE を送る(fire-and-forget)。成功なら True。
+
+        計測中インジケータ(mode=1: MOTOR_TEST 中マゼンタ常灯=動画カット点、
+        mode=0: 通常表示へ復帰)。送信失敗や NACK でも計測は止めない —
+        機体側が 3 秒フェイルセーフで AUTO へ自動復帰するため、ACK 待ちは
+        せず、失敗の扱い(警告するか黙るか)は呼び出し側に委ねる。
+        """
+        payload = proto.CmdLedMode(mode=mode)
+        try:
+            self.link.send(proto.MsgType.CMD_LED_MODE, payload.to_payload())
+        except SerialLinkError:
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     # キャリブ/FF プロファイル操作の排他スロット
     # ------------------------------------------------------------------
 
@@ -569,6 +594,9 @@ class ExpRecorder:
         self._started_at = 0.0        # time.time()(t_s 列と meta の基準)
         self._sample_count = 0
         self._rows_since_flush = 0
+        # 計測中 LED キープアライブの最終送信時刻(supervisor のクロック基準。
+        # None = 未送信 → 次の supervise 周期で即送信)
+        self._led_keepalive_at: Optional[float] = None
 
     def is_recording(self) -> bool:
         with self._lock:
@@ -580,6 +608,25 @@ class ExpRecorder:
             return {"active": self._writer is not None,
                     "file": self._file_name,
                     "samples": self._sample_count}
+
+    def service_led_keepalive(self, now: float) -> None:
+        """計測中 LED(mode=1)のキープアライブ再送1周期。
+
+        session の supervisor(20Hz)から毎周期呼ばれ、計測中のみ
+        LED_KEEPALIVE_INTERVAL_S(1s)間隔に間引いて CMD_LED_MODE(1) を
+        再送する(機体側は 3s 途絶で AUTO 復帰するため)。now は supervisor
+        のクロック基準 — time.time() と混ぜず、この関数内の比較のみに使う。
+        送信失敗は黙って次周期に任せる(モーターキープアライブと同じ扱い。
+        1Hz で警告を出し続けない)。
+        """
+        with self._lock:
+            if self._writer is None:
+                return
+            last = self._led_keepalive_at
+            if last is not None and now - last < LED_KEEPALIVE_INTERVAL_S:
+                return
+            self._led_keepalive_at = now
+        self.hub.send_led_mode(proto.CmdLedMode.MODE_RECORDING)
 
     # ------------------------------------------------------------------
     # 開始 / 停止
@@ -622,6 +669,13 @@ class ExpRecorder:
                 self._file_name = name
                 self._sample_count = 0
                 self._rows_since_flush = 0
+                self._led_keepalive_at = None
+        # 計測中 LED(MOTOR_TEST 中マゼンタ常灯 = 動画のカット点)を点ける。
+        # 送信失敗でも計測は止めない(警告のみ): 以後は supervisor の
+        # 約1秒キープアライブ(service_led_keepalive)が再送し続ける。
+        if not self.hub.send_led_mode(proto.CmdLedMode.MODE_RECORDING):
+            self.hub.notify("計測中LED(CMD_LED_MODE)の送信に失敗しました"
+                            "(計測は継続します。キープアライブで再送します)")
         return {"ok": True, "message": "計測を開始しました", **self.status()}
 
     def stop(self, aborted: bool = False) -> dict:
@@ -642,6 +696,12 @@ class ExpRecorder:
             file.close()
         except OSError:
             pass
+        # LED を通常表示へ戻す。手動停止・自動停止(hub.deactivate 経由の
+        # モード離脱/切断)の全経路がここを通る。送信できなくても機体側の
+        # 3秒フェイルセーフで AUTO へ自動復帰するため警告のみ。
+        if not self.hub.send_led_mode(proto.CmdLedMode.MODE_AUTO):
+            self.hub.notify("LED復帰(CMD_LED_MODE)の送信に失敗しました"
+                            "(機体側フェイルセーフで約3秒後に復帰します)")
         result = {"ok": True, "message": "計測を終了しました",
                   "file": name, "samples": count, "aborted": bool(aborted),
                   "active": False}

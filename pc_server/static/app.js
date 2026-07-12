@@ -2216,14 +2216,23 @@ function wireEvents() {
   }
 
   // クイック較正(Attitude 0 / Yaw 0 / Clear)
-  for (const btn of document.querySelectorAll("[data-quickcal-action]")) {
-    btn.addEventListener("click", () => withBusy(btn, async () => {
-      const resp = await apiPost("/api/quickcal", { action: btn.dataset.quickcalAction });
-      if (resp && resp.message) {
-        els.quickcalMsg.textContent = resp.message;
-        appendConsole("ui", resp.message);
+  // ヨーゼロは FF 停止→設定→FF 復元→アンカー再取得の多段シーケンスで数秒かかるため、
+  // 実行中は 4 ボタンまとめて無効化する(同時操作・二度押し防止)
+  const quickcalBtns = document.querySelectorAll("[data-quickcal-action]");
+  for (const btn of quickcalBtns) {
+    btn.addEventListener("click", async () => {
+      for (const b of quickcalBtns) b.disabled = true;
+      try {
+        const resp = await apiPost("/api/quickcal", { action: btn.dataset.quickcalAction });
+        if (resp && resp.message) {
+          els.quickcalMsg.textContent = resp.message;
+          appendConsole("ui", resp.message);
+        }
+      } finally {
+        for (const b of quickcalBtns) b.disabled = false;
+        updateExperimentControls();
       }
-    }));
+    });
   }
 
   // 地磁気(都道府県)

@@ -61,6 +61,20 @@ ACCEL6_SCALE_ABS_MAX = 10.0
 
 CAL_DATA_POLL_S = 0.05          # TLM_CAL_DATA 待ちのポーリング周期
 
+# ワンクリック・ヨーゼロ自動シーケンス(FF一時off → 設定/クリア → FF復元
+# → アンカー再取得)のタイミング定数。テストから monkeypatch で短縮できる
+# よう、メソッド内では毎回モジュールグローバルを参照する。
+YAWZERO_MODE_TIMEOUT_S = 1.5    # FF off 反映(ff_status 下位2bit==0)待ち上限
+YAWZERO_ALIGN_TIMEOUT_S = 1.0   # CF 整列(|yaw_est| < 許容)待ち上限(超過は警告のみ)
+YAWZERO_ALIGN_TOL_RAD = math.radians(8.0)
+YAWZERO_POLL_S = 0.02           # TLM_STATE ポーリング周期
+YAWZERO_ANCHOR_RETRIES = 10     # CMD_FF_ANCHOR の busy リトライ回数(≈3s)
+YAWZERO_ANCHOR_RETRY_S = 0.3    # リトライ間隔
+
+
+class _YawZeroAbort(Exception):
+    """ヨーゼロシーケンスの途中失敗(理由メッセージを運ぶ内部例外)。"""
+
 
 def ack_ok(ack: Optional[proto.TlmAck]) -> bool:
     return ack is not None and ack.status == proto.TlmAck.STATUS_OK
@@ -777,7 +791,8 @@ class CalibrationManager:
                                       else f"CMD_ATTMOUNT_SET 失敗: {detail}")}
 
     def yaw_zero(self) -> dict:
-        """現在の推定ヨーが 0 になるヨーゼロオフセットを逆算して設定する。
+        """現在の推定ヨーが 0 になるヨーゼロオフセットを逆算して設定する
+        (ワンクリック自動シーケンス)。
 
         CMD_YAWZERO_SET はレベル化磁気ヘディング座標系の mag_yaw_offset を
         直接インストールする復元専用 API で、機体側の推定ヨーは
@@ -786,45 +801,206 @@ class CalibrationManager:
         ならない。そこで機体の現在オフセット(TLM_CAL_DATA の
         yawzero_offset_rad = 現在の mag_yaw_offset。valid ビットに関わらず
         現行値が返る)と現在の推定ヨー(TLM_STATE の yaw_est_rad)から
-        offset_new = wrap_pi(offset_cur + yaw_est) を逆算して送る
-        (ファーム実装の申し送り事項の解決)。
+        offset_new = wrap_pi(offset_cur + yaw_est) を逆算して送る。
 
         ff_mode≠0 のときは yaw_est_rad が補正系推定器(補正CF/EKF)の出力に
-        なり、リファレンスCFの磁気オフセット座標系と一致しないため拒否する。
+        なり、リファレンスCFの磁気オフセット座標系と一致しない。そのため
+        サーバ側で FF を一時 off(est_mode 維持)→ TLM_STATE で反映確認 →
+        リファレンスCF の yaw_est から逆算・設定 → FF 復元 → アンカー再取得
+        (EKF を新基準に整列)まで自動オーケストレーションする。
         """
-        if self._tlm_state_provider is None:
-            return {"ok": False,
-                    "message": "TLM_STATE が参照できないためヨーゼロを設定できません"}
-        tlm, age = self._tlm_state_provider()
-        if tlm is None or age is None or age > self._telemetry_fresh_s:
-            return {"ok": False,
-                    "message": "テレメトリ(TLM_STATE)が新鮮ではありません"}
-        if not (tlm.ff_status & proto.TlmState.FF_STATUS_MAG_FRESH):
-            return {"ok": False,
-                    "message": "磁気サンプルが新鮮でないためヨーゼロを設定できません"
-                               "(磁気センサの状態を確認してください)"}
-        cal = self.fetch_cal_data()
-        if cal is None:
-            return {"ok": False,
-                    "message": "機体からキャリブレーションデータを取得できません"
-                               "でした(リンク/機体状態を確認)"}
-        if cal.ff_mode != 0:
-            return {"ok": False,
-                    "message": "FF 補正が有効なためヨーゼロを設定できません。"
-                               "先に FF モードを off にしてください"}
-        offset_new = wrap_pi(cal.yawzero_offset_rad + tlm.yaw_est_rad)
-        payload = proto.CmdYawzeroSet(valid=1, offset_rad=offset_new)
-        ok, detail = self._send_ack(proto.MsgType.CMD_YAWZERO_SET,
-                                    payload.to_payload())
-        return {"ok": ok, "message": ("ヨーゼロを設定しました" if ok
-                                      else f"CMD_YAWZERO_SET 失敗: {detail}")}
+        return self._yaw_zero_sequence(clear=False)
 
     def yaw_zero_clear(self) -> dict:
-        payload = proto.CmdYawzeroSet(valid=0, offset_rad=0.0)
-        ok, detail = self._send_ack(proto.MsgType.CMD_YAWZERO_SET,
-                                    payload.to_payload())
-        return {"ok": ok, "message": ("ヨーゼロをクリアしました" if ok
-                                      else f"CMD_YAWZERO_SET 失敗: {detail}")}
+        """ヨーゼロをクリアする(yaw_zero と同じ自動シーケンスのクリア版)。"""
+        return self._yaw_zero_sequence(clear=True)
+
+    # ---- ヨーゼロ自動シーケンスの内部ヘルパ ----
+
+    def _fresh_tlm_state(self) -> Optional[proto.TlmState]:
+        """新鮮な TLM_STATE スナップショット(なければ None)。"""
+        if self._tlm_state_provider is None:
+            return None
+        tlm, age = self._tlm_state_provider()
+        if tlm is None or age is None or age > self._telemetry_fresh_s:
+            return None
+        return tlm
+
+    def _wait_tlm_state(self, predicate: Callable[[proto.TlmState], bool],
+                        timeout_s: float) -> Optional[proto.TlmState]:
+        """新鮮な TLM_STATE が条件を満たすまでポーリングする。"""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            tlm = self._fresh_tlm_state()
+            if tlm is not None and predicate(tlm):
+                return tlm
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(YAWZERO_POLL_S)
+
+    def _yaw_zero_guards(self, clear: bool) -> Optional[str]:
+        """ヨーゼロ操作の事前ガード。拒否理由(日本語)か None を返す。"""
+        if self._tlm_state_provider is None:
+            return "TLM_STATE が参照できないためヨーゼロを操作できません"
+        tlm = self._fresh_tlm_state()
+        if tlm is None:
+            return "テレメトリ(TLM_STATE)が新鮮ではありません"
+        if not clear and not (tlm.ff_status & proto.TlmState.FF_STATUS_MAG_FRESH):
+            return ("磁気サンプルが新鮮でないためヨーゼロを設定できません"
+                    "(磁気センサの状態を確認してください)")
+        # 推定器状態を変えるため、計測・スイープ・モーター回転中は拒否する
+        # (FF off 中の CF はモーター磁気外乱で狂い、アンカーも busy になる)
+        if self.hub.sweep.is_running() or self.hub.sequence.is_running():
+            return "スイープ/シーケンス実行中はヨーゼロを操作できません"
+        if self.hub.recorder.is_recording():
+            return ("実験計測(Experiment ログ)実行中はヨーゼロを操作できません"
+                    "(推定器状態が変わり計測データが汚れます)")
+        if self.hub.motor_status().get("running"):
+            return "モーター回転中はヨーゼロを操作できません(先に停止してください)"
+        sample, age = self.hub.latest_sample()
+        if (sample is not None and age is not None
+                and age <= self.hub.exp_fresh_s
+                and sample.get("motors_running")):
+            return "モーター回転中はヨーゼロを操作できません(先に停止してください)"
+        return None
+
+    def _send_ff_mode(self, ff_mode: int, est_mode: int) -> tuple[bool, str]:
+        return self._send_ack(
+            proto.MsgType.CMD_FF_MODE,
+            proto.CmdFfMode(ff_mode=ff_mode, est_mode=est_mode).to_payload())
+
+    def _anchor_after_yawzero(self, steps: list[str],
+                              warnings: list[str]) -> None:
+        """CMD_FF_ANCHOR を busy リトライ付きで送る(最終失敗は警告のみ)。"""
+        busy_name = ACK_STATUS_NAMES[proto.TlmAck.STATUS_BUSY]
+        for attempt in range(YAWZERO_ANCHOR_RETRIES):
+            if attempt:
+                time.sleep(YAWZERO_ANCHOR_RETRY_S)
+            ok, detail = self._send_ack(proto.MsgType.CMD_FF_ANCHOR, b"")
+            if ok:
+                steps.append("アンカー再取得")
+                return
+            if detail != busy_name:
+                warnings.append(f"アンカー再取得に失敗しました({detail})")
+                return
+        warnings.append("アンカー再取得は保留です"
+                        "(busy: 次のモーター始動時に自動再取得されます)")
+
+    def _yaw_zero_sequence(self, *, clear: bool) -> dict:
+        """ヨーゼロ設定/クリアの自動シーケンス本体。
+
+        FF 有効中でも UI ワンクリックで完結するよう、サーバ側で
+        1. CAL_GET(ff_mode/est_mode/offset_cur 取得)
+        2. ff_mode≠0 なら CMD_FF_MODE(0, est) で FF 一時 off
+        3. TLM_STATE.ff_status 下位2bit==0 で反映確認
+        4. CMD_YAWZERO_SET(設定はリファレンスCF の yaw_est から逆算)
+        5. CF の新基準整列を確認(設定時のみ。超過は警告)
+        6. ff_mode≠0 だったら CMD_FF_MODE で復元(失敗は警告+手動復元案内)
+        7. CMD_FF_ANCHOR を busy リトライ付きで送信(最終 busy は警告)
+        を実行する。途中失敗時は FF モードの復元を試みてから失敗を返す。
+        """
+        op = "ヨーゼロクリア" if clear else "ヨーゼロ設定"
+        reason = self._yaw_zero_guards(clear)
+        if reason:
+            return {"ok": False, "message": reason}
+        # スイープ/シーケンスとの相互排他+プロファイル操作との直列化
+        # (ffprofile と同じ排他スロット。TOCTOU なし)
+        busy = self.hub.calprofile_begin()
+        if busy:
+            return {"ok": False, "message": busy}
+        steps: list[str] = []
+        warnings: list[str] = []
+        try:
+            cal = self.fetch_cal_data()
+            if cal is None:
+                return {"ok": False,
+                        "message": "機体からキャリブレーションデータを取得"
+                                   "できませんでした(リンク/機体状態を確認)"}
+            ff_mode_orig = int(cal.ff_mode)
+            est_mode_orig = int(cal.est_mode)
+            ff_restore_pending = False   # FF off 送信後〜復元前の途中失敗検知
+            try:
+                if ff_mode_orig != 0:
+                    # FF 一時 off(est_mode は維持。機体側で KF 再シード)
+                    ff_restore_pending = True
+                    ok, detail = self._send_ff_mode(0, est_mode_orig)
+                    if not ok:
+                        raise _YawZeroAbort(f"CMD_FF_MODE(off) 失敗: {detail}")
+                    steps.append("FF一時off")
+                    # TLM_STATE で反映確認(以降の yaw_est = リファレンスCF)
+                    if self._wait_tlm_state(
+                            lambda t: (t.ff_status
+                                       & proto.TlmState.FF_STATUS_FF_MODE_MASK)
+                            == 0, YAWZERO_MODE_TIMEOUT_S) is None:
+                        raise _YawZeroAbort(
+                            "FF off の反映を TLM_STATE で確認できませんでした")
+                    steps.append("FF off反映確認")
+                if clear:
+                    payload = proto.CmdYawzeroSet(valid=0, offset_rad=0.0)
+                else:
+                    tlm = self._fresh_tlm_state()
+                    if tlm is None:
+                        raise _YawZeroAbort(
+                            "テレメトリ(TLM_STATE)が新鮮ではありません")
+                    offset_new = wrap_pi(cal.yawzero_offset_rad
+                                         + tlm.yaw_est_rad)
+                    payload = proto.CmdYawzeroSet(valid=1,
+                                                  offset_rad=offset_new)
+                ok, detail = self._send_ack(proto.MsgType.CMD_YAWZERO_SET,
+                                            payload.to_payload())
+                if not ok:
+                    raise _YawZeroAbort(f"CMD_YAWZERO_SET 失敗: {detail}")
+                steps.append("ヨーゼロクリア" if clear
+                             else f"ヨーゼロ設定(offset={payload.offset_rad:+.3f} rad)")
+                if not clear:
+                    # CF は次の磁気サンプル(≈0.1s)で新基準に整列する。
+                    # 確認できなくても失敗にはしない(警告のみ)
+                    if self._wait_tlm_state(
+                            lambda t: abs(t.yaw_est_rad)
+                            < YAWZERO_ALIGN_TOL_RAD,
+                            YAWZERO_ALIGN_TIMEOUT_S) is not None:
+                        steps.append("CF整列確認")
+                    else:
+                        warnings.append("CF の新基準整列(|yaw|<8°)を確認"
+                                        "できませんでした(磁気サンプル待ち"
+                                        "の可能性)")
+                if ff_mode_orig != 0:
+                    # FF モード復元(失敗しても継続するが必ず明記する)
+                    ff_restore_pending = False
+                    ok, detail = self._send_ff_mode(ff_mode_orig,
+                                                    est_mode_orig)
+                    if ok:
+                        steps.append(f"FF復元(ff={ff_mode_orig}, "
+                                     f"est={est_mode_orig})")
+                    else:
+                        warnings.append(
+                            f"FFモードの復元に失敗しました({detail})。"
+                            "FFモードがoffのままです。手動で復元してください")
+                # アンカー再取得(EKF の基準を新ヨーゼロに整列)
+                self._anchor_after_yawzero(steps, warnings)
+            except _YawZeroAbort as exc:
+                message = str(exc)
+                if ff_restore_pending:
+                    # 途中失敗でも FF モードは必ず復元を試みる
+                    ok, detail = self._send_ff_mode(ff_mode_orig,
+                                                    est_mode_orig)
+                    if ok:
+                        message += "(FFモードは復元しました)"
+                    else:
+                        message += (f"(FFモードの復元にも失敗: {detail}。"
+                                    "FFモードがoffのままです。手動で復元して"
+                                    "ください)")
+                return {"ok": False,
+                        "message": f"{op}に失敗しました: {message}",
+                        "steps": steps, "warnings": warnings}
+            message = f"{op}を完了しました({' → '.join(steps)})"
+            if warnings:
+                message += " / 警告: " + " / ".join(warnings)
+            self.notify(message)
+            return {"ok": True, "message": message,
+                    "steps": steps, "warnings": warnings}
+        finally:
+            self.hub.calprofile_end()
 
     # ---- 地磁気 ----
 

@@ -75,6 +75,7 @@ class MsgType(IntEnum):
     CMD_FF_MODE = 0x22
     CMD_FF_ANCHOR = 0x23
     CMD_POS_ERR = 0x24
+    CMD_LED_MODE = 0x25
     # 下り(ドローン -> PC): 0x30–0x4F
     TLM_STATE = 0x30
     TLM_EVENT = 0x31
@@ -312,6 +313,7 @@ _CMD_FF_MOT_FMT = "<B3f3f"
 _CMD_FF_AUX_FMT = "<f"
 _CMD_FF_COMMIT_FMT = "<I"
 _CMD_FF_MODE_FMT = "<BB"
+_CMD_LED_MODE_FMT = "<B"
 _TLM_EVENT_FMT = "<BBBBf"
 _TLM_STATE_FMT = "<IIBBB21fH9fBB"
 _TLM_ACK_FMT = "<BIB"
@@ -340,6 +342,7 @@ assert struct.calcsize(_CMD_FF_MOT_FMT) == 25
 assert struct.calcsize(_CMD_FF_AUX_FMT) == 4
 assert struct.calcsize(_CMD_FF_COMMIT_FMT) == 4
 assert struct.calcsize(_CMD_FF_MODE_FMT) == 2
+assert struct.calcsize(_CMD_LED_MODE_FMT) == 1
 assert struct.calcsize(_TLM_EVENT_FMT) == 8
 assert struct.calcsize(_TLM_STATE_FMT) == 135
 assert struct.calcsize(_TLM_ACK_FMT) == 6
@@ -710,6 +713,32 @@ class CmdFfMode:
 
 
 @dataclass
+class CmdLedMode:
+    """0x25 CMD_LED_MODE(1B)— LED 表示モード切替(計測中インジケータ)。
+
+    mode=1(RECORDING)で MOTOR_TEST 中のみ LED をマゼンタ常灯にする
+    (スマホ動画のカット点検出用。「マゼンタに変わった瞬間 = 計測開始」)。
+    フェイルセーフ: 最後の mode=1 受信から 3 秒で AUTO へ自動復帰するため、
+    PC は計測中およそ 1 秒間隔で再送する(キープアライブ)。MOTOR_TEST
+    離脱でも即 AUTO。受理状態はキャリブ系と同じ(WAIT/COMPLETE/MOTOR_TEST)。
+    """
+    mode: int = 0
+
+    TYPE = MsgType.CMD_LED_MODE
+    PAYLOAD_SIZE = 1
+    MODE_AUTO = 0       # 通常の状態表示
+    MODE_RECORDING = 1  # 計測中(マゼンタ常灯、MOTOR_TEST 中のみ有効)
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_LED_MODE_FMT, self.mode)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdLedMode":
+        _check_len("CMD_LED_MODE", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_LED_MODE_FMT, data))
+
+
+@dataclass
 class TlmState:
     """0x30 TLM_STATE(135B)— フル状態テレメトリ(25Hz)。
 
@@ -818,7 +847,7 @@ class TlmEvent:
 
 @dataclass
 class TlmAck:
-    """0x32 TLM_ACK(6B)— 0x14–0x23 コマンドへの応答。"""
+    """0x32 TLM_ACK(6B)— 0x14–0x23, 0x25 コマンドへの応答。"""
     acked_type: int = 0   # 応答対象のメッセージ型
     acked_seq: int = 0    # 応答対象フレームの seq
     status: int = 0       # STATUS_*
@@ -1270,6 +1299,7 @@ PAYLOAD_CLASSES = {
     MsgType.CMD_FF_AUX: CmdFfAux,
     MsgType.CMD_FF_COMMIT: CmdFfCommit,
     MsgType.CMD_FF_MODE: CmdFfMode,
+    MsgType.CMD_LED_MODE: CmdLedMode,
     MsgType.TLM_STATE: TlmState,
     MsgType.TLM_EVENT: TlmEvent,
     MsgType.TLM_ACK: TlmAck,
@@ -1310,6 +1340,7 @@ EXPECTED_PAYLOAD_SIZE: dict[MsgType, Optional[int]] = {
     MsgType.CMD_FF_COMMIT: CmdFfCommit.PAYLOAD_SIZE,
     MsgType.CMD_FF_MODE: CmdFfMode.PAYLOAD_SIZE,
     MsgType.CMD_FF_ANCHOR: 0,
+    MsgType.CMD_LED_MODE: CmdLedMode.PAYLOAD_SIZE,
     MsgType.TLM_STATE: TlmState.PAYLOAD_SIZE,
     MsgType.TLM_EVENT: TlmEvent.PAYLOAD_SIZE,
     MsgType.TLM_ACK: TlmAck.PAYLOAD_SIZE,

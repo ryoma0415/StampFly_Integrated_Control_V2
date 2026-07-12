@@ -16,7 +16,7 @@ import pytest
 import stampfly_protocol as sp
 
 SEED = 0x5F4641  # 固定シード(再現性)
-CASES_PER_TYPE = 60         # 31型 x 60 = 1860 ケース(>500)
+CASES_PER_TYPE = 60         # 32型 x 60 = 1920 ケース(>500)
 STREAM_CASES = 50
 
 # LOG_TEXT は UTF-8(PROTOCOL.md)。1B(ASCII)/2B/3B(日本語)/4B(非BMP)の
@@ -98,6 +98,8 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
         return sp.CmdFfCommit(crc32=rng.randrange(2**32))
     if msg_type == sp.MsgType.CMD_FF_MODE:
         return sp.CmdFfMode(ff_mode=rng.randrange(3), est_mode=rng.randrange(2))
+    if msg_type == sp.MsgType.CMD_LED_MODE:
+        return sp.CmdLedMode(mode=rng.randrange(2))
     if msg_type == sp.MsgType.TLM_STATE:
         return sp.TlmState(
             seq_echo=rng.randrange(2**32),

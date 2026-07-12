@@ -617,6 +617,89 @@ class TestExpRecorder:
         assert meta["aborted"] is True
 
 
+class TestRecordingLed:
+    """計測中 LED(CMD_LED_MODE): 開始/停止時の送信・キープアライブ・
+    送信失敗でも計測継続(機体側3秒フェイルセーフ前提の警告のみ)。"""
+
+    @staticmethod
+    def _led_frames(transport):
+        return [proto.CmdLedMode.from_payload(f.payload)
+                for f in transport.frames_of_type(proto.MsgType.CMD_LED_MODE)]
+
+    def test_start_sends_recording_and_stop_sends_auto(self, exp_session,
+                                                       tmp_path):
+        session, transport, clock, responder = exp_session
+        session.experiment.recorder.logs_dir = tmp_path
+        transport.clear_sent()
+        assert session.exp_record_start()["ok"]
+        modes = [f.mode for f in self._led_frames(transport)]
+        assert modes == [proto.CmdLedMode.MODE_RECORDING]
+
+        transport.clear_sent()
+        assert session.exp_record_stop()["ok"]
+        modes = [f.mode for f in self._led_frames(transport)]
+        assert modes == [proto.CmdLedMode.MODE_AUTO]
+
+    def test_keepalive_resends_about_every_second(self, exp_session,
+                                                  tmp_path):
+        session, transport, clock, responder = exp_session
+        session.experiment.recorder.logs_dir = tmp_path
+        assert session.exp_record_start()["ok"]
+        transport.clear_sent()
+
+        now = clock()
+        session.supervise(now)               # 初回は即送信
+        assert len(self._led_frames(transport)) == 1
+        session.supervise(now + 0.5)         # 1秒未満 → 送らない
+        assert len(self._led_frames(transport)) == 1
+        session.supervise(now + 1.0)         # 1秒経過 → 再送
+        assert len(self._led_frames(transport)) == 2
+        assert all(f.mode == proto.CmdLedMode.MODE_RECORDING
+                   for f in self._led_frames(transport))
+
+    def test_keepalive_silent_when_not_recording(self, exp_session):
+        session, transport, clock, responder = exp_session
+        transport.clear_sent()
+        now = clock()
+        session.supervise(now)
+        session.supervise(now + 2.0)
+        assert self._led_frames(transport) == []
+
+    def test_send_failure_does_not_stop_recording(self, exp_session,
+                                                  tmp_path, monkeypatch):
+        """送信失敗/NACK でも計測は開始・継続する(警告のみ、T 相当)。"""
+        session, transport, clock, responder = exp_session
+        recorder = session.experiment.recorder
+        recorder.logs_dir = tmp_path
+
+        from core.serial_link import SerialLinkError
+
+        def raise_send(msg_type, payload=b""):
+            raise SerialLinkError("送信不能(テスト)")
+
+        monkeypatch.setattr(session.serial, "send", raise_send)
+        result = session.exp_record_start()
+        assert result["ok"], result
+        assert recorder.is_recording()
+        # キープアライブも例外を漏らさない
+        session.supervise(clock())
+        assert recorder.is_recording()
+        result = session.exp_record_stop()
+        assert result["ok"], result
+
+    def test_auto_stop_path_sends_auto(self, exp_session, tmp_path):
+        """モード離脱の自動停止経路(hub.deactivate → recorder.stop)でも
+        CMD_LED_MODE(0) が送られる。"""
+        session, transport, clock, responder = exp_session
+        session.experiment.recorder.logs_dir = tmp_path
+        assert session.exp_record_start()["ok"]
+        transport.clear_sent()
+        assert session.set_mode(MODE_POSTURE)
+        assert not session.experiment.recorder.is_recording()
+        modes = [f.mode for f in self._led_frames(transport)]
+        assert proto.CmdLedMode.MODE_AUTO in modes
+
+
 class TestSequenceRunner:
     def test_two_mask_sequence(self, exp_session, short_sweep):
         session, transport, clock, responder = exp_session

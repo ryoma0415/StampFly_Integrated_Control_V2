@@ -62,6 +62,8 @@ def _build_message(kind: str, fields: dict):
         return sp.CmdFfCommit(**fields)
     if kind == "CMD_FF_MODE":
         return sp.CmdFfMode(**fields)
+    if kind == "CMD_LED_MODE":
+        return sp.CmdLedMode(**fields)
     if kind == "TLM_STATE":
         return sp.TlmState(**fields)
     if kind == "TLM_EVENT":
@@ -138,7 +140,7 @@ def test_vector_file_metadata(vectors):
                      "cmd_attmount_set", "cmd_yawzero_set", "cmd_geomag_set",
                      "cmd_ff_begin_nlut8", "cmd_ff_lut_point", "cmd_ff_mot_fl",
                      "cmd_ff_aux", "cmd_ff_commit", "cmd_ff_mode_b_ekf",
-                     "cmd_ff_anchor_empty_payload",
+                     "cmd_ff_anchor_empty_payload", "cmd_led_mode_recording",
                      "tlm_ack_ff_commit_ok", "tlm_exp_full", "tlm_cal_data_full"):
         assert required in names, required
     # マルチ機体拡張(0x55-0x58)のベクタが揃っていること

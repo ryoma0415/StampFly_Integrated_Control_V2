@@ -34,7 +34,7 @@ struct CommandMailbox {
     stampfly::CmdPosErr pos_err{};
     uint32_t pos_err_seq = 0;
     uint32_t pos_err_rx_ms = 0;
-    // v2 コマンド(0x14-0x23)のリングバッファ。満杯時は新着を落とす
+    // v2 コマンド(0x14-0x23, 0x25)のリングバッファ。満杯時は新着を落とす
     // (PC側の ACK タイムアウト+リトライで回復する)。
     V2Command v2_ring[V2_COMMAND_QUEUE_CAPACITY]{};
     size_t v2_head = 0;   // 次に取り出す位置
@@ -42,7 +42,7 @@ struct CommandMailbox {
 };
 CommandMailbox mailbox;
 
-// V2Command::payload は 0x14-0x23 の最大 payload(CMD_MAG3D_SET 49B)で確保
+// V2Command::payload は v2 コマンドの最大 payload(CMD_MAG3D_SET 49B)で確保
 // している。他の v2 上り型がそれを超えないことをコンパイル時に固定する。
 static_assert(stampfly::CmdMode::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
 static_assert(stampfly::CmdMotorRun::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
@@ -56,11 +56,14 @@ static_assert(stampfly::CmdFfMot::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v
 static_assert(stampfly::CmdFfAux::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
 static_assert(stampfly::CmdFfCommit::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
 static_assert(stampfly::CmdFfMode::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
+static_assert(stampfly::CmdLedMode::PAYLOAD_SIZE <= sizeof(V2Command::payload), "v2 payload buf");
 
-// v2 コマンド型(0x14-0x23)か。型レンジは stampfly_protocol.hpp の割り当てに一致。
+// v2 コマンド型(0x14-0x23, 0x25。0x24 は CMD_POS_ERR ストリームで別扱い)か。
+// 型レンジは stampfly_protocol.hpp の割り当てに一致。
 constexpr bool is_v2_command_type(uint8_t type) {
-    return type >= static_cast<uint8_t>(stampfly::MsgType::CMD_MODE) &&
-           type <= static_cast<uint8_t>(stampfly::MsgType::CMD_FF_ANCHOR);
+    return (type >= static_cast<uint8_t>(stampfly::MsgType::CMD_MODE) &&
+            type <= static_cast<uint8_t>(stampfly::MsgType::CMD_FF_ANCHOR)) ||
+           type == static_cast<uint8_t>(stampfly::MsgType::CMD_LED_MODE);
 }
 
 // --- リレーピア(最初の有効上りフレームの送信元MACを学習、以後不変) ---
@@ -164,7 +167,7 @@ void on_esp_now_recv(const EspNowRecvInfo* sender_info, const uint8_t* data, int
             break;
         }
         default:
-            // v2 コマンド(0x14-0x23)はリングへ積む(期待長は検証済み)。
+            // v2 コマンド(0x14-0x23, 0x25)はリングへ積む(期待長は検証済み)。
             // 満杯なら新着を落とす(PC側リトライで回復)。
             if (is_v2_command_type(frame.type)) {
                 portENTER_CRITICAL(&command_mux);

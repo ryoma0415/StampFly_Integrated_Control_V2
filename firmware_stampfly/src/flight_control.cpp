@@ -1061,7 +1061,7 @@ void handle_complete(const CommandSnapshot& cmd) {
 }
 
 // ---------------------------------------------------------------------------
-// v2 コマンド処理(0x14-0x23。契約 §1.2 / §2.4 / §2.5)
+// v2 コマンド処理(0x14-0x23, 0x25。契約 §1.2 / §2.4 / §2.5)
 //
 // 全コマンドに TLM_ACK で応答する。キャリブ/FF系(0x17-0x23)は
 // WAIT / COMPLETE / MOTOR_TEST でのみ受理(飛行中の NVS 書込み禁止)。
@@ -1251,9 +1251,11 @@ uint8_t process_one_v2_command(const V2Command& c, bool& send_cal_data_after) {
     using stampfly::MsgType;
     const MsgType type = static_cast<MsgType>(c.type);
 
-    // キャリブ/FF系(0x17-0x23)は WAIT/COMPLETE/MOTOR_TEST のみ受理(契約 §1.2)
-    if (c.type >= static_cast<uint8_t>(MsgType::CMD_CAL_GET) &&
-        c.type <= static_cast<uint8_t>(MsgType::CMD_FF_ANCHOR) &&
+    // キャリブ/FF系(0x17-0x23)と CMD_LED_MODE(0x25)は WAIT/COMPLETE/
+    // MOTOR_TEST のみ受理(契約 §1.2。LED_MODE も同じ非飛行ガードに相乗り)
+    if (((c.type >= static_cast<uint8_t>(MsgType::CMD_CAL_GET) &&
+          c.type <= static_cast<uint8_t>(MsgType::CMD_FF_ANCHOR)) ||
+         c.type == static_cast<uint8_t>(MsgType::CMD_LED_MODE)) &&
         !in_cal_command_state()) {
         return TlmAck::STATUS_BAD_STATE;
     }
@@ -1358,6 +1360,15 @@ uint8_t process_one_v2_command(const V2Command& c, bool& send_cal_data_after) {
         case MsgType::CMD_FF_ANCHOR:
             // モーター回転中(実出力あり)/停止窓が未充填なら busy で拒否可(契約 §1.2)
             return sensorHubFfAnchorNow() ? TlmAck::STATUS_OK : TlmAck::STATUS_BUSY;
+        case MsgType::CMD_LED_MODE: {
+            // 計測中 LED インジケータ。表示効果は MOTOR_TEST 中のみ
+            // (フェイルセーフ・自動復帰は indicators 側が管理する)。
+            stampfly::CmdLedMode m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (m.mode > stampfly::CmdLedMode::MODE_RECORDING) return TlmAck::STATUS_INVALID_ARG;
+            indicators_set_led_mode(m.mode);
+            return TlmAck::STATUS_OK;
+        }
         default:
             // comm 層のレンジ検査により到達しない(防御的に invalid_arg)
             return TlmAck::STATUS_INVALID_ARG;
@@ -1431,7 +1442,7 @@ void loop_400Hz(void) {
     apply_setpoint(cmd);
     apply_pos_err(cmd);
 
-    // v2 コマンド(0x14-0x23)の処理+TLM_ACK 応答。CMD_MODE の遷移は
+    // v2 コマンド(0x14-0x23, 0x25)の処理+TLM_ACK 応答。CMD_MODE の遷移は
     // この直後の状態スイッチで同tick内に反映される(STOP は各ハンドラが最優先)。
     process_v2_commands(cmd);
 

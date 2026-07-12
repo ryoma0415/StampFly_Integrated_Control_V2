@@ -81,10 +81,11 @@ enum class MsgType : uint8_t {
   CMD_FF_MODE = 0x22,      // ff_mode / est_mode 実行時切替(2B)
   CMD_FF_ANCHOR = 0x23,    // アンカー再取得要求(payload 0B)
   CMD_POS_ERR = 0x24,      // XY位置誤差+高度+ヨー目標(21B、機上XY制御。ハートビート兼用 50Hz)
+  CMD_LED_MODE = 0x25,     // LED 表示モード切替(1B、計測中インジケータ)
   // 下り(ドローン -> PC): 0x30–0x4F
   TLM_STATE = 0x30,        // フル状態テレメトリ(135B、25Hz)
   TLM_EVENT = 0x31,        // 状態遷移イベント(8B、即時+2Hz)
-  TLM_ACK = 0x32,          // 0x14–0x23 コマンドへの応答(6B)
+  TLM_ACK = 0x32,          // 0x14–0x23, 0x25 コマンドへの応答(6B)
   TLM_EXP = 0x33,          // 実験テレメトリ(86B、MOTOR_TEST 中のみ 25Hz)
   TLM_CAL_DATA = 0x34,     // キャリブ一括データ(112B、CMD_CAL_GET 応答)
   // ログ(リレー/ドローン -> PC)
@@ -815,6 +816,32 @@ inline bool deserialize(const uint8_t* in, size_t len, CmdFfMode* out) {
   return true;
 }
 
+// 0x25 CMD_LED_MODE(1B)— LED 表示モード切替(計測中インジケータ)。
+// mode=1(RECORDING)で MOTOR_TEST 中のみマゼンタ常灯(動画カット点検出用)。
+// フェイルセーフ: 最後の mode=1 受信から 3 秒で AUTO へ自動復帰(PC は約 1 秒
+// 間隔で再送)。MOTOR_TEST 離脱でも即 AUTO。受理状態はキャリブ系と同じ。
+struct CmdLedMode {
+  static constexpr MsgType TYPE = MsgType::CMD_LED_MODE;
+  static constexpr size_t PAYLOAD_SIZE = 1;
+  static constexpr uint8_t MODE_AUTO = 0;       // 通常の状態表示
+  static constexpr uint8_t MODE_RECORDING = 1;  // 計測中(マゼンタ常灯)
+
+  uint8_t mode = 0;
+};
+static_assert(CmdLedMode::PAYLOAD_SIZE == 1, "PROTOCOL.md: CMD_LED_MODE payload = 1B");
+
+inline bool serialize(const CmdLedMode& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < CmdLedMode::PAYLOAD_SIZE) return false;
+  wr_u8(out + 0, m.mode);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, CmdLedMode* out) {
+  if (in == nullptr || out == nullptr || len != CmdLedMode::PAYLOAD_SIZE) return false;
+  out->mode = rd_u8(in + 0);
+  return true;
+}
+
 // 0x30 TLM_STATE(135B)— フル状態テレメトリ(25Hz、400Hzループの16分周)。
 // オフセットは PROTOCOL.md の表と1対1対応(宣言順に隙間なくパック)。
 // v2: 末尾追加のみ(既存オフセット 0–96 は v1 と不変。serial_link.py が
@@ -1012,7 +1039,7 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmEvent* out) {
   return true;
 }
 
-// 0x32 TLM_ACK(6B)— 0x14–0x23 コマンドへの応答。
+// 0x32 TLM_ACK(6B)— 0x14–0x23, 0x25 コマンドへの応答。
 struct TlmAck {
   static constexpr MsgType TYPE = MsgType::TLM_ACK;
   static constexpr size_t PAYLOAD_SIZE = 1 + 4 + 1;
@@ -1561,6 +1588,8 @@ inline int expected_payload_size(uint8_t type) {
       return static_cast<int>(CmdFfCommit::PAYLOAD_SIZE);
     case MsgType::CMD_FF_MODE:
       return static_cast<int>(CmdFfMode::PAYLOAD_SIZE);
+    case MsgType::CMD_LED_MODE:
+      return static_cast<int>(CmdLedMode::PAYLOAD_SIZE);
     case MsgType::TLM_STATE:
       return static_cast<int>(TlmState::PAYLOAD_SIZE);
     case MsgType::TLM_EVENT:

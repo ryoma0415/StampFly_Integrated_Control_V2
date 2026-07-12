@@ -136,6 +136,13 @@ class FakeDroneResponder:
         self.silent_types: set[int] = set()
         self._dropped_once: set[int] = set()
         self._ff_nlut = 0
+        # True にすると各コマンド応答に cal_data の ff/est モードを反映した
+        # TLM_STATE を追随させる(ヨーゼロ自動シーケンスのモード反映確認と
+        # CF 整列確認を模擬)。YAWZERO_SET(valid=1) 受理で yaw_est は 0 に
+        # 整列する(次の磁気サンプルで新基準に揃うファーム挙動の近似)
+        self.auto_tlm_state = False
+        self.yaw_est_rad = 0.0
+        self.tlm_state_status_extra = proto.TlmState.FF_STATUS_MAG_FRESH
 
     def _update_cal_state(self, frame: proto.Frame) -> None:
         cal = self.cal_data
@@ -169,6 +176,7 @@ class FakeDroneResponder:
             if msg.valid:
                 cal.valid_flags |= proto.TlmCalData.VALID_YAWZERO
                 cal.yawzero_offset_rad = msg.offset_rad
+                self.yaw_est_rad = 0.0   # 新基準へ整列(auto_tlm_state 用)
             else:
                 cal.valid_flags &= ~proto.TlmCalData.VALID_YAWZERO
         elif t == proto.MsgType.CMD_GEOMAG_SET:
@@ -210,7 +218,20 @@ class FakeDroneResponder:
         if t == proto.MsgType.CMD_CAL_GET:
             replies.append((proto.MsgType.TLM_CAL_DATA,
                             self.cal_data.to_payload()))
+        if self.auto_tlm_state:
+            replies.append((proto.MsgType.TLM_STATE,
+                            self.make_tlm_state().to_payload()))
         return replies
+
+    def make_tlm_state(self) -> proto.TlmState:
+        """cal_data の ff/est モードを反映した TLM_STATE を組み立てる。"""
+        ff_status = (self.cal_data.ff_mode
+                     & proto.TlmState.FF_STATUS_FF_MODE_MASK)
+        if self.cal_data.est_mode:
+            ff_status |= proto.TlmState.FF_STATUS_EST_EKF
+        ff_status |= self.tlm_state_status_extra
+        return proto.TlmState(yaw_est_rad=self.yaw_est_rad,
+                              ff_status=ff_status)
 
 
 def make_tlm_exp(current_a: float = 0.2, vbat_v: float = 3.9,

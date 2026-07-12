@@ -1626,6 +1626,12 @@ class SessionManager:
                 self.warn("MoCap 途絶 >2s: CMD_STOP を送信します(自動着陸)")
                 self.stop()
 
+        # --- 計測中 LED キープアライブ(CMD_LED_MODE(1) の約1秒周期再送)---
+        # 機体側は最後の mode=1 から3秒で通常表示へ自動復帰するため、計測中
+        # (ExpRecorder)は supervisor に相乗りして再送し続ける(専用スレッド
+        # なし。非計測時は即 return する軽量チェックのみ)。
+        self.experiment.recorder.service_led_keepalive(now)
+
         # --- 単機テレメトリ途絶(リレー再起動等のサイレント断)---
         # リレーはターゲット設定を RAM のみに保持するため、リレーの再起動で
         # 「シリアルは生きているが機体との転送だけ死んだ」ゾンビ接続になり得る

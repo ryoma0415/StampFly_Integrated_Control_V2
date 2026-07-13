@@ -212,8 +212,11 @@ class TestDropoutPhaseFreeze:
         assert emitted[-1][3]["traj_phase_rad"] == pytest.approx(frozen_phase)
         assert controller.get_target() == pytest.approx(frozen_target)
 
-        # 復帰: t0 が前送りされ、位相は凍結値から連続に進む(ジャンプしない)
-        step_with_pose(controller, clock, 1)
+        # 復帰: t0 が前送りされ、位相は凍結値から連続に進む(ジャンプしない)。
+        # 復帰後の最初のフレームは frame_hold(300ms)超のギャップで
+        # data_valid=0 のため位相凍結がもう1フレーム続く(仕様)。
+        # 2フレーム目から再開する
+        step_with_pose(controller, clock, 2)
         resumed = emitted[-1][3]["traj_phase_rad"]
         assert abs(wrap_pi(resumed - frozen_phase)) \
             <= (2 * math.pi / 8.0) * STEP_DT + 1e-6

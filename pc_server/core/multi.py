@@ -109,6 +109,9 @@ class DroneSlot:
         self.stop_pending: Optional[dict] = None
         self.mocap_warned = False
         self.mocap_stop_sent = False
+        # データ無効(受信はあるが data_valid=0 継続)警告のエピソード管理
+        self.data_invalid_warned = False
+        self.data_invalid_stop_sent = False
         # XY 誤差が divergence_error_m を超え続けている開始時刻(発散検知)
         self.error_high_since: Optional[float] = None
         self.target_set = False
@@ -154,6 +157,10 @@ class MultiControlManager:
         self._start_grace_s: float = failsafe["start_grace_s"]
         self._mocap_dropout_level_s: float = failsafe["mocap_dropout_level_s"]
         self._mocap_dropout_stop_s: float = failsafe["mocap_dropout_stop_s"]
+        # データ無効の持続監視(単機セッションと同じポリシー。session.py 参照。
+        # 追加キーは旧形式の設定でも動くよう .get で読む)
+        self._data_invalid_warn_s: float = failsafe.get("data_invalid_warn_s", 0.5)
+        self._data_invalid_stop_s: float = failsafe.get("data_invalid_stop_s", 2.0)
         self._telemetry_fresh_s: float = \
             server_config["freshness"]["telemetry_fresh_s"]
         # armed/flying スロットの TLM 途絶ハードタイムアウト(リレー再起動・
@@ -405,6 +412,13 @@ class MultiControlManager:
                 return False, (f"機体「{slot.name}」の MoCap"
                                f"(RB{slot.rigid_body_id})が新鮮ではありません。"
                                "リジッドボディの追跡状態を確認してください")
+            # 受信していてもフィルタ/トラッキングが無効なら開始しない
+            # (単機 START と同じゲート。session.start 参照)
+            if not slot.controller.data_valid():
+                return False, (f"機体「{slot.name}」の MoCap"
+                               f"(RB{slot.rigid_body_id})位置データが無効です。"
+                               "トラッキング状態を確認し、数秒待って再試行して"
+                               "ください")
             # 離陸前は地上にいるはず(宙にある RB は ID 取り違えや吊り上げの兆候)
             snap = slot.controller.mocap_snapshot(now)
             if snap is not None and abs(snap.get("z") or 0.0) \
@@ -439,6 +453,13 @@ class MultiControlManager:
             with self._lock:
                 slot.phase = SLOT_ARMED
                 slot.armed_since = now
+                # 前飛行のフェイルセーフ・エピソードを持ち越さない
+                slot.data_invalid_warned = False
+                slot.data_invalid_stop_sent = False
+                slot.error_high_since = None
+            # 飛行単位でフィルタを仕切り直す(単機 START と同じ。前飛行の
+            # 外れ値ロックアウトを持ち越さない)
+            slot.controller.reset_filter()
             slot.controller.set_control_active(True)
             started.append(slot.name)
         self._info("一斉離陸開始: " + ", ".join(started))
@@ -787,6 +808,42 @@ class MultiControlManager:
                         "resends": 0,
                     }
                 self._send_stop_to(slot)
+
+            # --- データ無効の持続(受信はあるが data_valid=0 が続く)---
+            # 単機セッション(session.supervise)と同じポリシー。途絶中は
+            # 判定しない(途絶側のポリシーに委ねる)
+            if not dropped:
+                invalid_age = slot.controller.data_invalid_age_s(now)
+                warn_invalid = False
+                send_stop_invalid = False
+                with self._lock:
+                    if (invalid_age is not None
+                            and invalid_age > self._data_invalid_warn_s):
+                        if not slot.data_invalid_warned:
+                            slot.data_invalid_warned = True
+                            warn_invalid = True
+                        if invalid_age > self._data_invalid_stop_s \
+                                and not slot.data_invalid_stop_sent:
+                            slot.data_invalid_stop_sent = True
+                            send_stop_invalid = True
+                    else:
+                        slot.data_invalid_warned = False
+                        slot.data_invalid_stop_sent = False
+                if warn_invalid:
+                    self._warn(
+                        f"MoCap 位置データ無効 >{self._data_invalid_warn_s:.1f}s"
+                        f"({slot.name}): セットポイントを水平に固定しています")
+                if send_stop_invalid:
+                    self._warn(
+                        f"MoCap 位置データ無効 >{self._data_invalid_stop_s:.0f}s"
+                        f"({slot.name}): CMD_STOP を送信します(自動着陸)")
+                    slot.controller.set_control_active(False)
+                    with self._lock:
+                        slot.stop_pending = {
+                            "deadline": now + self._stop_ack_timeout_s,
+                            "resends": 0,
+                        }
+                    self._send_stop_to(slot)
 
             # --- XY 誤差の持続的発散(flying かつ閉ループ中のみ) ---
             # rigid_body_id を取り違えると各機の PID が他機の位置でループを

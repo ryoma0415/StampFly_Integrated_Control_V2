@@ -112,7 +112,9 @@ StampFly_Integrated_Control_V2/
 │   │   ├── posture.py     PostureController: UI setpoint→スルーレート制限→50Hz送信。
 │   │   │                  SetpointShaper(v2: shape_yaw = 最短経路wrap+45°/s)を定義
 │   │   ├── position.py    PositionController: mocap→フィルタ→XY PID→setpoint→50Hz送信。
-│   │   │                  v2: 円軌道(位相合流・MoCap途絶中の位相凍結・接線ヨー)
+│   │   │                  v2: 円軌道(位相合流・MoCap途絶中の位相凍結・接線ヨー)。
+│   │   │                  START時の reset_filter / data_valid ゲート /
+│   │   │                  データ無効持続監視の基準(data_invalid_age_s)
 │   │   ├── multi.py       v2: MultiControlManager+DroneSlot(2〜4機の同時位置制御。
 │   │   │                  §複数機モード)
 │   │   ├── mocap.py       NatNet接続(vendor/のSDK)、座標変換、PositionFilter。
@@ -120,7 +122,10 @@ StampFly_Integrated_Control_V2/
 │   │   │                  bodies_snapshot() / パッシブ start)
 │   │   ├── pid.py         既存pid_controller.pyを移植・整理(負ゲイン規約は廃止し、
 │   │   │                  軸符号は座標変換側で扱う)
-│   │   ├── filter.py      既存position_filter.pyを移植・整理
+│   │   ├── filter.py      既存position_filter.pyを移植・整理。2026-07:
+│   │   │                  tracking_valid=0 は欠測扱い(アンカー非更新)+
+│   │   │                  連続外れ値/予測経過での強制再シード(ロックアウト対策。
+│   │   │                  再シード後 N フレームは検疫 = probation で閉ループ抑止)
 │   │   ├── experiment.py  v2: ExperimentHub(TLM_EXP配信・モーターテスト・排他スロット)
 │   │   │                  + SweepRunner(電流×磁場スイープ)+ SequenceRunner(加算性)
 │   │   ├── calibration.py v2: CalibrationManager(3D磁気fit・加速度6面・Attitude0/Yaw0/
@@ -336,21 +341,27 @@ _enter_experiment / _exit_experiment)と
   内側フレームを `register_node_handler` 経由で node_id 付きディスパッチする。
   リレーは単機(RLY_SET_TARGET)/マルチ(RLY_SET_PEERS)の排他2モードで、
   マルチ中は非エンベロープの上り 0x10–0x2F をレート制限つき LOG_TEXT で拒否する。
-- **開始条件(start_all)**: 全機の目標設定済み・全機の MoCap 新鮮・目標同士の
+- **開始条件(start_all)**: 全機の目標設定済み・全機の MoCap 新鮮**かつ
+  位置データ有効(data_valid)**・目標同士の
   XY 距離 ≥ `multi.min_target_separation_m`(既定 0.5m)・全機が地上
   (|z| ≤ `multi.start_ground_z_max_m`、既定 0.3m — RB ID 取り違え対策)。
-  1機でも不合格なら全機開始しない。目標 XY は ±`multi.target_xy_abs_max_m`
+  1機でも不合格なら全機開始しない。開始受理時に各スロットのフィルタを
+  `reset_filter` で飛行単位に初期化する(単機 START と同じ)。目標 XY は ±`multi.target_xy_abs_max_m`
   (既定 2.0m)以内のみ受理し、いずれかのスロットが armed/flying の間の
   目標変更でも他機目標との最小間隔を再検証する。
 - **フェイルセーフ**: 単機セッションと同じ規範をスロットごとに適用する:
   STOP 再送(600ms×3、LANDING/WAIT イベントで解除)/ MoCap 途絶
   (>300ms 水平固定は PositionController 内蔵、>2s で**当該機のみ** CMD_STOP)/
-  START 猶予。加えて armed/flying スロットのテレメトリ途絶
+  MoCap データ無効の持続(受信はあるが data_valid=0 継続。
+  > `failsafe.data_invalid_warn_s` 警告、> `failsafe.data_invalid_stop_s` で
+  **当該機のみ** CMD_STOP)/ START 猶予。加えて armed/flying スロットのテレメトリ途絶
   (> `multi.tlm_timeout_s`、既定 3s — リレー再起動・機体電源断の検出)で
   当該スロットを idle へ解放し警告する。飛行中の閉ループで XY 位置誤差
   > `multi.divergence_error_m`(既定 1.0m)が `multi.divergence_hold_s`
   (既定 1.0s)継続した機体は発散とみなし**当該機のみ** CMD_STOP
-  (rigid_body_id 取り違えによる交差結合の最終防衛線)。SPACE / stop は**全機一斉**
+  (rigid_body_id 取り違えによる交差結合の最終防衛線。2026-07 から単機
+  セッションにも同規範を適用: `failsafe.divergence_error_m` /
+  `divergence_hold_s`)。SPACE / stop は**全機一斉**
   (`emergency_stop_all` はロックを迂回して CMD_STOP を先行送出)。
   機体側 200ms/500ms のリンク喪失フェイルセーフが機体ごとの最終防衛線。
 - **飛行ガード**: マルチ選択中は `select_airframe` を拒否(RLY_SET_TARGET が

@@ -154,6 +154,16 @@ class SessionManager:
         self._start_grace_s: float = failsafe["start_grace_s"]
         self._mocap_dropout_level_s: float = failsafe["mocap_dropout_level_s"]
         self._mocap_dropout_stop_s: float = failsafe["mocap_dropout_stop_s"]
+        # データ無効の持続監視(受信はあるが data_valid=0 が続く:
+        # トラッキング喪失・外れ値・低信頼度。2026-07 位置固定化障害の教訓)。
+        # 追加キーは旧形式の設定でも動くよう .get で読む(tlm_stale_s と同じ)
+        self._data_invalid_warn_s: float = failsafe.get("data_invalid_warn_s", 0.5)
+        self._data_invalid_stop_s: float = failsafe.get("data_invalid_stop_s", 2.0)
+        # XY 誤差の持続的発散(単機。multi.py の divergence 検知と同じ規範:
+        # RB 取り違え・偽ソースへの再シードで閉ループが幻の誤差を追う事故の
+        # 最終防衛線)
+        self._divergence_error_m: float = failsafe.get("divergence_error_m", 1.0)
+        self._divergence_hold_s: float = failsafe.get("divergence_hold_s", 1.0)
         self._telemetry_fresh_s: float = self.server_config["freshness"]["telemetry_fresh_s"]
         # 単機テレメトリ途絶監視(リレー再起動などのサイレント断の検出)。
         # 既定値は server.json failsafe 節と同値(旧形式の設定でも動くよう
@@ -257,6 +267,12 @@ class SessionManager:
         # MoCap 途絶警告のエピソード管理
         self._mocap_warned = False
         self._mocap_stop_sent = False
+
+        # データ無効(受信はあるが data_valid=0 継続)警告のエピソード管理
+        self._data_invalid_warned = False
+        self._data_invalid_stop_sent = False
+        # XY 誤差が divergence_error_m を超え続けている開始時刻(発散検知)
+        self._error_high_since: Optional[float] = None
 
         # 単機テレメトリ途絶(リレー再起動等のサイレント断)監視の状態
         self._connected_at: Optional[float] = None
@@ -742,6 +758,13 @@ class SessionManager:
             if age is None or age > self._mocap_dropout_level_s:
                 self.warn("MoCap データが新鮮でないため開始できません")
                 return False
+            # 受信していてもフィルタ/トラッキングが無効なら閉ループを開始
+            # しない(位置固定化状態での盲目離陸を防ぐ。フィルタは連続外れ値
+            # から自動再シードするため、健全なら数百 ms 以内に有効へ戻る)
+            if not self.position.data_valid():
+                self.warn("MoCap 位置データが無効のため開始できません"
+                          "(トラッキング状態を確認し、数秒待って再試行)")
+                return False
         try:
             self.serial.send(proto.MsgType.CMD_START)
         except SerialLinkError as exc:
@@ -755,7 +778,15 @@ class SessionManager:
             # 飛行ログの寿命は「START 受理 〜 飛行終了」(_finish_flight_log)
             self._open_flight_log()
         if mode == MODE_POSITION:
+            # 飛行単位でフィルタを仕切り直す(前飛行の外れ値ロックアウトや
+            # 古い速度推定を持ち越さない)。次フレームで即再シードされる
+            self.position.reset_filter()
             self.position.set_control_active(True)
+            # 前飛行のフェイルセーフ・エピソードを持ち越さない
+            with self._lock:
+                self._data_invalid_warned = False
+                self._data_invalid_stop_sent = False
+                self._error_high_since = None
         self.info("CMD_START 送信")
         return True
 
@@ -1273,6 +1304,9 @@ class SessionManager:
             self._armed_since = None
             self._mocap_warned = False
             self._mocap_stop_sent = False
+            self._data_invalid_warned = False
+            self._data_invalid_stop_sent = False
+            self._error_high_since = None
             self._experiment_active = False
             self._connected_at = None
             self._tlm_stale_warned = False
@@ -1624,6 +1658,67 @@ class SessionManager:
                 self.warn("MoCap 途絶 >300ms: セットポイントを水平に固定します")
             if send_stop:
                 self.warn("MoCap 途絶 >2s: CMD_STOP を送信します(自動着陸)")
+                self.stop()
+
+            # --- データ無効の持続(受信はあるが data_valid=0 が続く)---
+            # トラッキング喪失・外れ値・低信頼度の間、on_mocap_pose は
+            # roll/pitch を水平へ強制している(位置閉ループは事実上停止)。
+            # フレームは届き続けるため上の途絶ポリシーでは検出できない。
+            # 途絶中は判定しない(無効時間は途絶時間を包含するため二重警告
+            # になる。途絶側のポリシーに委ねる)
+            if not dropped:
+                invalid_age = self.position.data_invalid_age_s(now)
+                warn_invalid = False
+                send_stop_invalid = False
+                with self._lock:
+                    if (invalid_age is not None
+                            and invalid_age > self._data_invalid_warn_s):
+                        if not self._data_invalid_warned:
+                            self._data_invalid_warned = True
+                            warn_invalid = True
+                        if invalid_age > self._data_invalid_stop_s \
+                                and not self._data_invalid_stop_sent:
+                            self._data_invalid_stop_sent = True
+                            send_stop_invalid = True
+                    else:
+                        self._data_invalid_warned = False
+                        self._data_invalid_stop_sent = False
+                if warn_invalid:
+                    self.warn(
+                        f"MoCap 位置データ無効 >{self._data_invalid_warn_s:.1f}s"
+                        "(トラッキング喪失/外れ値): セットポイントを水平に"
+                        "固定しています")
+                if send_stop_invalid:
+                    self.warn(
+                        f"MoCap 位置データ無効 >{self._data_invalid_stop_s:.0f}s: "
+                        "CMD_STOP を送信します(自動着陸)")
+                    self.stop()
+
+            # --- XY 誤差の持続的発散(flying かつ閉ループ中のみ) ---
+            # multi.supervise の発散検知と同じ規範(単機版)。RB 取り違えや
+            # 偽ソース(反射)への再シードで、フィルタ上は「有効」なまま
+            # 閉ループが幻の誤差を追い続ける事故の最終防衛線。途絶中は誤差が
+            # 古いため判定しない(途絶フェイルセーフに委ねる)。
+            error_m = self.position.xy_error_m()
+            control_active = self.position.control_active
+            diverged = False
+            with self._lock:
+                if (phase == PHASE_FLYING and control_active and not dropped
+                        and error_m is not None
+                        and error_m > self._divergence_error_m):
+                    if self._error_high_since is None:
+                        self._error_high_since = now
+                    elif now - self._error_high_since > self._divergence_hold_s:
+                        self._error_high_since = None
+                        diverged = True
+                else:
+                    self._error_high_since = None
+            if diverged:
+                self.warn(
+                    f"XY 位置誤差 >{self._divergence_error_m:.1f}m が "
+                    f"{self._divergence_hold_s:.1f}s 継続: 発散とみなし "
+                    "CMD_STOP を送信します(rigid_body_id の対応と"
+                    "トラッキング状態を確認してください)")
                 self.stop()
 
         # --- 計測中 LED キープアライブ(CMD_LED_MODE(1) の約1秒周期再送)---

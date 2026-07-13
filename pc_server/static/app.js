@@ -864,8 +864,16 @@ function renderYawMonitor() {
 function renderMocap() {
   const m = lastMocap;
   if (m) {
-    setLinkInd(els.mocapStatus, !!m.fresh);
-    els.mocapStatusText.textContent = m.fresh ? "受信中" : "途絶";
+    // fresh = 生フレームの受信鮮度、valid = フィルタ/トラッキングの有効性。
+    // 受信していてもデータ無効(トラッキング喪失・外れ値)は警告色で区別する
+    // (無効中は位置表示が凍結し、XY 閉ループは水平固定になっている)
+    const valid = m.valid !== false;
+    setLinkInd(els.mocapStatus, !!m.fresh, !valid);
+    els.mocapStatusText.textContent =
+      m.fresh ? (valid ? "受信中" : "受信中(位置無効)") : "途絶";
+    els.mocapStatus.title = (m.fresh && !valid)
+      ? "MoCapフレームは届いていますが位置データが無効です(トラッキング喪失/外れ値)。位置表示は最後の有効値で凍結し、XY制御は水平固定になります"
+      : "";
     const conf = typeof m.confidence === "number" ? ` conf: ${m.confidence.toFixed(2)}` : "";
     els.mocapCoords.textContent =
       `x: ${fmtNum(m.x, 2)} y: ${fmtNum(m.y, 2)} z: ${fmtNum(m.z, 2)} yaw: ${fmtNum(m.yaw_deg, 1)}°${conf}`;
@@ -1261,8 +1269,11 @@ function renderMulti() {
     const volt = t && typeof t.voltage === "number" ? `${t.voltage.toFixed(2)}V` : "--V";
     const stateName = t ? t.state_name : "--";
     const link = t && t.fresh ? "TLM✓" : "TLM✗";
+    // RB△ = 受信はあるが位置データ無効(トラッキング喪失/外れ値)。
+    // 単機の「受信中(位置無効)」と同じ意味
+    const mValid = m && m.valid !== false;
     const mocapTxt = m && m.fresh
-      ? `RB✓ (${fmtNum(m.x, 2)}, ${fmtNum(m.y, 2)}, ${fmtNum(m.z, 2)})`
+      ? `${mValid ? "RB✓" : "RB△無効"} (${fmtNum(m.x, 2)}, ${fmtNum(m.y, 2)}, ${fmtNum(m.z, 2)})`
       : "RB✗";
     const lat = typeof d.latency_ms === "number"
       ? ` ${d.latency_ms.toFixed(0)}ms` : "";
@@ -1270,7 +1281,8 @@ function renderMulti() {
       ? `  ヨー${fmtNum(d.yaw_ref_deg, 0)}°` : "";
     chip.textContent =
       `[${d.node_id}] ${d.name}  ${phaseJp}/${stateName}  ${volt}  ${link}  ${mocapTxt}${lat}${yawTxt}`;
-    chip.classList.toggle("chip-warn", !(t && t.fresh) || !(m && m.fresh));
+    chip.classList.toggle("chip-warn",
+      !(t && t.fresh) || !(m && m.fresh) || !mValid);
     chip.classList.toggle("chip-flying", d.phase === "flying");
     box.appendChild(chip);
 
@@ -2053,6 +2065,11 @@ function wireEvents() {
     // この場で: 現在のMoCap位置XYを目標に(Zは現在の入力値を維持)
     if (!lastMocap || typeof lastMocap.x !== "number") {
       appendConsole("ui", "MoCap位置が未受信のため「この場で」を設定できません");
+      return;
+    }
+    if (lastMocap.valid === false) {
+      // 無効中の表示位置は凍結値のため、目標にすると実位置とずれる
+      appendConsole("ui", "MoCap位置データが無効のため「この場で」を設定できません(トラッキング復帰を待ってください)");
       return;
     }
     els.targetX.value = lastMocap.x.toFixed(2);

@@ -17,6 +17,10 @@
 フェイルセーフ(PROTOCOL.md):
 - MoCap 途絶 > mocap_dropout_level_s(300ms)→ roll/pitch を水平(0)に固定し
   て送信を継続(alt_ref は維持)。>2s の CMD_STOP は session 層の監視が行う。
+- データ無効の持続(受信はあるが data_valid=0 が続く: トラッキング喪失・
+  外れ値・低信頼度)→ roll/pitch は水平のまま(on_mocap_pose が強制)。
+  警告・自動 CMD_STOP は session 層の監視(data_invalid_warn_s /
+  data_invalid_stop_s)が行う。基準は data_invalid_age_s。
 
 単位は core 内部規約(rad / m)。座標は制御座標系(mocap.py で変換済み)。
 """
@@ -96,6 +100,14 @@ class PositionController:
         self._last_cmd = (0.0, 0.0)                    # PID 出力 (roll, pitch) [rad]
         self._last_errors = (0.0, 0.0)
         self._last_data_valid = False
+        # データ無効が連続し始めた時刻(持続的データ無効の監視基準。
+        # 有効フレームで None に戻る。START を経ない flying 昇格でも
+        # 無効フレーム到着時点から計時が始まる)
+        self._invalid_since: Optional[float] = None
+        # フィルタ世代: reset_filter / reset_control のたびに +1。
+        # NatNet スレッドが旧世代フィルタで計算した結果をリセット後に
+        # 書き戻す競合を検出して捨てるために使う
+        self._filter_generation = 0
 
         # 直近の送信値(バイアス加算前)
         self._last_output = (0.0, 0.0, self._target[2])
@@ -194,6 +206,7 @@ class PositionController:
             filter_result = self._last_filter_result
             pose = self._last_pose
             pose_t = self._last_pose_t
+            data_valid = self._last_data_valid
             alt_lo, alt_hi = self._shaper.alt_limits
         if not (alt_lo <= alt_m <= alt_hi):
             return False, f"高度は {alt_lo}–{alt_hi} m で指定してください"
@@ -203,6 +216,11 @@ class PositionController:
         age = None if pose_t is None else (now - pose_t)
         if age is None or age > self._dropout_level_s:
             return False, "MoCap データが新鮮でないため円軌道を開始できません"
+        # 有効性ガード(session.start と同じ): 無効中のフィルタ位置は
+        # 凍結/外挿されたゴーストのため、そこから合流位相を決めない
+        if not data_valid:
+            return False, ("MoCap 位置データが無効のため円軌道を開始できません"
+                           "(トラッキング状態を確認してください)")
         if filter_result is not None:
             px, py, _ = filter_result["filtered_position"]
         elif pose is not None:
@@ -293,6 +311,7 @@ class PositionController:
 
         # フィルタは NatNet スレッドと reset_control(UI/executor)が共有する
         with self._filter_lock:
+            generation = self._filter_generation
             filter_result = self.position_filter.process_position(
                 position,
                 marker_count=pose["marker_count"],
@@ -309,6 +328,8 @@ class PositionController:
             confidence >= self._confidence_zero_threshold
             and not filter_result["is_outlier"]
             and filter_result["tracking_valid"]
+            # 再シード直後の検疫中は追従はするが閉ループには使わない
+            and not filter_result.get("probation", False)
         )
         # フレーム間隔が保持時間を超えた場合も無効扱い(legacy と同じ)
         if frame_dt is not None and frame_dt > self._frame_hold_s:
@@ -339,10 +360,18 @@ class PositionController:
             pitch_cmd = 0.0
 
         with self._lock:
+            if generation != self._filter_generation:
+                # 処理中に reset_filter/reset_control が走った。旧世代
+                # フィルタの結果でリセット後のキャッシュを汚さない
+                return
             self._last_filter_result = filter_result
             self._last_cmd = (roll_cmd, pitch_cmd)
             self._last_errors = (error_x, error_y)
             self._last_data_valid = is_data_valid
+            if is_data_valid:
+                self._invalid_since = None
+            elif self._invalid_since is None:
+                self._invalid_since = t
 
     # ------------------------------------------------------------------
     # 50Hz 送信
@@ -385,6 +414,7 @@ class PositionController:
         """フィルタ・PID・整形状態をリセットする(セッション開始時)。"""
         with self._filter_lock:
             self.position_filter.reset()
+            self._filter_generation += 1
         with self._pid_lock:
             self.pid.reset()
         self._shaper.reset()
@@ -396,10 +426,31 @@ class PositionController:
             self._last_cmd = (0.0, 0.0)
             self._last_errors = (0.0, 0.0)
             self._last_data_valid = False
+            self._invalid_since = None
             self._control_active = False
             self._traj = None
             self._traj_phase = None
             self._last_yaw_output = 0.0
+
+    def reset_filter(self) -> None:
+        """位置フィルタのみ再初期化する(離陸 CMD_START 受理時)。
+
+        フィルタ状態は接続・モード変更をまたがずセッション中ずっと生き続ける
+        ため、前の飛行で外れ値ロックアウトに陥ったまま次の飛行へ持ち越される
+        (2026-07 の位置固定化障害)。飛行単位で仕切り直す。ポーズキャッシュ
+        (_last_pose/_last_pose_t)は消さない(START 直後の途絶誤検知を防ぐ)。
+        世代カウンタで NatNet スレッドの書き戻し競合(旧世代フィルタの結果で
+        リセット後のキャッシュが汚れる)を防ぐ。
+        """
+        with self._filter_lock:
+            self.position_filter.reset()
+            self._filter_generation += 1
+        with self._lock:
+            self._last_filter_result = None
+            self._last_cmd = (0.0, 0.0)
+            self._last_errors = (0.0, 0.0)
+            self._last_data_valid = False
+            self._invalid_since = None
 
     def _sender_loop(self, stop_event: threading.Event) -> None:
         run_paced_loop(stop_event, self._clock, self._period_s, self.step)
@@ -415,11 +466,13 @@ class PositionController:
             dropped = age is None or age > self._dropout_level_s
             traj = self._traj
             if traj is not None:
-                # MoCap 途絶中は軌道位相の時間更新を凍結する(位置フィード
-                # バックを失ったまま目標と接線ヨーだけが進み、復帰時に XY
-                # 誤差が跳ねる・途絶中に盲目的な回頭指令を出すのを防ぐ)。
+                # MoCap 途絶中・データ無効中は軌道位相の時間更新を凍結する
+                # (位置フィードバックを失ったまま目標と接線ヨーだけが進み、
+                # 復帰時に XY 誤差が跳ねる・盲目的な回頭指令を出すのを防ぐ。
+                # 無効中は on_mocap_pose が指令を水平固定しており、目標だけ
+                # 周回させる意味がない)。
                 # 復帰時は t0 を凍結時間ぶん前送りして位相を連続に保つ。
-                if dropped:
+                if dropped or not self._last_data_valid:
                     if traj["frozen_at"] is None:
                         traj["frozen_at"] = now
                     t_eff = traj["frozen_at"]
@@ -544,6 +597,27 @@ class PositionController:
             pose_t = self._last_pose_t
         return None if pose_t is None else (now - pose_t)
 
+    def data_valid(self) -> bool:
+        """直近フレームの位置データ有効性(信頼度・外れ値・トラッキング)。
+
+        受信鮮度(mocap_age_s)とは独立。START ゲートと UI 表示が使う。
+        """
+        with self._lock:
+            return self._last_data_valid
+
+    def data_invalid_age_s(self, now: Optional[float] = None) -> Optional[float]:
+        """データ無効が連続し始めてからの経過秒(現在有効なら None)。
+
+        supervise 層の「受信はあるがデータ無効が続く」フェイルセーフ用。
+        無効フレームの到着で計時が始まるため、START を経ずに flying へ
+        昇格したケース(飛行中の再接続)でも機能する。
+        """
+        if now is None:
+            now = self._clock()
+        with self._lock:
+            t = self._invalid_since
+        return None if t is None else (now - t)
+
     def mocap_snapshot(self, now: Optional[float] = None) -> Optional[dict]:
         """WebSocket の "mocap" フィールド用スナップショット(deg/m)。"""
         if now is None:
@@ -552,6 +626,7 @@ class PositionController:
             pose = self._last_pose
             pose_t = self._last_pose_t
             filter_result = self._last_filter_result
+            data_valid = self._last_data_valid
         if pose is None or pose_t is None:
             return None
         position = (filter_result["filtered_position"]
@@ -565,4 +640,7 @@ class PositionController:
             "yaw_deg": pose["yaw_rad"] * RAD_TO_DEG,
             "confidence": float(confidence),
             "fresh": (now - pose_t) <= self._mocap_fresh_s,
+            # フィルタ有効性(受信鮮度と独立)。UI は fresh かつ valid で
+            # 「受信中」緑、fresh だが invalid は警告色にする
+            "valid": bool(data_valid),
         }

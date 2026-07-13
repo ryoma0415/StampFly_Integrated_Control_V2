@@ -332,6 +332,9 @@ Reason:      0=none, 1=start_cmd, 2=stop_cmd, 3=max_flight_time, 4=low_voltage,
 | 最大飛行時間 120s | LANDING(reason=3) | ファーム |
 | MoCap 途絶 >300ms(Positionモード) | setpoint を水平に固定+UI警告(円軌道中は軌道位相・接線ヨー目標も凍結) | pc_server |
 | MoCap 途絶 >2s(Positionモード) | CMD_STOP 送信(自動着陸)。円軌道中も同一 | pc_server |
+| MoCap データ無効 >0.5s(Positionモード、受信はあるが data_valid=0 継続: トラッキング喪失/外れ値/低信頼度) | setpoint は水平固定のまま(データ無効時は常時)+UI警告。閾値は server.json failsafe.data_invalid_warn_s | pc_server |
+| MoCap データ無効 >2s(Positionモード) | CMD_STOP 送信(自動着陸)。閾値は failsafe.data_invalid_stop_s。完全途絶中は上の途絶ポリシーが優先 | pc_server |
+| XY 位置誤差 >1.0m が 1.0s 継続(Positionモード、flying+閉ループ中、MoCap 新鮮時のみ) | 発散とみなし CMD_STOP 送信(自動着陸)。RB 取り違え・偽ソースへの再シードの最終防衛線。閾値は failsafe.divergence_error_m / divergence_hold_s(Multi は multi.divergence_* で機体別に従来どおり) | pc_server |
 | STOP 送信後 600ms 以内に LANDING/WAIT イベントなし | CMD_STOP 再送(最大3回)+UI警告 | pc_server |
 | シリアル切断 | UI赤色警告(機体側は上記リンク喪失で自律着陸。MOTOR_TEST 中は CMD_MOTOR_RUN 途絶停止) | pc_server |
 
@@ -340,6 +343,7 @@ Reason:      0=none, 1=start_cmd, 2=stop_cmd, 3=max_flight_time, 4=low_voltage,
 (ハートビート兼用 — 機体側の 200ms/500ms 途絶フェイルセーフは単機時と同一)、
 STOP 送信後 600ms×最大3回の再送監視もノード別、MoCap 途絶 >300ms 水平固定 /
 >2s CMD_STOP も機体別に判定する(途絶した機体のみ停止し他機は継続)。
+MoCap データ無効(>0.5s 警告 / >2s CMD_STOP)も同様に機体別。
 緊急停止(SPACE / STOP)は**全機一斉** CMD_STOP。
 
 レート規範: CMD_SETPOINT 50Hz(PC送信、experiment モード中は停止。

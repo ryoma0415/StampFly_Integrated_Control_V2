@@ -240,6 +240,9 @@ XY 位置ループの計算場所を選択できる(サーバ再起動で反映)
 | 最大飛行時間 120s | LANDING(reason=3) | ファーム |
 | MoCap 途絶 >300ms(Position/Multiモード) | setpoint を水平に固定+UI警告(円軌道中は軌道位相・接線ヨー目標も凍結。Multi は機体ごとに判定) | pc_server |
 | MoCap 途絶 >2s(Position/Multiモード) | CMD_STOP 送信(自動着陸)。円軌道中も同一。Multi は**当該機のみ** | pc_server |
+| MoCap データ無効 >0.5s(Position/Multiモード。受信はあるがトラッキング喪失/外れ値/低信頼度が続く) | setpoint は水平固定のまま+UI警告(MoCap インジケータは「受信中(位置無効)」黄) | pc_server |
+| MoCap データ無効 >2s(Position/Multiモード) | CMD_STOP 送信(自動着陸)。Multi は**当該機のみ**。完全途絶中は上の途絶ポリシーが優先 | pc_server |
+| XY 位置誤差 >1.0m が 1.0s 継続(flying+閉ループ中) | 発散とみなし CMD_STOP(自動着陸)。RB 取り違え・偽データ追従の最終防衛線(v2 では Multi のみ→単機にも適用) | pc_server |
 | STOP 送信後 600ms 以内に LANDING/WAIT イベントなし | CMD_STOP 再送(最大3回)+UI警告 | pc_server |
 | シリアル切断 | UI赤色警告(機体側は上記リンク喪失で自律着陸。MOTOR_TEST 中は CMD_MOTOR_RUN 途絶停止) | pc_server |
 
@@ -257,6 +260,7 @@ ARCHITECTURE.md「安全クランプ(多層)」)。
 | 飛行中に勝手に着陸した | コンソールのイベント(reason)を確認: link_loss=電波/USB、low_voltage=充電、max_flight_time=仕様(120s) |
 | COMPLETE から動かない | OverG 後。機体を回収・静置(高度 0.15m 未満)して Re-arm (RESET) |
 | Position で警告「MoCap 途絶」 | マーカーの隠れ・計測範囲外。頻発するなら Motive のカメラ配置と `control.json` のフィルタ設定を見直す |
+| MoCap が「受信中(位置無効)」(黄) | フレームは届いているがトラッキング喪失/外れ値で位置が使えない状態。フィルタは連続外れ値から自動再シードするため通常は数秒で復帰する。復帰しない場合は Motive のリジッドボディ追跡(マーカー隠れ・反射)を確認。無効のままの START は拒否され、飛行中に続くと 0.5s で警告・2s で自動着陸(§9) |
 
 ---
 

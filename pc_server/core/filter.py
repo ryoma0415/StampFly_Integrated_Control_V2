@@ -5,6 +5,16 @@
 - パラメータは config/control.json の "filter" セクションから供給する。
 - アルゴリズム(動的閾値・予測補間・重み付き移動平均)は飛行実績のある
   旧実装と同一に保つ。
+
+2026-07 ロックアウト対策(旧実装からの意図的な変更):
+- tracking_valid=0 のサンプルは欠測扱い(アンカー・履歴・閾値を更新しない)。
+  Motive が喪失中に配信する凍結ポーズを正常受理するとアンカーが固着する。
+- 連続外れ値 max_consecutive_outliers または予測経過 max_prediction_s で
+  生位置に強制再シードする。アンカーと閾値EMAは受理時にしか育たないため、
+  実位置が max_outlier_threshold より遠くへ出ると永久拒否の固定点に陥る。
+- 再シード後 reseed_probation_frames は検疫期間: 受理・追従はするが
+  probation=True・劣化信頼度(≤0.35)で返し、新アンカーが偽ソース
+  (RB 取り違え・反射)だった場合の閉ループ即時再有効化を防ぐ。
 """
 
 from __future__ import annotations
@@ -38,7 +48,10 @@ class PositionFilter:
 
     def __init__(self, window_size: int = 5, outlier_threshold: float = 0.1,
                  velocity_window: int = 3, enable_prediction: bool = True,
-                 max_outlier_threshold: float = 0.4) -> None:
+                 max_outlier_threshold: float = 0.4,
+                 max_consecutive_outliers: int = 50,
+                 max_prediction_s: float = 0.5,
+                 reseed_probation_frames: int = 10) -> None:
         self.window_size = window_size
         self.base_threshold = outlier_threshold
         self.max_threshold = max(outlier_threshold, max_outlier_threshold)
@@ -46,6 +59,9 @@ class PositionFilter:
         self.dynamic_threshold = outlier_threshold
         self.velocity_window = velocity_window
         self.enable_prediction = enable_prediction
+        self.max_consecutive_outliers = max_consecutive_outliers
+        self.max_prediction_s = max_prediction_s
+        self.reseed_probation_frames = reseed_probation_frames
 
         self.position_history: deque = deque(maxlen=window_size)
         self.velocity_history: deque = deque(maxlen=velocity_window)
@@ -63,6 +79,10 @@ class PositionFilter:
         self.outlier_detected = False
         self.outlier_count = 0
         self.consecutive_outliers = 0
+        self.reseed_count = 0
+        # 再シード後の検疫: 残りフレーム数(>0 の間、受理はするが
+        # probation=True・劣化信頼度で返し、下流の data_valid を抑止する)
+        self.probation_remaining = 0
 
         self.total_samples = 0
         self.outlier_samples = 0
@@ -71,13 +91,22 @@ class PositionFilter:
 
     @classmethod
     def from_config(cls, filter_config: dict) -> "PositionFilter":
-        """control.json の "filter" セクションから生成する。"""
+        """control.json の "filter" セクションから生成する。
+
+        2026-07 追加キーは旧形式の設定でも動くよう .get で読む
+        (session.py の failsafe 追加キーと同じ流儀)。
+        """
         return cls(
             window_size=filter_config["window_size"],
             outlier_threshold=filter_config["outlier_threshold"],
             velocity_window=filter_config["velocity_window"],
             enable_prediction=filter_config["enable_prediction"],
             max_outlier_threshold=filter_config["max_outlier_threshold"],
+            max_consecutive_outliers=filter_config.get(
+                "max_consecutive_outliers", 50),
+            max_prediction_s=filter_config.get("max_prediction_s", 0.5),
+            reseed_probation_frames=filter_config.get(
+                "reseed_probation_frames", 10),
         )
 
     def reset(self) -> None:
@@ -96,6 +125,8 @@ class PositionFilter:
         self.outlier_detected = False
         self.outlier_count = 0
         self.consecutive_outliers = 0
+        self.reseed_count = 0
+        self.probation_remaining = 0
         self.total_samples = 0
         self.outlier_samples = 0
         self.last_source = None
@@ -184,6 +215,50 @@ class PositionFilter:
         weights /= weights.sum()
         return tuple(np.average(positions, weights=weights, axis=0))
 
+    def _degraded_confidence(self, marker_count, tracking_valid,
+                             quality_weight, rigid_body_error) -> float:
+        """外れ値・トラッキング喪失サンプルの信頼度(受理値より大きく割引)。"""
+        confidence = OUTLIER_BASE_CONFIDENCE
+        if marker_count is not None:
+            confidence *= max(0.25, marker_count / MARKER_FULL_COUNT)
+        if not tracking_valid:
+            confidence *= 0.4
+        if quality_weight is not None:
+            confidence *= 0.5 + 0.5 * max(0.0, min(quality_weight, 1.0))
+        if rigid_body_error is not None:
+            confidence *= 1.0 / (1.0 + max(0.0, rigid_body_error))
+        return confidence
+
+    def _reseed(self, position, current_time) -> None:
+        """生位置を新しいアンカーとして内部状態を再シードする。
+
+        アンカー(last_valid_position)と閾値EMAは受理時にしか更新されない
+        ため、実位置がアンカーから max_outlier_threshold を超えて離れると
+        全サンプルを外れ値として拒否し続ける固定点に陥る(2026-07 の
+        位置固定化障害)。連続外れ値・予測経過時間が上限に達したら、
+        追従を放棄して現在の生位置から仕切り直す。"""
+        self.position_history.clear()
+        self.velocity_history.clear()
+        self.time_history.clear()
+        self.position_history.append(position)
+        self.velocity_history.append(position)
+        self.time_history.append(current_time)
+        self.last_valid_position = position
+        self.last_valid_time = current_time
+        self.prev_valid_position = None
+        self.estimated_velocity = np.zeros(3)
+        self.velocity_magnitude_ema = 0.0
+        self.step_distance_ema = 0.0
+        self.dynamic_threshold = self.base_threshold
+        self.dt_ema = None
+        self.outlier_detected = False
+        self.consecutive_outliers = 0
+        self.reseed_count += 1
+        # 検疫開始: 新アンカーが偽ソース(RB 取り違え・反射)かもしれない
+        # ため、以後 N フレームは受理しつつ probation=True・劣化信頼度で
+        # 返し、閉ループの即時再有効化を防ぐ
+        self.probation_remaining = self.reseed_probation_frames
+
     def process_position(self, position, marker_count=None, current_time=None,
                          tracking_valid=True, quality_weight=None,
                          rigid_body_error=None, source="rigid_body") -> dict:
@@ -200,7 +275,48 @@ class PositionFilter:
         self.total_samples += 1
         self.last_source = source
 
-        # 初回サンプルはそのまま受理
+        # トラッキング喪失中は欠測扱い: アンカー・履歴・閾値を一切更新せず、
+        # 予測(なければ直前有効値)を低信頼度で返す。Motive は喪失中も
+        # 最後のポーズを凍結値のまま配信し続けるため、これを正常受理すると
+        # アンカーが凍結点に固着し推定速度も 0 に潰れる(2026-07 の
+        # 位置固定化障害の初段)。
+        if not tracking_valid:
+            filtered_position = position
+            used_prediction = False
+            if self.last_valid_position is not None:
+                filtered_position = self.last_valid_position
+                if self.enable_prediction and self.last_valid_time is not None:
+                    # 外挿は max_prediction_s で頭打ちにする(喪失が長引いた
+                    # ときに推定速度でゴースト位置が滑走し続けないため。
+                    # 以後は「最後の有効値付近で凍結」の表示契約に一致)
+                    predicted = self.predict_position(min(
+                        current_time - self.last_valid_time,
+                        self.max_prediction_s))
+                    if predicted is not None:
+                        filtered_position = predicted
+                        used_prediction = True
+            confidence = max(CONFIDENCE_FLOOR, min(1.0, self._degraded_confidence(
+                marker_count, tracking_valid, quality_weight, rigid_body_error)))
+            self.last_confidence = confidence
+            return {
+                "filtered_position": filtered_position,
+                "raw_position": position,
+                "is_outlier": False,
+                "used_prediction": used_prediction,
+                "confidence": confidence,
+                "marker_count": marker_count,
+                "consecutive_outliers": self.consecutive_outliers,
+                "source": source,
+                "threshold": self.dynamic_threshold,
+                "tracking_valid": tracking_valid,
+                "rigid_body_error": rigid_body_error,
+                "probation": False,
+            }
+
+        # 初回サンプルはそのまま受理する。再シードと違い検疫は課さない:
+        # 初回化は明示操作(接続・モード変更・START — いずれも直前に
+        # data_valid ゲートを通る)でのみ起きるため。誤アンカーの残余リスクは
+        # session 層の XY 発散フェイルセーフが受け持つ
         if self.last_valid_position is None:
             self.last_valid_position = position
             self.last_valid_time = current_time
@@ -221,17 +337,53 @@ class PositionFilter:
                 "threshold": self.dynamic_threshold,
                 "tracking_valid": tracking_valid,
                 "rigid_body_error": rigid_body_error,
+                "probation": False,
             }
 
         is_outlier, threshold = self.is_outlier(
             position, current_time=current_time, tracking_valid=tracking_valid,
             marker_count=marker_count, quality_weight=quality_weight)
 
+        in_probation = False
         if is_outlier:
             self.outlier_detected = True
             self.outlier_count += 1
             self.outlier_samples += 1
             self.consecutive_outliers += 1
+
+            confidence = self._degraded_confidence(
+                marker_count, tracking_valid, quality_weight, rigid_body_error)
+
+            # 強制復帰(再シード): 連続外れ値または予測経過時間が上限に
+            # 達したら、生位置を新アンカーとして受け直す。復帰フレーム自体は
+            # is_outlier=1・低信頼度のまま返し、下流の data_valid 回復は
+            # 次フレーム以降の通常受理に任せる(1フレームの誤アンカーで
+            # 即座に閉ループが有効化されないため)。
+            prediction_age = (current_time - self.last_valid_time
+                              if self.last_valid_time is not None else None)
+            if (self.consecutive_outliers >= self.max_consecutive_outliers
+                    or (prediction_age is not None
+                        and prediction_age > self.max_prediction_s)):
+                self._reseed(position, current_time)
+                confidence = max(CONFIDENCE_FLOOR, min(1.0, confidence))
+                self.last_confidence = confidence
+                return {
+                    "filtered_position": position,
+                    "raw_position": position,
+                    "is_outlier": True,
+                    "used_prediction": False,
+                    "confidence": confidence,
+                    "marker_count": marker_count,
+                    "consecutive_outliers": self.consecutive_outliers,
+                    "source": source,
+                    # ログ契約(LOG_STRUCTURE.md): filter_threshold は
+                    # 「外れ値判定に使った閾値」— 再シードで初期化した値では
+                    # なく、このフレームの判定に使った動的閾値を返す
+                    "threshold": threshold,
+                    "tracking_valid": tracking_valid,
+                    "rigid_body_error": rigid_body_error,
+                    "probation": True,
+                }
 
             used_prediction = False
             filtered_position = self.last_valid_position
@@ -240,16 +392,6 @@ class PositionFilter:
                 if predicted is not None:
                     filtered_position = predicted
                     used_prediction = True
-
-            confidence = OUTLIER_BASE_CONFIDENCE
-            if marker_count is not None:
-                confidence *= max(0.25, marker_count / MARKER_FULL_COUNT)
-            if not tracking_valid:
-                confidence *= 0.4
-            if quality_weight is not None:
-                confidence *= 0.5 + 0.5 * max(0.0, min(quality_weight, 1.0))
-            if rigid_body_error is not None:
-                confidence *= 1.0 / (1.0 + max(0.0, rigid_body_error))
         else:
             self.outlier_detected = False
             self.consecutive_outliers = 0
@@ -293,6 +435,17 @@ class PositionFilter:
             if rigid_body_error is not None:
                 confidence *= 1.0 / (1.0 + max(0.0, rigid_body_error))
 
+            if self.probation_remaining > 0:
+                # 再シード直後の検疫中: 受理・追従はするが劣化信頼度
+                # (≤0.35 < PID 異常解除の 0.5)+ probation=True で返し、
+                # 新アンカーが偽ソースだった場合に閉ループが即再有効化
+                # されるのを防ぐ(N フレーム連続受理で通常に戻る)
+                self.probation_remaining -= 1
+                in_probation = True
+                confidence = self._degraded_confidence(
+                    marker_count, tracking_valid, quality_weight,
+                    rigid_body_error)
+
         confidence = max(CONFIDENCE_FLOOR, min(1.0, confidence))
         self.last_confidence = confidence
 
@@ -308,6 +461,7 @@ class PositionFilter:
             "threshold": threshold,
             "tracking_valid": tracking_valid,
             "rigid_body_error": rigid_body_error,
+            "probation": in_probation,
         }
 
     def get_statistics(self) -> dict:
@@ -320,6 +474,7 @@ class PositionFilter:
             "outlier_rate": outlier_rate,
             "current_threshold": self.dynamic_threshold,
             "consecutive_outliers": self.consecutive_outliers,
+            "reseed_count": self.reseed_count,
             "estimated_velocity": self.estimated_velocity.tolist(),
             "last_confidence": self.last_confidence,
             "last_source": self.last_source,

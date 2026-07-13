@@ -13,7 +13,10 @@
     "outlier_threshold": 0.1,
     "velocity_window": 3,
     "enable_prediction": true,
-    "max_outlier_threshold": 0.4
+    "max_outlier_threshold": 0.4,
+    "max_consecutive_outliers": 50,
+    "max_prediction_s": 0.5,
+    "reseed_probation_frames": 10
   },
   "coordinate_transform": {
     "x": { "axis": "z", "sign": 1 },

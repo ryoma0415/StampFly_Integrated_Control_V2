@@ -232,6 +232,42 @@ class TestMultiStopAndFailsafe:
         assert len(relay.uplinks(0, proto.MsgType.CMD_STOP)) == 1
         assert len(relay.uplinks(1, proto.MsgType.CMD_STOP)) == 2
 
+    def test_start_rejects_invalid_mocap_data(self, multi_session):
+        """受信が新鮮でもデータ無効のスロットがあれば一斉開始を拒否する。"""
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        session.multi_target("drone 1", 0.5, 0.5, 0.4)
+        session.multi_target("drone 2", -0.5, -0.5, 0.4)
+        feed_fresh_mocap(session, clock)
+        # drone 2 のみトラッキング無効の新鮮ポーズ
+        slot2 = session.multi._slots[1]
+        slot2.controller.on_mocap_pose(
+            make_pose(z=0.0, t=clock(), tracking_valid=False))
+        assert session.multi_start() is False
+        # 有効ポーズ復帰で開始できる
+        slot2.controller.on_mocap_pose(make_pose(z=0.0, t=clock()))
+        assert session.multi_start() is True
+
+    def test_start_reseeds_slot_filters(self, multi_session):
+        """一斉開始で各スロットのフィルタを仕切り直す(単機 START と同じ)。"""
+        session, transport, clock, relay = self._armed_session(multi_session)
+        for slot in session.multi._slots:
+            assert slot.controller.position_filter.last_valid_position is None
+
+    def test_data_invalid_stops_only_affected_drone(self, multi_session):
+        """データ無効 >2s の機体にだけ CMD_STOP(受信は継続しているケース)。"""
+        session, transport, clock, relay = self._armed_session(multi_session)
+        slot1, slot2 = session.multi._slots
+        # drone 1 は有効、drone 2 は新鮮だがトラッキング無効のまま 2.2s
+        for _ in range(int(2.2 / 0.01)):
+            t = clock.advance(0.01)
+            slot1.controller.on_mocap_pose(make_pose(x=0.5, y=0.5, t=t))
+            slot2.controller.on_mocap_pose(
+                make_pose(x=-0.5, y=-0.5, t=t, tracking_valid=False))
+        session.multi.supervise(clock())
+        assert relay.uplinks(0, proto.MsgType.CMD_STOP) == []
+        assert len(relay.uplinks(1, proto.MsgType.CMD_STOP)) == 1
+
     def test_mocap_dropout_stops_only_affected_drone(self, multi_session):
         session, transport, clock, relay = self._armed_session(multi_session)
         # 両機 flying へ(TLM_STATE を MUX_DOWN で注入)

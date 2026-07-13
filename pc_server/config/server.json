@@ -48,6 +48,10 @@
   "failsafe": {
     "mocap_dropout_level_s": 0.3,
     "mocap_dropout_stop_s": 2.0,
+    "data_invalid_warn_s": 0.5,
+    "data_invalid_stop_s": 2.0,
+    "divergence_error_m": 1.0,
+    "divergence_hold_s": 1.0,
     "stop_ack_timeout_s": 0.6,
     "stop_max_retries": 3,
     "start_grace_s": 1.5,

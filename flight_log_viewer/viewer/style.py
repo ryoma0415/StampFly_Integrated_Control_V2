@@ -1,4 +1,4 @@
-"""ダークテーマの描画スタイル共通ヘルパー(旧 Drone_Log_Viewer 踏襲)。"""
+"""白背景ライトテーマの描画スタイル共通ヘルパー。"""
 
 from __future__ import annotations
 
@@ -10,24 +10,31 @@ jp_font.setup_japanese_font()
 
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .constants import AX_BG, FIG_BG, FIG_DPI, GRID_ALPHA, GRID_COLOR  # noqa: E402
+from .constants import (  # noqa: E402
+    AX_BG,
+    FIG_BG,
+    FIG_DPI,
+    GRID_ALPHA,
+    GRID_COLOR,
+    TEXT_COLOR,
+)
 
 
 def style_ax(ax) -> None:
-    """Axes をダークテーマに整える。"""
+    """Axes を白背景ライトテーマに整える。"""
     ax.set_facecolor(AX_BG)
-    ax.tick_params(colors="white", labelsize=9)
-    ax.title.set_color("white")
-    ax.xaxis.label.set_color("white")
-    ax.yaxis.label.set_color("white")
+    ax.tick_params(colors=TEXT_COLOR, labelsize=9)
+    ax.title.set_color(TEXT_COLOR)
+    ax.xaxis.label.set_color(TEXT_COLOR)
+    ax.yaxis.label.set_color(TEXT_COLOR)
     ax.grid(True, alpha=GRID_ALPHA, color=GRID_COLOR)
     for spine in ax.spines.values():
-        spine.set_edgecolor(GRID_COLOR)
+        spine.set_edgecolor(TEXT_COLOR)
 
 
 def new_fig(nrows: int = 1, ncols: int = 1, figsize: tuple[float, float] = (12.0, 5.0),
             sharex: bool = False, height_ratios: list[float] | None = None):
-    """ダーク背景の Figure と Axes(常に 2 次元でなく flatten 済み配列)を返す。"""
+    """白背景の Figure と Axes(常に 2 次元でなく flatten 済み配列)を返す。"""
     gridspec_kw = {"height_ratios": height_ratios} if height_ratios else None
     fig, axes = plt.subplots(
         nrows, ncols, figsize=figsize, dpi=FIG_DPI, sharex=sharex,
@@ -43,16 +50,17 @@ def new_fig(nrows: int = 1, ncols: int = 1, figsize: tuple[float, float] = (12.0
     return fig, axes
 
 
-def legend_dark(ax, **kwargs) -> None:
-    """ダークテーマ向けの凡例(白文字)。"""
+def styled_legend(ax, **kwargs) -> None:
+    """白背景ライトテーマ向けの凡例(白地に濃文字)。"""
     kwargs.setdefault("loc", "upper right")
     kwargs.setdefault("fontsize", 8)
-    kwargs.setdefault("framealpha", 0.6)
+    kwargs.setdefault("framealpha", 0.8)
     leg = ax.legend(**kwargs)
     if leg is not None:
         leg.get_frame().set_facecolor(AX_BG)
+        leg.get_frame().set_edgecolor("#cccccc")
         for text in leg.get_texts():
-            text.set_color("white")
+            text.set_color(TEXT_COLOR)
 
 
 def save_fig(fig, out_dir: Path, filename: str) -> Path:

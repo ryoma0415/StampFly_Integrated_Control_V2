@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from .constants import MULTI_DRONE_COLORS  # noqa: E402
 from .loader import FlightLog  # noqa: E402
 from .plots import generate_static_figures  # noqa: E402
-from .style import legend_dark, new_fig, save_fig  # noqa: E402
+from .style import styled_legend, new_fig, save_fig  # noqa: E402
 from .yaw_analysis import compute_yaw_stats, generate_yaw_figures  # noqa: E402
 
 MULTI_XY_FILENAME = "M01_multi_xy.png"
@@ -60,10 +60,10 @@ def fig_multi_xy(logs: list[FlightLog], out_dir: str | Path) -> Path | None:
             last = df.index[valid][-1]
             ax.scatter(df.at[first, "pos_x"], df.at[first, "pos_y"],
                        color=color, marker="o", s=90, zorder=5,
-                       edgecolors="white", linewidth=1.2)
+                       edgecolors="#111111", linewidth=1.2)
             ax.scatter(df.at[last, "pos_x"], df.at[last, "pos_y"],
                        color=color, marker="X", s=110, zorder=5,
-                       edgecolors="white", linewidth=1.2)
+                       edgecolors="#111111", linewidth=1.2)
         has_any = True
 
     if not has_any:
@@ -74,7 +74,7 @@ def fig_multi_xy(logs: list[FlightLog], out_dir: str | Path) -> Path | None:
     ax.set_xlabel("X [m]", fontsize=11)
     ax.set_ylabel("Y [m]", fontsize=11)
     ax.set_aspect("equal")
-    legend_dark(ax, ncol=2)
+    styled_legend(ax, ncol=2)
     return save_fig(fig, out_dir, MULTI_XY_FILENAME)
 
 

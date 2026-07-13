@@ -24,7 +24,7 @@ from .constants import (  # noqa: E402
     TLM_FLAG_LOW_VOLTAGE,
 )
 from .loader import FlightLog  # noqa: E402
-from .style import legend_dark, new_fig, save_fig  # noqa: E402
+from .style import styled_legend, new_fig, save_fig  # noqa: E402
 from .yaw_analysis import _SOURCE_INFO, compute_yaw_stats  # noqa: E402
 
 # 図キャプション(ファイル名 → 表示名)
@@ -220,19 +220,19 @@ def _summary_lines(summary: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 _HTML_STYLE = """
-body { background: #1e1e1e; color: #e5e7eb; font-family: 'Hiragino Sans',
+body { background: #ffffff; color: #1f2937; font-family: 'Hiragino Sans',
        'Noto Sans CJK JP', sans-serif; margin: 0; padding: 24px; }
-h1 { font-size: 1.4rem; border-bottom: 2px solid #3b82f6; padding-bottom: 8px; }
-h2 { font-size: 1.1rem; color: #93c5fd; margin-top: 28px; }
+h1 { font-size: 1.4rem; border-bottom: 2px solid #2563eb; padding-bottom: 8px; }
+h2 { font-size: 1.1rem; color: #1d4ed8; margin-top: 28px; }
 table { border-collapse: collapse; margin: 8px 0 16px; }
-th, td { border: 1px solid #4b5563; padding: 6px 12px; font-size: 0.85rem; }
-th { background: #374151; text-align: left; }
+th, td { border: 1px solid #d1d5db; padding: 6px 12px; font-size: 0.85rem; }
+th { background: #f3f4f6; text-align: left; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .figure { margin: 16px 0; }
-.figure img { max-width: 100%; border: 1px solid #4b5563; border-radius: 4px; }
-.figure .caption { color: #9ca3af; font-size: 0.85rem; margin: 4px 0; }
-.warn { color: #fbbf24; }
-.meta { color: #9ca3af; font-size: 0.8rem; }
+.figure img { max-width: 100%; border: 1px solid #d1d5db; border-radius: 4px; }
+.figure .caption { color: #6b7280; font-size: 0.85rem; margin: 4px 0; }
+.warn { color: #b45309; }
+.meta { color: #6b7280; font-size: 0.8rem; }
 """
 
 
@@ -427,7 +427,7 @@ def generate_multi_report(logs: list[FlightLog], out_dir: str | Path) -> Path:
             f"<td class='num'>{_fmt(summary['flight_time_s'], 1)}</td>"
             f"<td class='num'>{_fmt(summary['pos_rms_2d_m'], 3)}</td>"
             f"<td class='num'>{_fmt(_max_altitude_m(log), 2)}</td>"
-            f"<td><a href='{html.escape(link)}' style='color:#93c5fd'>"
+            f"<td><a href='{html.escape(link)}' style='color:#1d4ed8'>"
             f"機体別レポート</a></td></tr>")
     body.append("</table>")
 
@@ -477,7 +477,7 @@ def _fig_compare_yaw(log_a: FlightLog, log_b: FlightLog, out_dir: Path) -> Path 
     ax.set_title(f"ヨー誤差比較  A={log_a.name} / B={log_b.name}", fontsize=13)
     ax.set_xlabel("時間 [s]", fontsize=11)
     ax.set_ylabel("誤差 [deg]", fontsize=10)
-    legend_dark(ax, loc="best", ncol=2, fontsize=8)
+    styled_legend(ax, loc="best", ncol=2, fontsize=8)
     return save_fig(fig, out_dir, "compare_yaw_error.png")
 
 

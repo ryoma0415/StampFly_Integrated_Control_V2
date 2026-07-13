@@ -15,17 +15,26 @@ pc_server/data/exp_logs/explog_<YYYYMMDD_HHMMSS>.csv（≈25Hz）を読み、
     06_ff_status.png        ff_status（ff_mode + フラグビット）のタイムライン
 
 アニメーション（7枠レイアウト・スマホ動画同期）:
-    メニュー [2]/[3] または --animation で、全期間固定軸+移動カーソル方式の
-    MP4（1920x1080, libx264/yuv420p）を生成する。スマホ動画（正方形前提。
+    メニュー [2]/[3] または --animation で、時系列6枠をスクロール窓表示
+    （既定5秒幅・--window または対話メニューで 5〜60 秒に変更可。
+    x軸は常に現在時刻 t を中央にした [t-窓幅/2, t+窓幅/2]。線は時刻<=t の
+    履歴のみ描画し、右半分（未来）は常に空白。開始直後は左半分が負時間の
+    空白でドットだけが中央にあり、時間とともに履歴が左へ流れる。
+    y軸は全期間から固定）した MP4（1920x1080, libx264/yuv420p）を生成する。
+    各トレースには現在時刻の補間値位置に線と同色・黒フチの大きなドットを重畳
+    （常に x軸中央）。
+    スマホ動画（正方形前提。
     非正方形は中央クロップ）は「LED がマゼンタに変わった瞬間 = 計測開始(t_s=0)」
     でカット済みの前提で先頭から同期する。動画は
     ../pc_server/data/exp_logs/videos/ に置くと対話メニューから番号選択できる。
+    アニメ生成時は、同一レイアウトで全期間を俯瞰する静止画ボード
+    explog_<stem>_overview.png も同時出力する（--start/--end に関わらず全期間）。
 
 使い方:
     python plot_explog.py                    # 対話: [1]静止画 [2]アニメ(動画同期) [3]アニメ(動画なし)
     python plot_explog.py explog_xxx.csv [-o 出力ディレクトリ]      # 静止画（従来）
     python plot_explog.py explog_xxx.csv --animation                # アニメ（動画なし, 20fps）
-    python plot_explog.py explog_xxx.csv --video 動画.mp4 [--fps N] [--start S] [--end E]
+    python plot_explog.py explog_xxx.csv --video 動画.mp4 [--fps N] [--start S] [--end E] [--window W]
     引数を省略すると explog CSV を新しい順に一覧表示し、番号で1つ選ぶ
     （Enter=最新 / q=中止）。出力先は既定で data_analysis/graphs/explog_<stamp>/。
 
@@ -62,21 +71,21 @@ for _jp in ("Hiragino Sans", "Hiragino Maru Gothic Pro", "YuGothic", "Yu Gothic"
         break
 plt.rcParams["axes.unicode_minus"] = False
 
-# ダークテーマ
+# ライトテーマ（白背景）
 plt.rcParams.update({
-    "figure.facecolor": "#0f1117",
-    "savefig.facecolor": "#0f1117",
-    "axes.facecolor": "#151a23",
-    "axes.edgecolor": "#3a4152",
-    "axes.labelcolor": "#e6e9ef",
-    "axes.titlecolor": "#e6e9ef",
-    "text.color": "#e6e9ef",
-    "xtick.color": "#aab2c0",
-    "ytick.color": "#aab2c0",
-    "grid.color": "#3a4152",
-    "legend.facecolor": "#1c2230",
-    "legend.edgecolor": "#3a4152",
-    "legend.labelcolor": "#e6e9ef",
+    "figure.facecolor": "#ffffff",
+    "savefig.facecolor": "#ffffff",
+    "axes.facecolor": "#ffffff",
+    "axes.edgecolor": "#444444",
+    "axes.labelcolor": "#222222",
+    "axes.titlecolor": "#222222",
+    "text.color": "#222222",
+    "xtick.color": "#444444",
+    "ytick.color": "#444444",
+    "grid.color": "#999999",
+    "legend.facecolor": "#ffffff",
+    "legend.edgecolor": "#cccccc",
+    "legend.labelcolor": "#222222",
 })
 
 EXPLOG_GLOB = "explog_*.csv"
@@ -84,31 +93,31 @@ EXPLOG_GLOB = "explog_*.csv"
 # ヨー3系統（列名, 表示ラベル, 色）
 YAW_STREAMS = [
     ("yaw_gyro_int_deg", "ジャイロ積分", "#f59e0b"),
-    ("yaw_est_deg", "EKF推定 (FF+EKF)", "#38bdf8"),
-    ("yaw_madgwick_deg", "Madgwick", "#f472b6"),
+    ("yaw_est_deg", "EKF推定 (FF+EKF)", "#0284c7"),
+    ("yaw_madgwick_deg", "Madgwick", "#db2777"),
 ]
 
 # ffg（EKFゲート状態ビット, ファーム側 yaw_estimator_kf と一致）
 GATE_BITS = [
-    ("R膨張(soft)", "#fbbf24"),
+    ("R膨張(soft)", "#d97706"),
     ("NIS棄却", "#ef4444"),
     ("norm棄却", "#f97316"),
     ("z棄却", "#a855f7"),
-    ("tilt>25°", "#94a3b8"),
+    ("tilt>25°", "#64748b"),
     ("b_m凍結", "#dc2626"),
-    ("ドリフト警告", "#0ea5e9"),
-    ("再捕捉中", "#4ade80"),
+    ("ドリフト警告", "#0284c7"),
+    ("再捕捉中", "#16a34a"),
 ]
 
 # ff_status: 下位2bit = ff_mode(0=off,1=A,2=B)、bit2-6 = フラグ
 FF_MODE_MASK = 0x03
 FF_MODE_NAMES = {0: "off", 1: "A", 2: "B", 3: "?(3)"}
 FF_STATUS_FLAGS = [  # (bit, ラベル, 色)
-    (2, "est=EKF", "#38bdf8"),
-    (3, "アンカー有効", "#4ade80"),
-    (4, "FF係数ロード済", "#a78bfa"),
-    (5, "Yaw制御アクティブ", "#fb923c"),
-    (6, "磁気fresh", "#f472b6"),
+    (2, "est=EKF", "#0284c7"),
+    (3, "アンカー有効", "#16a34a"),
+    (4, "FF係数ロード済", "#7c3aed"),
+    (5, "Yaw制御アクティブ", "#ea580c"),
+    (6, "磁気fresh", "#db2777"),
 ]
 
 NIS_EXPECT = 2.0
@@ -340,7 +349,7 @@ def _motor_spans(ax, t: np.ndarray, on: np.ndarray) -> None:
 def _duty_panel(ax, t: np.ndarray, data: dict, on: np.ndarray) -> None:
     """下段共通: duty_cmd + ON区間帯。"""
     _motor_spans(ax, t, on)
-    ax.plot(t, col(data, "duty_cmd"), "-", lw=1.2, color="#aab2c0", label="duty_cmd")
+    ax.plot(t, col(data, "duty_cmd"), "-", lw=1.2, color="#475569", label="duty_cmd")
     ax.set_ylabel("duty")
     ax.set_xlabel("時間 [s]")
     ax.grid(alpha=0.3)
@@ -369,13 +378,13 @@ def fig01_yaw_comparison(data: dict, t: np.ndarray, on: np.ndarray,
         if idx.size:
             off = circ_mean_deg(wrap180(ye[idx] - ym[idx]))
             tw, yw = wrapped_plot_series(t, ym + off)
-            ax.plot(tw, yw, ":", lw=1.0, color="#4ade80", alpha=0.55,
+            ax.plot(tw, yw, ":", lw=1.0, color="#16a34a", alpha=0.75,
                     label="磁気方位(FF補正後, 開始点合わせ) [tilt>15°マスク]")
 
     yr = col(data, "yaw_ref_deg")
     if np.isfinite(yr).any():
         tw, yw = wrapped_plot_series(t, yr)
-        ax.plot(tw, yw, "--", lw=1.0, color="#e6e9ef", alpha=0.6, label="目標 yaw_ref")
+        ax.plot(tw, yw, "--", lw=1.0, color="#111111", alpha=0.6, label="目標 yaw_ref")
     ax.axhline(0, ls=":", lw=0.8, color="#6b7280")
     ax.set_ylim(-190, 190)
     ax.set_yticks(np.arange(-180, 181, 90))
@@ -452,14 +461,14 @@ def fig03_current_duty(data: dict, t: np.ndarray, on: np.ndarray,
     fig, (ax, ax2) = plt.subplots(
         2, 1, figsize=(13, 7), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     _motor_spans(ax, t, on)
-    ax.plot(t, col(data, "current_a"), "-", lw=1.3, color="#4ade80", label="総電流 [A]")
-    ax.set_ylabel("電流 [A]", color="#4ade80")
-    ax.tick_params(axis="y", labelcolor="#4ade80")
+    ax.plot(t, col(data, "current_a"), "-", lw=1.3, color="#16a34a", label="総電流 [A]")
+    ax.set_ylabel("電流 [A]", color="#16a34a")
+    ax.tick_params(axis="y", labelcolor="#16a34a")
     ax.grid(alpha=0.3)
     axv = ax.twinx()
-    axv.plot(t, col(data, "vbat_v"), "-", lw=1.2, color="#38bdf8", label="vbat [V]")
-    axv.set_ylabel("バッテリ電圧 [V]", color="#38bdf8")
-    axv.tick_params(axis="y", labelcolor="#38bdf8")
+    axv.plot(t, col(data, "vbat_v"), "-", lw=1.2, color="#0284c7", label="vbat [V]")
+    axv.set_ylabel("バッテリ電圧 [V]", color="#0284c7")
+    axv.tick_params(axis="y", labelcolor="#0284c7")
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = axv.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc="best", fontsize=8)
@@ -476,9 +485,9 @@ def fig04_mag_ff(data: dict, t: np.ndarray, on: np.ndarray,
         return False
     has_ff = usable(data, "db_hat_x_ut") or usable(data, "db_hat_y_ut")
     axes_spec = [
-        ("x", col(data, "bx_cal"), col(data, "db_hat_x_ut"), "#60a5fa"),
-        ("y", col(data, "by_cal"), col(data, "db_hat_y_ut"), "#4ade80"),
-        ("z", col(data, "bz_cal"), None, "#f87171"),  # FF は水平2軸のみ
+        ("x", col(data, "bx_cal"), col(data, "db_hat_x_ut"), "#2563eb"),
+        ("y", col(data, "by_cal"), col(data, "db_hat_y_ut"), "#16a34a"),
+        ("z", col(data, "bz_cal"), None, "#dc2626"),  # FF は水平2軸のみ
     ]
     fig, axarr = plt.subplots(3, 1, figsize=(13, 9.5), sharex=True)
     for ax, (a, bcal, dbh, color) in zip(axarr, axes_spec):
@@ -488,14 +497,14 @@ def fig04_mag_ff(data: dict, t: np.ndarray, on: np.ndarray,
         ax.plot(t, db, "-", lw=1.3, color=color,
                 label=f"Δb{a}_cal（開始基準 {base:.1f}µT からの変化）")
         if dbh is not None and np.isfinite(dbh).any():
-            ax.plot(t, dbh, "--", lw=1.3, color="#e6e9ef", alpha=0.85,
+            ax.plot(t, dbh, "--", lw=1.3, color="#111111", alpha=0.85,
                     label=f"db_hat_{a}（FF推定外乱）")
             resid = db - dbh
-            ax.plot(t, resid, "-", lw=1.0, color="#a78bfa", alpha=0.8,
+            ax.plot(t, resid, "-", lw=1.0, color="#7c3aed", alpha=0.8,
                     label=f"残差 Δb{a} − db_hat_{a}")
         elif a != "z":
             ax.text(0.01, 0.05, "db_hat 列なし/全欠損", transform=ax.transAxes,
-                    fontsize=8, color="#aab2c0")
+                    fontsize=8, color="#6b7280")
         ax.axhline(0, ls=":", lw=0.8, color="#6b7280")
         ax.set_ylabel(f"B_{a} [µT]")
         ax.grid(alpha=0.3)
@@ -522,12 +531,12 @@ def fig05_ekf_diagnostics(data: dict, t: np.ndarray, on: np.ndarray,
     if has_nis:
         nis = col(data, "nis")
         _motor_spans(ax, t, on)
-        ax.plot(t, nis, "-", lw=0.9, color="#0ea5e9", label="NIS")
-        ax.axhline(NIS_SOFT, ls="--", color="#f59e0b", lw=1,
+        ax.plot(t, nis, "-", lw=0.9, color="#0284c7", label="NIS")
+        ax.axhline(NIS_SOFT, ls="--", color="#d97706", lw=1,
                    label=f"χ²(2) 95%={NIS_SOFT}（R膨張）")
         ax.axhline(NIS_REJECT, ls="--", color="#ef4444", lw=1,
                    label=f"χ²(2) 99.9%={NIS_REJECT}（棄却）")
-        ax.axhline(NIS_EXPECT, ls=":", color="#aab2c0", lw=1,
+        ax.axhline(NIS_EXPECT, ls=":", color="#6b7280", lw=1,
                    label=f"期待値≈{NIS_EXPECT}")
         fin = nis[np.isfinite(nis)]
         top = np.percentile(fin, 99) if fin.size else 15.0
@@ -537,7 +546,7 @@ def fig05_ekf_diagnostics(data: dict, t: np.ndarray, on: np.ndarray,
         ax.legend(loc="upper right", fontsize=8, ncol=2)
     else:
         ax.text(0.5, 0.5, "nis 列なし/全欠損", ha="center", va="center",
-                transform=ax.transAxes, color="#aab2c0")
+                transform=ax.transAxes, color="#6b7280")
     ax.set_title("⑤ EKF健全性: NIS と ffg 8ゲート発火タイムライン" + tsuffix, fontsize=12)
 
     if has_ffg:
@@ -552,7 +561,7 @@ def fig05_ekf_diagnostics(data: dict, t: np.ndarray, on: np.ndarray,
         ax2.set_title("ゲート発火（帯 = そのゲートが立っている区間）", fontsize=10)
     else:
         ax2.text(0.5, 0.5, "ffg 列なし/全欠損", ha="center", va="center",
-                 transform=ax2.transAxes, color="#aab2c0")
+                 transform=ax2.transAxes, color="#6b7280")
     ax2.set_xlabel("時間 [s]")
     save_fig(fig, out, "05_ekf_diagnostics.png")
     return True
@@ -569,7 +578,7 @@ def fig06_ff_status(data: dict, t: np.ndarray, on: np.ndarray,
         2, 1, figsize=(13, 7), sharex=True, gridspec_kw={"height_ratios": [1, 2]})
 
     _motor_spans(ax, t, on)
-    ax.step(t, mode, where="post", lw=1.5, color="#38bdf8")
+    ax.step(t, mode, where="post", lw=1.5, color="#0284c7")
     ax.set_yticks(sorted(FF_MODE_NAMES.keys()))
     ax.set_yticklabels([f"{k}: {v}" for k, v in sorted(FF_MODE_NAMES.items())],
                        fontsize=8)
@@ -775,14 +784,23 @@ def write_summary(data: dict, t: np.ndarray, on: np.ndarray, path: Path,
 # ----------------------------------------------------------- animation --------
 # 7枠レイアウト（3行×4列）: 左2×2=①スマホ動画、右上②ヨー ③duty+電流、
 # 右中④磁場x ⑤磁場y、下段⑥b_m ⑦IMU温度（幅広）。
-# 全期間固定軸+移動カーソル方式: 背景（時系列全体）を一度だけ描画し、
-# フレーム毎はカーソル縦線・現在値テキスト・動画フレームのみ blit 更新する。
+# 時系列6枠はスクロール窓表示: x軸は常に現在時刻 t 中心の [t-窓幅/2, t+窓幅/2]
+# （開始直後は左半分が負時間の空白）。線は時刻<=t の履歴のみ描画し、右半分
+# （未来）は常に空白。y軸はログ全期間から初期化時に一度だけ固定。
+# xlim が毎フレーム変わるため blit は使わず、フレーム毎に Line2D の set_data
+# （窓スライス・右端は t）+ set_xlim + canvas 再描画を行う。全トレースに現在
+# 時刻の補間値位置を示すドット（線と同色・黒フチ・常に x軸中央）を重畳する
+# （overview には無し）。
+# アニメ生成時は全期間俯瞰の静止画ボード explog_<stem>_overview.png も同時出力。
 ANIM_FPS_NO_VIDEO = 20.0        # 動画なし時のフレームレート
 ANIM_FIGSIZE = (19.2, 10.8)     # 1920x1080 @ dpi100
 ANIM_DPI = 100
+ANIM_WINDOW_S = 5.0             # スクロール窓幅の既定 [s]（--window/対話で変更可）
+ANIM_WINDOW_MIN_S = 5.0
+ANIM_WINDOW_MAX_S = 60.0
 VIDEO_PANEL_MAX_PX = 720        # 動画フレームの縮小上限（正方形一辺）
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv")
-CURSOR_COLOR = "#f8fafc"
+TIME_TEXT_COLOR = "#111111"
 
 
 def videos_dir() -> Path:
@@ -870,6 +888,29 @@ def _interp_series(t: np.ndarray, v: np.ndarray,
     return np.interp(frame_times, t[fin], v[fin], left=np.nan, right=np.nan)
 
 
+def _dot_interp(tx: np.ndarray, ty: np.ndarray,
+                frame_times: np.ndarray) -> np.ndarray:
+    """現在位置ドット用の NaN 保存線形補間。
+
+    _interp_series と違い NaN を落とさない: 補間区間の端点いずれかが NaN なら
+    NaN（＝ドット非表示）。ヨーのラップ跨ぎに挿入した NaN 切断点を越えて
+    +179°→−179° を「0° 付近」と誤補間しないため。範囲外も NaN。
+    """
+    out = np.full(len(frame_times), np.nan)
+    if len(tx) < 2:
+        return out
+    idx = np.clip(np.searchsorted(tx, frame_times, side="right") - 1,
+                  0, len(tx) - 2)
+    t0, t1 = tx[idx], tx[idx + 1]
+    y0, y1 = ty[idx], ty[idx + 1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        frac = np.where(t1 > t0, (frame_times - t0) / (t1 - t0), 0.0)
+        val = y0 + frac * (y1 - y0)
+    ok = (frame_times >= tx[0]) & (frame_times <= tx[-1])
+    out[ok] = val[ok]
+    return out
+
+
 def _fmt_val(v: float, fmt: str = "{:+.1f}") -> str:
     return fmt.format(v) if np.isfinite(v) else "--"
 
@@ -891,42 +932,245 @@ def _window_ylim(ax, t: np.ndarray, arrays: list[np.ndarray],
     ax.set_ylim(lo - pad, hi + pad)
 
 
-def _anim_panel(ax, title: str, ylabel: str, t0: float, t1: float) -> dict:
-    """1枠の共通装飾 + 移動カーソル + 現在値テキスト（animated=True）を作る。"""
-    ax.set_xlim(t0, t1)
+def _value_textbox(ax):
+    """現在値テキストボックス（左上）を作る。"""
+    return ax.text(0.02, 0.965, "", transform=ax.transAxes, va="top", ha="left",
+                   fontsize=8, zorder=11,
+                   bbox=dict(facecolor="#ffffff", edgecolor="#444444",
+                             alpha=0.85, boxstyle="round,pad=0.25"))
+
+
+def _anim_panel(ax, title: str, ylabel: str, x0: float, x1: float,
+                with_text: bool) -> dict:
+    """1枠の共通装飾（+ 任意で現在値テキスト）を作り panel dict を返す。
+
+    panel dict:
+      ax    : xlim 更新に使う主軸
+      lines : (Line2D, t全体, y全体) のリスト。スクロール時に窓スライスを set_data
+      text  : 現在値テキスト（with_text=False では None）
+      fmt   : フレーム index → 現在値文字列
+    """
+    ax.set_xlim(x0, x1)
     ax.set_title(title, fontsize=10)
     ax.set_ylabel(ylabel, fontsize=9)
     ax.set_xlabel("時間 [s]", fontsize=8)
     ax.tick_params(labelsize=8)
     ax.grid(alpha=0.3)
-    cursor = ax.axvline(t0, color=CURSOR_COLOR, lw=1.1, alpha=0.9,
-                        zorder=10, animated=True)
-    text = ax.text(0.02, 0.965, "", transform=ax.transAxes, va="top", ha="left",
-                   fontsize=8, zorder=11, animated=True,
-                   bbox=dict(facecolor="#1c2230", edgecolor="#3a4152",
-                             alpha=0.85, boxstyle="round,pad=0.25"))
-    return {"ax": ax, "cursor": cursor, "text": text, "fmt": lambda i: ""}
+    text = _value_textbox(ax) if with_text else None
+    return {"ax": ax, "lines": [], "text": text, "fmt": lambda i: ""}
+
+
+def _panel_line(panel: dict, ax, tx: np.ndarray, ty: np.ndarray, **kw) -> None:
+    """panel に Line2D を1本追加し、スクロール set_data 用に全期間データを保持する。
+
+    t が NaN の点は searchsorted（窓スライス）で困るため落としておく。
+    """
+    tx = np.asarray(tx, dtype=float)
+    ty = np.asarray(ty, dtype=float)
+    fin_t = np.isfinite(tx)
+    tx, ty = tx[fin_t], ty[fin_t]
+    (line,) = ax.plot(tx, ty, **kw)
+    panel["lines"].append((line, tx, ty))
 
 
 def _legend_small(ax) -> None:
     ax.legend(loc="upper right", fontsize=7, framealpha=0.7)
 
 
+def _explog_stem(path: Path) -> str:
+    return path.stem[len("explog_"):] if path.stem.startswith("explog_") else path.stem
+
+
+def _build_board(path: Path, data: dict, t: np.ndarray, tsuffix: str,
+                 iv: dict[str, np.ndarray] | None,
+                 x0: float, x1: float, title_head: str):
+    """アニメ / 全期間俯瞰ボード共通の 3×4 ボード Figure を構築する。
+
+    時系列6枠の初期 xlim は [x0, x1]。y軸レンジは常にログ全期間の有限値から
+    一度だけ固定する（スクロール中にフレーム毎へ暴れない）。
+    iv=None（俯瞰ボード）では現在値テキスト・fmt を作らない。
+    ①動画枠の中身（動画フレーム / サムネ / 「動画なし」）は呼び出し側が設定する。
+    戻り値: (fig, ax_video, panels)
+    """
+    with_text = iv is not None
+    yl0 = float(np.nanmin(t))
+    yl1 = float(np.nanmax(t))
+
+    fig = plt.figure(figsize=ANIM_FIGSIZE, dpi=ANIM_DPI)
+    gs = fig.add_gridspec(3, 4, left=0.045, right=0.985, top=0.90, bottom=0.06,
+                          wspace=0.30, hspace=0.55,
+                          height_ratios=[1.0, 1.0, 0.9])
+    fig.suptitle(f"{title_head}: {path.name}"
+                 + (tsuffix.replace("\n", "   ") if tsuffix else ""),
+                 fontsize=13)
+
+    # ① スマホ動画（左2×2）
+    ax_video = fig.add_subplot(gs[0:2, 0:2])
+    ax_video.axis("off")
+
+    panels: list[dict] = []
+
+    # ② Yaw（±180ラップ + ラップ跨ぎ NaN 切断）
+    p = _anim_panel(fig.add_subplot(gs[0, 2]), "② ヨー（±180°ラップ）",
+                    "Yaw [deg]", x0, x1, with_text)
+    for key, lab, color in (("yaw_madgwick_deg", "Madgwick", "#db2777"),
+                            ("yaw_est_deg", "EKF推定", "#0284c7")):
+        if usable(data, key):
+            tw, yw = wrapped_plot_series(t, col(data, key))
+            _panel_line(p, p["ax"], tw, yw, ls="-", lw=1.1, color=color, label=lab)
+    p["ax"].set_ylim(-190, 190)
+    p["ax"].set_yticks(np.arange(-180, 181, 90))
+    _legend_small(p["ax"])
+    if iv is not None:
+        p["fmt"] = lambda i: (f"Mdg {_fmt_val(iv['yaw_madgwick_deg'][i])}° / "
+                              f"EKF {_fmt_val(iv['yaw_est_deg'][i])}°")
+    panels.append(p)
+
+    # ③ duty + 電流（twinx。x軸は共有なので set_xlim は主軸のみでよい）
+    ax3 = fig.add_subplot(gs[0, 3])
+    ax3.set_title("③ duty + 電流", fontsize=10)
+    ax3.set_xlabel("時間 [s]", fontsize=8)
+    ax3.set_ylabel("duty", fontsize=9, color="#475569")
+    ax3.tick_params(labelsize=8)
+    ax3.tick_params(axis="y", labelcolor="#475569")
+    ax3.grid(alpha=0.3)
+    ax3.set_xlim(x0, x1)
+    p3 = {"ax": ax3, "lines": [], "text": None, "fmt": lambda i: ""}
+    _panel_line(p3, ax3, t, col(data, "duty_cmd"), ls="-", lw=1.1,
+                color="#475569", label="duty_cmd")
+    _window_ylim(ax3, t, [col(data, "duty_cmd")], yl0, yl1)
+    ax3t = ax3.twinx()
+    _panel_line(p3, ax3t, t, col(data, "current_a"), ls="-", lw=1.1,
+                color="#16a34a", label="電流 [A]")
+    ax3t.set_ylabel("電流 [A]", fontsize=9, color="#16a34a")
+    ax3t.tick_params(labelsize=8, axis="y", labelcolor="#16a34a")
+    _window_ylim(ax3t, t, [col(data, "current_a")], yl0, yl1)
+    h1, l1 = ax3.get_legend_handles_labels()
+    h2, l2 = ax3t.get_legend_handles_labels()
+    ax3t.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=7, framealpha=0.7)
+    if iv is not None:
+        p3["text"] = _value_textbox(ax3t)  # 上に重なる twin 側に置く
+        p3["fmt"] = lambda i: (f"duty {_fmt_val(iv['duty_cmd'][i], '{:.3f}')} / "
+                               f"{_fmt_val(iv['current_a'][i], '{:.2f}')} A")
+    panels.append(p3)
+
+    # ④⑤ 磁場 x/y: b*_cal と FF補正後（b*_cal − db_hat_*）
+    for slot, axis_name, bkey, dkey, color in (
+            (gs[1, 2], "x", "bx_cal", "db_hat_x_ut", "#2563eb"),
+            (gs[1, 3], "y", "by_cal", "db_hat_y_ut", "#16a34a")):
+        num = "④" if axis_name == "x" else "⑤"
+        p = _anim_panel(fig.add_subplot(slot),
+                        f"{num} 磁場{axis_name}（校正済み と FF補正後）",
+                        f"B_{axis_name} [µT]", x0, x1, with_text)
+        bcal = col(data, bkey)
+        _panel_line(p, p["ax"], t, bcal, ls="-", lw=1.1, color=color, label=bkey)
+        has_ff = usable(data, dkey)
+        if has_ff:
+            bcorr = bcal - np.nan_to_num(col(data, dkey))
+            _panel_line(p, p["ax"], t, bcorr, ls="-", lw=1.1, color="#111111",
+                        alpha=0.85, label=f"{bkey} − db_hat_{axis_name}")
+            _window_ylim(p["ax"], t, [bcal, bcorr], yl0, yl1)
+        else:
+            _window_ylim(p["ax"], t, [bcal], yl0, yl1)
+        _legend_small(p["ax"])
+        if iv is not None:
+            def _fmt_mag(i, _b=bkey, _d=dkey, _has=has_ff):
+                raw = iv[_b][i]
+                if not _has:
+                    return f"cal {_fmt_val(raw)} µT"
+                corr = raw - (iv[_d][i] if np.isfinite(iv[_d][i]) else 0.0)
+                return f"cal {_fmt_val(raw)} / 補正後 {_fmt_val(corr)} µT"
+            p["fmt"] = _fmt_mag
+        panels.append(p)
+
+    # ⑥ b_m（EKF 磁気基準ベクトル水平2成分, 下段幅広）
+    p = _anim_panel(fig.add_subplot(gs[2, 0:2]), "⑥ b_m（EKF磁気基準・水平2成分）",
+                    "b_m [µT]", x0, x1, with_text)
+    for key, lab, color in (("bm_x_ut", "bm_x", "#7c3aed"),
+                            ("bm_y_ut", "bm_y", "#d97706")):
+        if usable(data, key):
+            _panel_line(p, p["ax"], t, col(data, key), ls="-", lw=1.1,
+                        color=color, label=lab)
+    _window_ylim(p["ax"], t, [col(data, "bm_x_ut"), col(data, "bm_y_ut")],
+                 yl0, yl1)
+    _legend_small(p["ax"])
+    if iv is not None:
+        p["fmt"] = lambda i: (f"x {_fmt_val(iv['bm_x_ut'][i])} / "
+                              f"y {_fmt_val(iv['bm_y_ut'][i])} µT")
+    panels.append(p)
+
+    # ⑦ IMU温度（下段幅広）
+    p = _anim_panel(fig.add_subplot(gs[2, 2:4]), "⑦ IMU温度", "温度 [°C]",
+                    x0, x1, with_text)
+    if usable(data, "imu_temp_c"):
+        _panel_line(p, p["ax"], t, col(data, "imu_temp_c"), ls="-", lw=1.1,
+                    color="#dc2626", label="imu_temp_c")
+        _window_ylim(p["ax"], t, [col(data, "imu_temp_c")], yl0, yl1)
+        _legend_small(p["ax"])
+    if iv is not None:
+        p["fmt"] = lambda i: f"{_fmt_val(iv['imu_temp_c'][i], '{:.1f}')} °C"
+    panels.append(p)
+
+    return fig, ax_video, panels
+
+
+def render_overview(path: Path, out: Path, data: dict, t: np.ndarray,
+                    tsuffix: str, video_path: Path | None) -> Path:
+    """全期間俯瞰の静止画ボード explog_<stem>_overview.png を出力する。
+
+    レイアウトはアニメと同一の 3×4 グリッド（1920x1080 相当）。時系列6枠は
+    --start/--end に関わらず常にログ全期間（カーソル・現在値ボックスなし）。
+    動画枠はスマホ動画の先頭フレーム（正方形クロップ）のサムネ固定表示。
+    動画なし経路では従来どおり「動画なし」表示。
+    """
+    x0 = float(np.nanmin(t))
+    x1 = float(np.nanmax(t))
+    fig, ax_video, _panels = _build_board(path, data, t, tsuffix, None, x0, x1,
+                                          "Experiment 全期間俯瞰ボード")
+    if video_path is not None:
+        reader = _VideoReader(video_path)
+        first = reader.frame_at(0)
+        reader.release()
+        if first is None:
+            sys.exit("動画の最初のフレームを読み込めませんでした。")
+        ax_video.imshow(first)
+        ax_video.set_title("① スマホ動画（先頭フレームのサムネイル）", fontsize=10)
+    else:
+        ax_video.set_title("① スマホ動画", fontsize=10)
+        ax_video.text(0.5, 0.5, "動画なし\n（--video または メニュー[2] で同期合成）",
+                      transform=ax_video.transAxes, ha="center", va="center",
+                      fontsize=13, color="#6b7280")
+    out_path = out / f"explog_{_explog_stem(path)}_overview.png"
+    fig.savefig(out_path)  # figure dpi のまま保存 = 1920x1080
+    plt.close(fig)
+    print(f"全期間俯瞰ボード出力: {out_path}")
+    return out_path
+
+
 def render_animation(path: Path, out: Path, data: dict, t: np.ndarray,
                      tsuffix: str, video_path: Path | None,
                      fps_arg: float | None, start_s: float | None,
-                     end_s: float | None) -> None:
-    """全期間固定軸+移動カーソル方式の 7枠アニメ MP4 を生成する。
+                     end_s: float | None, window_s: float | None) -> None:
+    """スクロール窓方式の 7枠アニメ MP4 を生成する。
 
     同期規約: 「LED がマゼンタに変わった瞬間 = 計測開始(t_s=0) = 動画のカット位置」。
     動画あり時は出力 fps=動画 fps（既定30）、長さ=min(動画, ログ, --end)。
     データ(≈23.5Hz)は各フレーム時刻へ線形補間して現在値表示に使う。
+    時系列6枠は x軸を常に現在時刻 t 中心の [t-窓幅/2, t+窓幅/2] とし、
+    線は時刻<=t の履歴のみ描画（右半分=未来は常に空白。開始直後は左半分が
+    負時間の空白）。y軸はログ全期間から固定。
+    全トレースに現在時刻の補間値位置ドット（線と同色・黒フチ・常に x軸中央・
+    NaN 時非表示）を重畳。
+    xlim が毎フレーム変わるため blit は使わず、フレーム毎に Line2D の
+    set_data（窓スライス・右端は t）+ ドット set_data + set_xlim +
+    canvas 再描画を行う。
     """
     _require_ffmpeg()
 
     t_end_log = float(np.nanmax(t))
     t0 = max(0.0, float(start_s)) if start_s is not None else 0.0
     t1 = min(t_end_log, float(end_s)) if end_s is not None else t_end_log
+    window = float(window_s) if window_s is not None else ANIM_WINDOW_S
 
     reader: _VideoReader | None = None
     if video_path is not None:
@@ -953,145 +1197,51 @@ def render_animation(path: Path, out: Path, data: dict, t: np.ndarray,
         iv[name] = wrap180(_interp_series(t, unwrap_deg(col(data, name)),
                                           frame_times))
 
-    # --- Figure / 7枠レイアウト ---
-    fig = plt.figure(figsize=ANIM_FIGSIZE, dpi=ANIM_DPI)
-    gs = fig.add_gridspec(3, 4, left=0.045, right=0.985, top=0.90, bottom=0.06,
-                          wspace=0.30, hspace=0.55,
-                          height_ratios=[1.0, 1.0, 0.9])
-    fig.suptitle(f"Experiment 計測アニメーション: {path.name}"
-                 + (tsuffix.replace("\n", "   ") if tsuffix else ""),
-                 fontsize=13)
+    # --- Figure / 7枠レイアウト（初期 xlim = 現在時刻 t0 中心の窓） ---
+    half = window / 2.0
+    fig, ax_video, panels = _build_board(path, data, t, tsuffix, iv,
+                                         t0 - half, t0 + half,
+                                         "Experiment 計測アニメーション")
     time_text = fig.text(0.985, 0.975, "", ha="right", va="top", fontsize=12,
-                         color=CURSOR_COLOR, animated=True)
+                         color=TIME_TEXT_COLOR)
+
+    # --- 現在位置ドット（全トレース。線と同色・黒フチ・自軸に描画） ---
+    # panel["lines"] を (line, tx, ty, dot_vals, dot) の5要素に拡張する。
+    # dot_vals は各フレーム時刻の NaN 保存補間値（NaN のフレームは非表示）。
+    # twinx（電流）は line.axes が twin 側なのでドットも自分の軸に載る。
+    for pnl in panels:
+        dotted = []
+        for line, tx, ty in pnl["lines"]:
+            dot_vals = _dot_interp(tx, ty, frame_times)
+            (dot,) = line.axes.plot([], [], marker="o", ls="", ms=9,
+                                    color=line.get_color(), mec="#111111",
+                                    mew=1.2, zorder=10)
+            dotted.append((line, tx, ty, dot_vals, dot))
+        pnl["lines"] = dotted
 
     # ① スマホ動画（左2×2）
-    ax_video = fig.add_subplot(gs[0:2, 0:2])
     ax_video.set_title("① スマホ動画（LEDマゼンタ点灯=計測開始 t=0 でカット済み前提）",
                        fontsize=10)
-    ax_video.axis("off")
     im_video = None
     if reader is not None:
         first = reader.frame_at(int(round(t0 * reader.fps)))
         if first is None:
             sys.exit("動画の最初のフレームを読み込めませんでした。")
-        im_video = ax_video.imshow(first, animated=True)
+        im_video = ax_video.imshow(first)
     else:
         ax_video.text(0.5, 0.5, "動画なし\n（--video または メニュー[2] で同期合成）",
                       transform=ax_video.transAxes, ha="center", va="center",
                       fontsize=13, color="#6b7280")
 
-    panels: list[dict] = []
-
-    # ② Yaw（±180ラップ + ラップ跨ぎ NaN 切断）
-    p = _anim_panel(fig.add_subplot(gs[0, 2]), "② ヨー（±180°ラップ）",
-                    "Yaw [deg]", t0, t1)
-    for key, lab, color in (("yaw_madgwick_deg", "Madgwick", "#f472b6"),
-                            ("yaw_est_deg", "EKF推定", "#38bdf8")):
-        if usable(data, key):
-            tw, yw = wrapped_plot_series(t, col(data, key))
-            p["ax"].plot(tw, yw, "-", lw=1.1, color=color, label=lab)
-    p["ax"].set_ylim(-190, 190)
-    p["ax"].set_yticks(np.arange(-180, 181, 90))
-    _legend_small(p["ax"])
-    p["fmt"] = lambda i: (f"Mdg {_fmt_val(iv['yaw_madgwick_deg'][i])}° / "
-                          f"EKF {_fmt_val(iv['yaw_est_deg'][i])}°")
-    panels.append(p)
-
-    # ③ duty + 電流（twinx。カーソル/テキストは上に重なる twin 側）
-    ax3 = fig.add_subplot(gs[0, 3])
-    ax3.set_title("③ duty + 電流", fontsize=10)
-    ax3.set_xlabel("時間 [s]", fontsize=8)
-    ax3.set_ylabel("duty", fontsize=9, color="#aab2c0")
-    ax3.tick_params(labelsize=8)
-    ax3.tick_params(axis="y", labelcolor="#aab2c0")
-    ax3.grid(alpha=0.3)
-    ax3.set_xlim(t0, t1)
-    ax3.plot(t, col(data, "duty_cmd"), "-", lw=1.1, color="#aab2c0",
-             label="duty_cmd")
-    _window_ylim(ax3, t, [col(data, "duty_cmd")], t0, t1)
-    ax3t = ax3.twinx()
-    ax3t.plot(t, col(data, "current_a"), "-", lw=1.1, color="#4ade80",
-              label="電流 [A]")
-    ax3t.set_ylabel("電流 [A]", fontsize=9, color="#4ade80")
-    ax3t.tick_params(labelsize=8, axis="y", labelcolor="#4ade80")
-    _window_ylim(ax3t, t, [col(data, "current_a")], t0, t1)
-    h1, l1 = ax3.get_legend_handles_labels()
-    h2, l2 = ax3t.get_legend_handles_labels()
-    ax3t.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=7, framealpha=0.7)
-    cursor3 = ax3t.axvline(t0, color=CURSOR_COLOR, lw=1.1, alpha=0.9,
-                           zorder=10, animated=True)
-    text3 = ax3t.text(0.02, 0.965, "", transform=ax3t.transAxes, va="top",
-                      ha="left", fontsize=8, zorder=11, animated=True,
-                      bbox=dict(facecolor="#1c2230", edgecolor="#3a4152",
-                                alpha=0.85, boxstyle="round,pad=0.25"))
-    panels.append({"ax": ax3t, "cursor": cursor3, "text": text3,
-                   "fmt": lambda i: (f"duty {_fmt_val(iv['duty_cmd'][i], '{:.3f}')} / "
-                                     f"{_fmt_val(iv['current_a'][i], '{:.2f}')} A")})
-
-    # ④⑤ 磁場 x/y: b*_cal と FF補正後（b*_cal − db_hat_*）
-    for slot, axis_name, bkey, dkey, color in (
-            (gs[1, 2], "x", "bx_cal", "db_hat_x_ut", "#60a5fa"),
-            (gs[1, 3], "y", "by_cal", "db_hat_y_ut", "#4ade80")):
-        num = "④" if axis_name == "x" else "⑤"
-        p = _anim_panel(fig.add_subplot(slot),
-                        f"{num} 磁場{axis_name}（校正済み と FF補正後）",
-                        f"B_{axis_name} [µT]", t0, t1)
-        bcal = col(data, bkey)
-        p["ax"].plot(t, bcal, "-", lw=1.1, color=color, label=bkey)
-        has_ff = usable(data, dkey)
-        if has_ff:
-            bcorr = bcal - np.nan_to_num(col(data, dkey))
-            p["ax"].plot(t, bcorr, "-", lw=1.1, color="#e6e9ef", alpha=0.85,
-                         label=f"{bkey} − db_hat_{axis_name}")
-            _window_ylim(p["ax"], t, [bcal, bcorr], t0, t1)
-        else:
-            _window_ylim(p["ax"], t, [bcal], t0, t1)
-        _legend_small(p["ax"])
-
-        def _fmt_mag(i, _b=bkey, _d=dkey, _has=has_ff):
-            raw = iv[_b][i]
-            if not _has:
-                return f"cal {_fmt_val(raw)} µT"
-            corr = raw - (iv[_d][i] if np.isfinite(iv[_d][i]) else 0.0)
-            return f"cal {_fmt_val(raw)} / 補正後 {_fmt_val(corr)} µT"
-        p["fmt"] = _fmt_mag
-        panels.append(p)
-
-    # ⑥ b_m（EKF 磁気基準ベクトル水平2成分, 下段幅広）
-    p = _anim_panel(fig.add_subplot(gs[2, 0:2]), "⑥ b_m（EKF磁気基準・水平2成分）",
-                    "b_m [µT]", t0, t1)
-    for key, lab, color in (("bm_x_ut", "bm_x", "#a78bfa"),
-                            ("bm_y_ut", "bm_y", "#fbbf24")):
-        if usable(data, key):
-            p["ax"].plot(t, col(data, key), "-", lw=1.1, color=color, label=lab)
-    _window_ylim(p["ax"], t, [col(data, "bm_x_ut"), col(data, "bm_y_ut")], t0, t1)
-    _legend_small(p["ax"])
-    p["fmt"] = lambda i: (f"x {_fmt_val(iv['bm_x_ut'][i])} / "
-                          f"y {_fmt_val(iv['bm_y_ut'][i])} µT")
-    panels.append(p)
-
-    # ⑦ IMU温度（下段幅広）
-    p = _anim_panel(fig.add_subplot(gs[2, 2:4]), "⑦ IMU温度", "温度 [°C]", t0, t1)
-    if usable(data, "imu_temp_c"):
-        p["ax"].plot(t, col(data, "imu_temp_c"), "-", lw=1.1, color="#f87171",
-                     label="imu_temp_c")
-        _window_ylim(p["ax"], t, [col(data, "imu_temp_c")], t0, t1)
-        _legend_small(p["ax"])
-    p["fmt"] = lambda i: f"{_fmt_val(iv['imu_temp_c'][i], '{:.1f}')} °C"
-    panels.append(p)
-
-    # --- 背景を一度だけ描画 → フレーム毎は動的 Artist のみ blit ---
     canvas = fig.canvas
-    canvas.draw()  # animated=True の Artist は背景に含まれない
-    background = canvas.copy_from_bbox(fig.bbox)
+    canvas.draw()
     w_px, h_px = canvas.get_width_height()
 
-    stem = path.stem[len("explog_"):] if path.stem.startswith("explog_") else path.stem
-    out_name = (f"explog_{stem}_animation"
+    out_name = (f"explog_{_explog_stem(path)}_animation"
                 + ("_with_video" if reader is not None else "") + ".mp4")
     out_path = out / out_name
     print(f"\nアニメーション生成: {n_frames}フレーム @ {fps:.2f}fps "
-          f"({t0:.1f}–{t1:.1f}s, {w_px}x{h_px}) → {out_path}")
+          f"({t0:.1f}–{t1:.1f}s, 窓幅 {window:.1f}s, {w_px}x{h_px}) → {out_path}")
 
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w_px}x{h_px}",
@@ -1103,20 +1253,30 @@ def render_animation(path: Path, out: Path, data: dict, t: np.ndarray,
     last_pct = -10
     try:
         for i, tf in enumerate(frame_times):
-            canvas.restore_region(background)
+            # スクロール窓: 常に現在時刻 tf 中心の [tf-窓幅/2, tf+窓幅/2]
+            # （開始直後は左半分が負時間の空白）
+            wl = tf - half
+            wr = tf + half
+            for pnl in panels:
+                pnl["ax"].set_xlim(wl, wr)  # twinx は x 軸共有のため主軸のみでよい
+                for line, tx, ty, dot_vals, dot in pnl["lines"]:
+                    i0 = max(int(np.searchsorted(tx, wl)) - 1, 0)
+                    # 右端は現在時刻 tf: 未来（tf より先）の線は描かない
+                    i1 = int(np.searchsorted(tx, tf, side="right"))
+                    line.set_data(tx[i0:i1], ty[i0:i1])
+                    v = dot_vals[i]
+                    if np.isfinite(v):
+                        dot.set_data([tf], [v])
+                    else:
+                        dot.set_data([], [])  # NaN のときは非表示
+                if pnl["text"] is not None:
+                    pnl["text"].set_text(pnl["fmt"](i))
             if im_video is not None and reader is not None:
                 frame = reader.frame_at(int(round(tf * reader.fps)))
                 if frame is not None:
                     im_video.set_data(frame)
-                ax_video.draw_artist(im_video)
-            for pnl in panels:
-                pnl["cursor"].set_xdata([tf, tf])
-                pnl["text"].set_text(pnl["fmt"](i))
-                pnl["ax"].draw_artist(pnl["cursor"])
-                pnl["ax"].draw_artist(pnl["text"])
             time_text.set_text(f"t = {tf:6.2f} s")
-            fig.draw_artist(time_text)
-            canvas.blit(fig.bbox)
+            canvas.draw()
             proc.stdin.write(bytes(canvas.buffer_rgba()))
             pct = int(100 * (i + 1) / n_frames)
             if pct >= last_pct + 10:
@@ -1254,6 +1414,34 @@ def choose_video() -> Path | None:
         print(f"  '{raw}' は番号でも既存ファイルでもありません。")
 
 
+def choose_window() -> float | None:
+    """スクロール窓幅 [s] を対話入力する。None は中止。
+
+    Enter（および EOF）は既定 ANIM_WINDOW_S。範囲外・非数値は再入力。
+    """
+    while True:
+        try:
+            raw = input(f"ウィンドウ幅(秒)を入力 (Enter={ANIM_WINDOW_S:.0f}, "
+                        f"{ANIM_WINDOW_MIN_S:.0f}〜{ANIM_WINDOW_MAX_S:.0f}, "
+                        f"q で中止): ").strip()
+        except EOFError:
+            print(f"（対話入力なし → 既定 {ANIM_WINDOW_S:.0f} 秒）")
+            return ANIM_WINDOW_S
+        if raw == "":
+            return ANIM_WINDOW_S
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        try:
+            v = float(raw)
+        except ValueError:
+            print(f"  '{raw}' は数値ではありません。")
+            continue
+        if ANIM_WINDOW_MIN_S <= v <= ANIM_WINDOW_MAX_S:
+            return v
+        print(f"  {ANIM_WINDOW_MIN_S:.0f}〜{ANIM_WINDOW_MAX_S:.0f} 秒の範囲で"
+              f"入力してください: {raw}")
+
+
 def default_out_dir(path: Path) -> Path:
     """既定の出力先: data_analysis/graphs/explog_<stamp>/。"""
     stem = path.stem
@@ -1281,21 +1469,32 @@ def main() -> None:
                     help="アニメ開始時刻 [s]（ログ時間軸基準, 既定0）")
     ap.add_argument("--end", type=float, metavar="S",
                     help="アニメ終了時刻 [s]（既定: ログ末尾。動画があれば min も取る）")
+    ap.add_argument("--window", type=float, metavar="W",
+                    help=f"アニメ時系列のスクロール窓幅 [s]"
+                         f"（既定 {ANIM_WINDOW_S:.0f}、"
+                         f"{ANIM_WINDOW_MIN_S:.0f}〜{ANIM_WINDOW_MAX_S:.0f}）")
     args = ap.parse_args()
+
+    if args.window is not None and not (ANIM_WINDOW_MIN_S <= args.window
+                                        <= ANIM_WINDOW_MAX_S):
+        sys.exit(f"--window は {ANIM_WINDOW_MIN_S:.0f}〜{ANIM_WINDOW_MAX_S:.0f} 秒"
+                 f"の範囲で指定してください: {args.window}")
 
     # --- モード決定（CLI フラグ優先。引数なしは対話メニュー） ---
     video_path = Path(args.video).expanduser() if args.video else None
+    interactive = False
     if args.animation or video_path is not None:
         mode = "anim_video" if video_path is not None else "anim_only"
     elif args.explog:
         mode = "static"  # 従来の CLI 挙動を維持
     else:
+        interactive = True
         mode = choose_mode()
         if mode is None:
             sys.exit("中止しました。")
     if mode == "static" and (args.fps or args.start is not None
-                             or args.end is not None):
-        print("警告: --fps/--start/--end はアニメ専用のため無視します"
+                             or args.end is not None or args.window is not None):
+        print("警告: --fps/--start/--end/--window はアニメ専用のため無視します"
               "（--animation を付けてください）。")
 
     if args.explog:
@@ -1317,6 +1516,14 @@ def main() -> None:
     if video_path is not None and not video_path.is_file():
         sys.exit(f"動画ファイルが見つかりません: {video_path}")
 
+    # 対話メニュー[2][3]では CSV（と動画）選択の後に窓幅を質問する
+    # （--window 指定時はそれを優先し質問しない）
+    window_s = args.window
+    if interactive and mode in ("anim_video", "anim_only") and window_s is None:
+        window_s = choose_window()
+        if window_s is None:
+            sys.exit("中止しました（窓幅が選択されていません）。")
+
     out = Path(args.out) if args.out else default_out_dir(path)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -1335,8 +1542,9 @@ def main() -> None:
         print(f"FF状態: {ffl}")
 
     if mode in ("anim_video", "anim_only"):
+        render_overview(path, out, data, t, tsuffix, video_path)
         render_animation(path, out, data, t, tsuffix, video_path,
-                         args.fps, args.start, args.end)
+                         args.fps, args.start, args.end, window_s)
         return
 
     n_figs = 0

@@ -89,14 +89,14 @@ TLM_FLAG_FLYING = 1 << 2        # 飛行中
 # tlm_ffg(EKF ゲート状態ビット。yaw 側 yaw_estimator_kf.hpp と一致)
 # (表示名, 説明, 描画色) を bit0 から順に並べる
 FFG_GATE_BITS: tuple[tuple[str, str, str], ...] = (
-    ("R膨張(soft)", "NIS>5.99 / norm 8-20µT → R膨張して採用", "#fbbf24"),
+    ("R膨張(soft)", "NIS>5.99 / norm 8-20µT → R膨張して採用", "#d97706"),
     ("NIS棄却", "NIS>13.8 → 磁気更新スキップ→ジャイロ滑走", "#ef4444"),
     ("norm棄却", "|‖B_corr‖−‖B0‖|>20µT → スキップ", "#f97316"),
     ("z棄却", "|B_corr.z−B0.z|>12µT → スキップ", "#a855f7"),
     ("tilt>25°", "傾き過大 → スキップ", "#64748b"),
     ("b_m凍結", "‖b_m‖>20µT → 磁気更新凍結(要再アンカー)", "#dc2626"),
     ("ドリフト警告", "|db_m/dt|>0.3µT/s 10s継続", "#0ea5e9"),
-    ("再捕捉中", "NIS棄却5s超継続 → Δψ≤3°/更新の制限付き更新で引き込み中", "#4ade80"),
+    ("再捕捉中", "NIS棄却5s超継続 → Δψ≤3°/更新の制限付き更新で引き込み中", "#22c55e"),
 )
 
 # tlm_ff_status(プロトコル v2 TLM_STATE offset134)のビット
@@ -128,11 +128,12 @@ LOW_VOLTAGE_THRESHOLD_V = 3.34   # 機体の低電圧判定 [V]
 LOOP_DT_NOMINAL_US = 2500.0      # 400Hz 制御ループの公称周期 [µs]
 
 # ---------------------------------------------------------------------------
-# 描画スタイル(旧 Drone_Log_Viewer のダークテーマを踏襲)
+# 描画スタイル(白背景ライトテーマ)
 # ---------------------------------------------------------------------------
 
-FIG_BG = "#1e1e1e"   # Figure 背景色
-AX_BG = "#2e2e2e"    # Axes 背景色
+FIG_BG = "#ffffff"   # Figure 背景色(白)
+AX_BG = "#ffffff"    # Axes 背景色(白)
+TEXT_COLOR = "#222222"  # 文字・軸ラベル色(濃色)
 GRID_COLOR = "gray"
 GRID_ALPHA = 0.3
 FIG_DPI = 150        # 静止画の解像度
@@ -140,50 +141,50 @@ ANIM_DPI = 100       # アニメーションの解像度
 
 COLORS: dict[str, str] = {
     # PID 成分
-    "p": "#FF6B6B",
-    "i": "#4ECDC4",
-    "d": "#95E77E",
+    "p": "#dc2626",
+    "i": "#0d9488",
+    "d": "#16a34a",
     # 軌跡・位置
     "trajectory": "#3498db",
     "raw_trajectory": "#7f8c8d",
-    "target": "#f1c40f",
-    "start": "#2ecc71",
+    "target": "#ca8a04",
+    "start": "#16a34a",
     "end": "#e74c3c",
     "current_pos": "#e74c3c",
     # 姿勢(指令 vs 実測)
-    "cmd_roll": "#FF6B6B",
-    "cmd_pitch": "#4ECDC4",
-    "meas_roll": "#F1C40F",
+    "cmd_roll": "#dc2626",
+    "cmd_pitch": "#0d9488",
+    "meas_roll": "#ca8a04",
     "meas_pitch": "#9B59B6",
     # ヨー4系統
-    "yaw_madgwick": "#f1c40f",   # Madgwick(tlm_yaw_rad)
+    "yaw_madgwick": "#ca8a04",   # Madgwick(tlm_yaw_rad)
     "yaw_ekf": "#e74c3c",        # EKF(tlm_yaw_est_rad)
     "yaw_gyro": "#3498db",       # ジャイロ積算(tlm_yaw_gyro_int_rad)
-    "yaw_mocap": "#2ecc71",      # MoCap 真値(mocap_yaw_deg)
-    "yaw_cmd": "#ffffff",        # PC ヨー指令(cmd_yaw_ref)
-    "yaw_ref_applied": "#fb923c",  # 機体適用ヨー目標(tlm_yaw_ref_rad)
+    "yaw_mocap": "#16a34a",      # MoCap 真値(mocap_yaw_deg)
+    "yaw_cmd": "#111111",        # PC ヨー指令(cmd_yaw_ref)
+    "yaw_ref_applied": "#ea580c",  # 機体適用ヨー目標(tlm_yaw_ref_rad)
     # 高度
-    "alt_ref": "#ffffff",
-    "alt_tof": "#94a3b8",
-    "alt_est": "#38bdf8",
+    "alt_ref": "#111111",
+    "alt_tof": "#64748b",
+    "alt_est": "#0284c7",
     # duty(FL/FR/RL/RR)
-    "duty_fl": "#FF6B6B",
-    "duty_fr": "#4ECDC4",
-    "duty_rl": "#95E77E",
-    "duty_rr": "#c084fc",
+    "duty_fl": "#dc2626",
+    "duty_fr": "#0d9488",
+    "duty_rl": "#16a34a",
+    "duty_rr": "#9333ea",
     # 電源
-    "voltage": "#0ea5e9",
+    "voltage": "#0284c7",
     "current": "#f97316",
     # 診断
-    "nis": "#0ea5e9",
+    "nis": "#0284c7",
     "bm_x": "#2563eb",
     "bm_y": "#16a34a",
     "bm_norm": "#7c3aed",
-    "dbhat_x": "#fbbf24",
-    "dbhat_y": "#f472b6",
-    "latency": "#38bdf8",
-    "loop_dt": "#f59e0b",
-    "marker": "#2ECC71",
+    "dbhat_x": "#d97706",
+    "dbhat_y": "#db2777",
+    "latency": "#0284c7",
+    "loop_dt": "#d97706",
+    "marker": "#16a34a",
 }
 
 # 複数機同時制御(multi)の機体別カラー(最大4機。M01 共有 XY 図などで
@@ -191,8 +192,8 @@ COLORS: dict[str, str] = {
 MULTI_DRONE_COLORS: tuple[str, ...] = (
     "#3498db",  # 機体1: 青(trajectory と同系)
     "#e74c3c",  # 機体2: 赤
-    "#2ecc71",  # 機体3: 緑
-    "#f1c40f",  # 機体4: 黄
+    "#16a34a",  # 機体3: 緑
+    "#ca8a04",  # 機体4: 黄(白背景で読める濃色の黄)
 )
 
 # ヨー4系統の (キー名, 列名(rad or deg), 表示名, 色, 単位が deg か)

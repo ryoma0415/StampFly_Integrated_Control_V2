@@ -36,7 +36,7 @@ from .loader import (  # noqa: E402
     unwrap_deg,
     wrapped_plot_series,
 )
-from .style import legend_dark, new_fig, save_fig  # noqa: E402
+from .style import styled_legend, new_fig, save_fig  # noqa: E402
 
 # 系統キー → (表示名, 色) の索引
 _SOURCE_INFO: dict[str, tuple[str, str]] = {
@@ -180,7 +180,7 @@ def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
                 label="ヨー指令(PC)")
     ax.set_title("ヨー4系統比較(アンラップ)", fontsize=14)
     ax.set_ylabel("ヨー角 [deg](連続)", fontsize=10)
-    legend_dark(ax, ncol=2)
+    styled_legend(ax, ncol=2)
 
     ax = axes[1]
     for key, label, color in available:
@@ -193,7 +193,7 @@ def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_ylim(-185.0, 185.0)
     ax.set_ylabel("ヨー角 [deg](±180)", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
-    legend_dark(ax, ncol=2)
+    styled_legend(ax, ncol=2)
     return save_fig(fig, out_dir, "10_yaw_four_sources.png")
 
 
@@ -222,14 +222,14 @@ def _fig_yaw_error(log: FlightLog, out_dir: Path, stats: dict) -> Path | None:
     # 飛行区間を淡く表示
     flying = log.flying_mask()
     if flying.any():
-        ax.fill_between(t, *ax.get_ylim(), where=flying, color="#ffffff",
-                        alpha=0.05, step="mid", label="飛行区間")
+        ax.fill_between(t, *ax.get_ylim(), where=flying, color="#64748b",
+                        alpha=0.12, step="mid", label="飛行区間")
 
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.6)
     ax.set_title(f"ヨー誤差(基準: {ref_label})", fontsize=14)
     ax.set_xlabel("時間 [s]", fontsize=11)
     ax.set_ylabel("誤差 [deg](±180 ラップ)", fontsize=10)
-    legend_dark(ax, loc="best", fontsize=9)
+    styled_legend(ax, loc="best", fontsize=9)
     return save_fig(fig, out_dir, "11_yaw_error.png")
 
 
@@ -258,7 +258,7 @@ def _fig_ekf_diagnostics(log: FlightLog, out_dir: Path) -> Path | None:
         ax.set_ylim(0, max(NIS_REJECT_THRESHOLD * 1.1, float(top) * 1.2))
     ax.set_title("EKF 診断: NIS(観測整合度)", fontsize=13)
     ax.set_ylabel("NIS", fontsize=10)
-    legend_dark(ax, ncol=2)
+    styled_legend(ax, ncol=2)
 
     # b_m
     ax = axes[1]
@@ -273,7 +273,7 @@ def _fig_ekf_diagnostics(log: FlightLog, out_dir: Path) -> Path | None:
                    label=f"凍結しきい値 {BM_FREEZE_THRESHOLD_UT:.0f}µT")
     ax.set_ylabel("b_m [µT]", fontsize=10)
     ax.set_title("EKF 磁気バイアス状態 b_m", fontsize=12)
-    legend_dark(ax, ncol=2)
+    styled_legend(ax, ncol=2)
 
     # db_hat(FF 補正ベクトル)
     ax = axes[2]
@@ -286,7 +286,7 @@ def _fig_ekf_diagnostics(log: FlightLog, out_dir: Path) -> Path | None:
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("db̂ [µT]", fontsize=10)
     ax.set_title("FF 磁気補正ベクトル db̂(電流起因外乱の補正量)", fontsize=12)
-    legend_dark(ax)
+    styled_legend(ax)
 
     # ffg ゲートラスタ
     ax = axes[3]
@@ -321,7 +321,7 @@ def _fig_ff_status(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_yticklabels(["0: off", "1: A", "2: B"], fontsize=8)
     ax.set_ylim(-0.3, 2.3)
     ax.set_title("ff_status タイムライン", fontsize=14)
-    legend_dark(ax)
+    styled_legend(ax)
 
     ax = axes[1]
     for row, (name, bit, color) in enumerate(FF_STATUS_FLAG_BITS):
@@ -361,10 +361,10 @@ def _fig_yaw_tracking(log: FlightLog, out_dir: Path, stats: dict) -> Path | None
         on = df["yaw_ctrl_on"].to_numpy(dtype=float) > 0
         if on.any():
             ax.fill_between(t, *ax.get_ylim(), where=on, color="#f59e0b",
-                            alpha=0.08, step="mid", label="ヨー制御 ON 区間")
+                            alpha=0.15, step="mid", label="ヨー制御 ON 区間")
     ax.set_title("ヨー指令追従", fontsize=14)
     ax.set_ylabel("ヨー角 [deg]", fontsize=10)
-    legend_dark(ax, loc="best")
+    styled_legend(ax, loc="best")
 
     ax = axes[1]
     if "yaw_track_err_deg" in df.columns and df["yaw_track_err_deg"].notna().any():
@@ -372,12 +372,12 @@ def _fig_yaw_tracking(log: FlightLog, out_dir: Path, stats: dict) -> Path | None
         if math.isfinite(stats.get("tracking_rms_deg", math.nan)):
             label += (f"  RMS={stats['tracking_rms_deg']:.2f}°"
                       f"  最大={stats['tracking_max_deg']:.2f}°")
-        ax.plot(t, df["yaw_track_err_deg"], color="#f87171", linewidth=0.9,
+        ax.plot(t, df["yaw_track_err_deg"], color="#dc2626", linewidth=0.9,
                 label=label)
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.6)
     ax.set_ylabel("誤差 [deg]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
-    legend_dark(ax, loc="best")
+    styled_legend(ax, loc="best")
     return save_fig(fig, out_dir, "14_yaw_tracking.png")
 
 

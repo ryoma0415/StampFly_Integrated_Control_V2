@@ -35,6 +35,7 @@ from .constants import (  # noqa: E402
     GRID_ALPHA,
     GRID_COLOR,
     MULTI_DRONE_COLORS,
+    TEXT_COLOR,
     YAW_SOURCES,
 )
 from .loader import FlightLog, wrapped_plot_series  # noqa: E402
@@ -201,24 +202,25 @@ def _interpolate_to_frames(df: pd.DataFrame, frame_times: np.ndarray) -> pd.Data
 
 def _style_ax(ax) -> None:
     ax.set_facecolor(AX_BG)
-    ax.tick_params(colors="white", labelsize=8)
-    ax.title.set_color("white")
-    ax.xaxis.label.set_color("white")
-    ax.yaxis.label.set_color("white")
+    ax.tick_params(colors=TEXT_COLOR, labelsize=8)
+    ax.title.set_color(TEXT_COLOR)
+    ax.xaxis.label.set_color(TEXT_COLOR)
+    ax.yaxis.label.set_color(TEXT_COLOR)
     ax.grid(True, alpha=GRID_ALPHA, color=GRID_COLOR)
     for spine in ax.spines.values():
-        spine.set_edgecolor(GRID_COLOR)
+        spine.set_edgecolor(TEXT_COLOR)
 
 
 def _legend(ax, **kwargs) -> None:
     kwargs.setdefault("loc", "upper right")
     kwargs.setdefault("fontsize", 7)
-    kwargs.setdefault("framealpha", 0.6)
+    kwargs.setdefault("framealpha", 0.8)
     leg = ax.legend(**kwargs)
     if leg is not None:
         leg.get_frame().set_facecolor(AX_BG)
+        leg.get_frame().set_edgecolor("#cccccc")
         for text in leg.get_texts():
-            text.set_color("white")
+            text.set_color(TEXT_COLOR)
 
 
 def _build_ts_panel(ax, df: pd.DataFrame, ylabel: str,
@@ -293,7 +295,7 @@ class _AnimationBuilder:
         # --- パネル1: 動画(あれば)/ XY 大画面(なければ) ---
         self.ax_main = self.fig.add_subplot(gs[0:2, 0:2])
         if video_frames:
-            self.ax_main.set_title("ドローン飛行映像", fontsize=13, color="white")
+            self.ax_main.set_title("ドローン飛行映像", fontsize=13, color=TEXT_COLOR)
             self.ax_main.axis("off")
             self.im_video = self.ax_main.imshow(video_frames[0])
             self.ax_xy = self.fig.add_subplot(gs[0, 2])
@@ -318,7 +320,7 @@ class _AnimationBuilder:
                 label="軌跡")
             (self.pt_current,) = self.ax_xy.plot(
                 [], [], marker="o", markersize=10, color=COLORS["current_pos"],
-                markeredgecolor="white", linestyle="none", label="現在位置")
+                markeredgecolor="#111111", linestyle="none", label="現在位置")
             x = self.df["pos_x"].to_numpy(dtype=float)
             y = self.df["pos_y"].to_numpy(dtype=float)
             if np.isfinite(x).any():
@@ -399,7 +401,7 @@ class _AnimationBuilder:
             (self.ax_duty, self.duty_lines),
             (self.ax_yaw_err, self.yaw_err_lines),
         )
-        self.title = self.fig.suptitle("", fontsize=13, color="white")
+        self.title = self.fig.suptitle("", fontsize=13, color=TEXT_COLOR)
 
     def _make_ts_panel(self, ax, ylabel: str,
                        specs: tuple[tuple[str, str, str, str], ...],
@@ -572,7 +574,7 @@ class _MultiAnimationBuilder:
                     label=f"{name} 軌跡")
                 (point,) = self.ax_xy.plot(
                     [], [], marker="o", markersize=11, color=color,
-                    markeredgecolor="white", linestyle="none")
+                    markeredgecolor="#111111", linestyle="none")
                 all_x.append(df["pos_x"].to_numpy(dtype=float))
                 all_y.append(df["pos_y"].to_numpy(dtype=float))
             self.xy_artists.append((has_pos, trail, point, df))
@@ -617,7 +619,7 @@ class _MultiAnimationBuilder:
 
             self.ts_panels += [(ax_alt, alt_lines), (ax_yaw, yaw_lines)]
 
-        self.title = self.fig.suptitle("", fontsize=13, color="white")
+        self.title = self.fig.suptitle("", fontsize=13, color=TEXT_COLOR)
         self._names = " / ".join(
             (log.drone_name or log.name) for log in logs)
 

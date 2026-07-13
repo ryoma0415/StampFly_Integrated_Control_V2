@@ -393,15 +393,23 @@ def _make_plots(profile: dict, internals: dict, name: str) -> None:
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    vec_pts = [(0.0, 0.0)]  # annotate/text は autoscale に反映されないため軸範囲を自前で決める
     for m in core.MOTORS:
         am = profile["method_b"]["a_m"][m]
         ax.annotate("", xy=(am[0], am[1]), xytext=(0, 0),
                     arrowprops=dict(arrowstyle="->", color="C0"))
         ax.text(am[0], am[1], f" {m}", fontsize=10)
+        vec_pts.append((am[0], am[1]))
     ab = profile["method_b"]["a_bar"]
     ax.annotate("", xy=(ab[0], ab[1]), xytext=(0, 0),
                 arrowprops=dict(arrowstyle="->", color="C3", lw=2))
     ax.text(ab[0], ab[1], " mean", color="C3", fontsize=10)
+    vec_pts.append((ab[0], ab[1]))
+    vp = np.asarray(vec_pts, dtype=float)
+    pad_x = 0.15 * max(float(np.ptp(vp[:, 0])), 1e-6)
+    pad_y = 0.15 * max(float(np.ptp(vp[:, 1])), 1e-6)
+    ax.set_xlim(vp[:, 0].min() - pad_x, vp[:, 0].max() + pad_x)
+    ax.set_ylim(vp[:, 1].min() - pad_y, vp[:, 1].max() + pad_y)
     ax.set_xlabel("a_x [uT/A]")
     ax.set_ylabel("a_y [uT/A]")
     ax.grid(alpha=0.3)

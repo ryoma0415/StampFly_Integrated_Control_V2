@@ -26,18 +26,19 @@ from .constants import (  # noqa: E402
     GRID_COLOR,
     LOOP_DT_NOMINAL_US,
     LOW_VOLTAGE_THRESHOLD_V,
+    TEXT_COLOR,
 )
 from .loader import FlightLog  # noqa: E402
-from .style import legend_dark, new_fig, save_fig  # noqa: E402
+from .style import styled_legend, new_fig, save_fig  # noqa: E402
 
 
 def _style_time_colorbar(fig, ax, norm, cmap, **kwargs):
-    """plasma 時間カラーバーをダークテーマで付ける。"""
+    """plasma 時間カラーバーを白背景ライトテーマで付ける。"""
     cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, **kwargs)
-    cbar.set_label("時間 [s]", color="white", fontsize=10)
-    cbar.ax.yaxis.set_tick_params(color="white")
+    cbar.set_label("時間 [s]", color=TEXT_COLOR, fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color=TEXT_COLOR)
     for label in cbar.ax.yaxis.get_ticklabels():
-        label.set_color("white")
+        label.set_color(TEXT_COLOR)
     cbar.outline.set_edgecolor(GRID_COLOR)
     return cbar
 
@@ -65,15 +66,15 @@ def _fig_xy_trajectory(log: FlightLog, out_dir: Path) -> Path | None:
         first = df.index[valid][0]
         last = df.index[valid][-1]
         ax.scatter(df.at[first, "pos_x"], df.at[first, "pos_y"], color=COLORS["start"],
-                   s=110, zorder=5, edgecolors="white", linewidth=1.5, label="開始位置")
+                   s=110, zorder=5, edgecolors="#111111", linewidth=1.5, label="開始位置")
         ax.scatter(df.at[last, "pos_x"], df.at[last, "pos_y"], color=COLORS["end"],
-                   s=110, zorder=5, edgecolors="white", linewidth=1.5, label="終了位置")
+                   s=110, zorder=5, edgecolors="#111111", linewidth=1.5, label="終了位置")
 
     ax.set_title("XY 飛行軌跡と目標", fontsize=14)
     ax.set_xlabel("X [m]", fontsize=11)
     ax.set_ylabel("Y [m]", fontsize=11)
     ax.set_aspect("equal")
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "01_xy_trajectory.png")
 
 
@@ -90,14 +91,14 @@ def _fig_attitude(log: FlightLog, out_dir: Path) -> Path | None:
         (axes[1], "Pitch", "pitch_ref_deg", "tlm_pitch_deg", COLORS["meas_pitch"]),
     ):
         if log.has(ref_col):
-            ax.plot(t, df[ref_col], color="#AAAAAA", linewidth=1.0, alpha=0.8,
+            ax.plot(t, df[ref_col], color="#666666", linewidth=1.0, alpha=0.8,
                     label=f"{axis_label} 指令")
         if log.has(meas_col):
             ax.plot(t, df[meas_col], color=meas_color, linewidth=1.0, alpha=0.9,
                     label=f"{axis_label} 実測(AHRS)")
         ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
         ax.set_ylabel("角度 [deg]", fontsize=10)
-        legend_dark(ax)
+        styled_legend(ax)
 
     axes[0].set_title("姿勢: 指令 vs 実測", fontsize=14)
     axes[-1].set_xlabel("時間 [s]", fontsize=11)
@@ -125,7 +126,7 @@ def _fig_altitude(log: FlightLog, out_dir: Path) -> Path | None:
                 alpha=0.9, label="推定高度")
     ax.set_title("高度", fontsize=14)
     ax.set_ylabel("高度 [m]", fontsize=10)
-    legend_dark(ax)
+    styled_legend(ax)
 
     ax = axes[1]
     if log.has("tlm_alt_velocity_m_s"):
@@ -137,7 +138,7 @@ def _fig_altitude(log: FlightLog, out_dir: Path) -> Path | None:
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("速度 [m/s]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "03_altitude.png")
 
 
@@ -158,17 +159,17 @@ def _fig_position_tracking(log: FlightLog, out_dir: Path) -> Path | None:
         ax.plot(t, df[pos_col], color=COLORS["trajectory"], linewidth=1.0,
                 alpha=0.9, label=f"実測 {axis_label}")
         ax.set_ylabel(f"{axis_label} [m]", fontsize=10)
-        legend_dark(ax)
+        styled_legend(ax)
 
     ax = axes[2]
     if log.has("error_x"):
-        ax.plot(t, df["error_x"], color="#FF6B6B", linewidth=1.0, alpha=0.9, label="誤差 X")
+        ax.plot(t, df["error_x"], color="#dc2626", linewidth=1.0, alpha=0.9, label="誤差 X")
     if log.has("error_y"):
-        ax.plot(t, df["error_y"], color="#4ECDC4", linewidth=1.0, alpha=0.9, label="誤差 Y")
+        ax.plot(t, df["error_y"], color="#0d9488", linewidth=1.0, alpha=0.9, label="誤差 Y")
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("誤差 [m]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
-    legend_dark(ax)
+    styled_legend(ax)
 
     axes[0].set_title("位置追従(目標 vs 実測)", fontsize=14)
     return save_fig(fig, out_dir, "04_position_tracking.png")
@@ -190,7 +191,7 @@ def _fig_pid(log: FlightLog, out_dir: Path) -> Path | None:
                         label=label)
         ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
         ax.set_ylabel(f"{axis_label} 出力", fontsize=10)
-        legend_dark(ax)
+        styled_legend(ax)
 
     axes[0].set_title("XY PID 成分", fontsize=14)
     axes[-1].set_xlabel("時間 [s]", fontsize=11)
@@ -217,7 +218,7 @@ def _fig_duty(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_xlabel("時間 [s]", fontsize=11)
     ax.set_ylabel("duty (0-1)", fontsize=11)
     ax.set_ylim(bottom=0)
-    legend_dark(ax, ncol=4)
+    styled_legend(ax, ncol=4)
     return save_fig(fig, out_dir, "06_duty.png")
 
 
@@ -237,7 +238,7 @@ def _fig_power(log: FlightLog, out_dir: Path) -> Path | None:
                    alpha=0.8, label=f"低電圧しきい値 {LOW_VOLTAGE_THRESHOLD_V}V")
     ax.set_title("電源(電圧 / 電流)", fontsize=14)
     ax.set_ylabel("電圧 [V]", fontsize=10)
-    legend_dark(ax)
+    styled_legend(ax)
 
     ax = axes[1]
     if log.has("tlm_current_a"):
@@ -245,7 +246,7 @@ def _fig_power(log: FlightLog, out_dir: Path) -> Path | None:
                 alpha=0.9, label="総電流(INA3221, 20Hz)")
     ax.set_ylabel("電流 [A]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "07_power.png")
 
 
@@ -264,7 +265,7 @@ def _fig_latency(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_title("通信レイテンシ / 制御周期", fontsize=14)
     ax.set_ylabel("レイテンシ [ms]", fontsize=10)
     ax.set_ylim(bottom=0)
-    legend_dark(ax)
+    styled_legend(ax)
 
     ax = axes[1]
     if log.has("tlm_loop_dt_us"):
@@ -274,7 +275,7 @@ def _fig_latency(log: FlightLog, out_dir: Path) -> Path | None:
                    label=f"公称 {LOOP_DT_NOMINAL_US:.0f}µs (400Hz)")
     ax.set_ylabel("loop_dt [µs]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "08_latency_loop_dt.png")
 
 
@@ -294,19 +295,19 @@ def _fig_mocap_diag(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_title("MoCap 診断", fontsize=14)
     ax.set_ylabel("マーカー数", fontsize=10)
     ax.set_ylim(bottom=0)
-    legend_dark(ax)
+    styled_legend(ax)
 
     ax = axes[1]
     if log.has("frame_dt_ms"):
-        ax.plot(t, df["frame_dt_ms"], color="#94a3b8", linewidth=0.7, alpha=0.8,
+        ax.plot(t, df["frame_dt_ms"], color="#64748b", linewidth=0.7, alpha=0.8,
                 label="フレーム間隔")
     if log.has("mocap_age_ms"):
-        ax.plot(t, df["mocap_age_ms"], color="#f472b6", linewidth=0.7, alpha=0.8,
+        ax.plot(t, df["mocap_age_ms"], color="#db2777", linewidth=0.7, alpha=0.8,
                 label="pose 鮮度")
     ax.set_ylabel("[ms]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
     ax.set_ylim(bottom=0)
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "09_mocap_diagnostics.png")
 
 
@@ -336,7 +337,7 @@ def _fig_xyz_3d(log: FlightLog, out_dir: Path) -> Path | None:
     pane_rgba = mcolors.to_rgba(AX_BG)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.set_pane_color(pane_rgba)
-    ax.tick_params(colors="white", labelsize=9)
+    ax.tick_params(colors=TEXT_COLOR, labelsize=9)
     ax.grid(True, alpha=GRID_ALPHA, color=GRID_COLOR)
 
     cmap = plt.get_cmap("plasma")
@@ -347,9 +348,9 @@ def _fig_xyz_3d(log: FlightLog, out_dir: Path) -> Path | None:
     ax.scatter(x, y, z, c=t, cmap=cmap, norm=norm, s=8, alpha=0.9,
                depthshade=False)
     ax.scatter(x[:1], y[:1], z[:1], color=COLORS["start"], s=80,
-               edgecolors="white", linewidth=1.2, label="開始位置")
+               edgecolors="#111111", linewidth=1.2, label="開始位置")
     ax.scatter(x[-1:], y[-1:], z[-1:], color=COLORS["end"], s=80,
-               edgecolors="white", linewidth=1.2, label="終了位置")
+               edgecolors="#111111", linewidth=1.2, label="終了位置")
 
     # 等スケール(最大レンジの立方体に合わせる)
     half = max(float(np.ptp(x)), float(np.ptp(y)), float(np.ptp(z)), 0.2) / 2.0
@@ -358,12 +359,12 @@ def _fig_xyz_3d(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_zlim((z.max() + z.min()) / 2 - half, (z.max() + z.min()) / 2 + half)
     ax.view_init(elev=25, azim=-60)
 
-    ax.set_title("3D 飛行軌跡(時間カラー)", color="white", fontsize=14, pad=12)
-    ax.set_xlabel("X [m]", color="white", fontsize=10)
-    ax.set_ylabel("Y [m]", color="white", fontsize=10)
-    ax.set_zlabel("Z [m]", color="white", fontsize=10)
+    ax.set_title("3D 飛行軌跡(時間カラー)", color=TEXT_COLOR, fontsize=14, pad=12)
+    ax.set_xlabel("X [m]", color=TEXT_COLOR, fontsize=10)
+    ax.set_ylabel("Y [m]", color=TEXT_COLOR, fontsize=10)
+    ax.set_zlabel("Z [m]", color=TEXT_COLOR, fontsize=10)
     _style_time_colorbar(fig, ax, norm, cmap, pad=0.12, shrink=0.7)
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "15_xyz_3d.png")
 
 
@@ -390,16 +391,16 @@ def _fig_xy_time(log: FlightLog, out_dir: Path) -> Path | None:
         ax.plot(df["target_x"], df["target_y"], color=COLORS["target"],
                 linewidth=1.0, linestyle="--", alpha=0.7, label="目標軌道")
     ax.scatter(x[:1], y[:1], color=COLORS["start"], s=110, zorder=5,
-               edgecolors="white", linewidth=1.5, label="開始位置")
+               edgecolors="#111111", linewidth=1.5, label="開始位置")
     ax.scatter(x[-1:], y[-1:], color=COLORS["end"], s=110, zorder=5,
-               edgecolors="white", linewidth=1.5, label="終了位置")
+               edgecolors="#111111", linewidth=1.5, label="終了位置")
 
     ax.set_title("XY 軌跡(時間カラー)", fontsize=14)
     ax.set_xlabel("X [m]", fontsize=11)
     ax.set_ylabel("Y [m]", fontsize=11)
     ax.set_aspect("equal")
     _style_time_colorbar(fig, ax, norm, cmap, pad=0.02)
-    legend_dark(ax)
+    styled_legend(ax)
     return save_fig(fig, out_dir, "16_xy_time.png")
 
 
@@ -424,14 +425,14 @@ def _fig_cmd_echo(log: FlightLog, out_dir: Path) -> Path | None:
 
     for ax, (axis_label, ref_col, echo_col, echo_color) in zip(axes, pairs):
         if log.has(ref_col):
-            ax.plot(t, df[ref_col], color="#AAAAAA", linewidth=1.0, alpha=0.85,
+            ax.plot(t, df[ref_col], color="#666666", linewidth=1.0, alpha=0.85,
                     label=f"{axis_label} 送信指令(PC)")
         if log.has(echo_col):
             ax.plot(t, df[echo_col], color=echo_color, linewidth=1.0, alpha=0.9,
                     label=f"{axis_label} 機体適用エコー")
         ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
         ax.set_ylabel(f"{axis_label} [deg]", fontsize=10)
-        legend_dark(ax)
+        styled_legend(ax)
 
     axes[0].set_title("指令エコー: 送信指令 vs 機体適用", fontsize=14)
     axes[-1].set_xlabel("時間 [s]", fontsize=11)

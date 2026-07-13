@@ -192,7 +192,7 @@ flight_log_viewer/
 │   ├── multi_plots.py    # Multi 用: 共有 XY 図(M01)+機体別図一式
 │   ├── animation.py      # 7 パネルアニメーション(動画同期はオプション)+複数機アニメーション
 │   ├── report.py         # サマリ / HTML / 2 ログ比較 / Multi レポート
-│   ├── style.py          # ダークテーマ描画ヘルパー
+│   ├── style.py          # 白背景ライトテーマ描画ヘルパー
 │   └── jp_font.py        # 日本語フォント自動選択(Hiragino Sans 等)
 ├── tests/make_dummy_log.py  # 100 列ダミーログ生成(単機 2 本+Multi 2 機グループ)
 └── output/               # 生成物(gitignore 済)

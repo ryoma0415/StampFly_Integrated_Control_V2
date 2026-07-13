@@ -17,14 +17,20 @@
     ΔB_all と一致するか（線形重ね合わせ）を検証する。対角ペア run があれば
     該当2機の和とも比較。比較図（軸別 上段: 測定/予測, 下段: 残差±3σ）に加え、
     判定サマリを PNG（00_verdict_summary.png）としても出力する。
+    シーケンスが単機4本のみ（多機 run なし）の場合は、csv_dir 内の
+    別取得の全機/対角ペアスイープ（sweep_*_meta.json, aborted=false）を
+    候補一覧から対話選択して比較する（Enter=同姿勢で時刻最近傍の1本）。
+    --target で対象を明示すれば対話質問なしで実行できる（バッチ向け）。
 
 使い方:
     python plot_sweep.py                        # 対話: メニュー → ファイル番号選択
-    python plot_sweep.py <path> [-o 出力先] [--results-dir dir]
+    python plot_sweep.py <path> [-o 出力先] [--results-dir dir] [--target stem]...
         <path> は sweep_*_samples.csv（→スイープ解析）または
         sequence_*_meta.json（→加算性検証）。拡張子/名前で自動判別する。
     --results-dir はファイル一覧の探索先 / シーケンスの samples CSV の
         ディレクトリ（既定: ../pc_server/data/sweep_results/）。
+    --target は加算性検証の比較対象（多機スイープの stem または
+        samples.csv パス。複数指定可）。
 
 出力先の既定:
     data_analysis/graphs/sweep_<stamp>/          （スイープ解析）
@@ -40,6 +46,7 @@ import json
 import math
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -50,8 +57,22 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3d projection)
 
-# ダークテーマ（style 適用後にフォントを設定する: style がフォントを上書きするため）
-plt.style.use("dark_background")
+# ライトテーマ（白背景）。matplotlib 既定の白背景をベースに、文字・軸を濃色に統一する。
+plt.rcParams.update({
+    "figure.facecolor": "#ffffff",
+    "savefig.facecolor": "#ffffff",
+    "axes.facecolor": "#ffffff",
+    "axes.edgecolor": "#444444",
+    "axes.labelcolor": "#222222",
+    "axes.titlecolor": "#222222",
+    "text.color": "#222222",
+    "xtick.color": "#444444",
+    "ytick.color": "#444444",
+    "grid.color": "#999999",
+    "legend.facecolor": "#ffffff",
+    "legend.edgecolor": "#cccccc",
+    "legend.labelcolor": "#222222",
+})
 
 # 日本語フォント（macOS優先）。見つからなければ既定フォントのまま（英字は問題なし）。
 _INSTALLED = {f.name for f in fm.fontManager.ttflist}
@@ -70,6 +91,9 @@ FLIGHT_DUTY_HI = 0.8
 SINGLES = ("FL", "FR", "RL", "RR")          # 単機 run のモーター名
 NOISE_SIGMA = 4.0                            # 判定: 最大|残差| ≤ max(4σ, 下限)
 NOISE_FLOOR_UT = 0.5                         # 判定しきい値の下限 [µT]（分解能スケール）
+
+# 加算性の比較対象になれる多機構成（全機 / 対角ペア）
+ALLOWED_MULTI = (frozenset(SINGLES), frozenset({"FL", "RR"}), frozenset({"FR", "RL"}))
 
 SWEEP_GLOB = "sweep_*_samples.csv"
 SEQ_GLOB = "sequence_*_meta.json"
@@ -168,7 +192,7 @@ def save_fig(fig, out: Path, name: str) -> None:
     fig.tight_layout()
     if _COND_FOOTER:
         fig.text(0.5, -0.005, _COND_FOOTER, ha="center", va="top",
-                 fontsize=8, color="lightgray")
+                 fontsize=8, color="#555555")
     fig.savefig(out / name, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
@@ -445,7 +469,7 @@ def _scatter_dB_vs_I(axarr, data, pdm, idle, dB0, band=None):
     mean_I = np.array([pdm[d]["I"] for d in duties])
     for i, a in enumerate(AXES):
         ax = axarr[i]
-        ax.scatter(cur, dB[:, i], s=6, alpha=0.3, color="silver", label="サンプル")
+        ax.scatter(cur, dB[:, i], s=6, alpha=0.3, color="gray", label="サンプル")
         mean_dB = np.array([pdm[d]["dB"][i] for d in duties])
         ax.scatter(mean_I, mean_dB, s=55, color="tab:red", zorder=5, label="duty平均")
         if band is None and np.isfinite(idle):
@@ -594,7 +618,7 @@ def fig7_baseline_drift_3d(pdb: dict, out: Path, seq: list[dict] | None = None) 
     ax = fig.add_subplot(111, projection="3d")
     sc = ax.scatter(diffs[:, 0], diffs[:, 1], diffs[:, 2], c=color, cmap="viridis", s=60)
     ax.plot(diffs[:, 0], diffs[:, 1], diffs[:, 2], color="gray", lw=0.8, alpha=0.6)
-    ax.scatter([0], [0], [0], color="white", marker="x", s=80, label="初期 base")
+    ax.scatter([0], [0], [0], color="#111111", marker="x", s=80, label="初期 base")
     ax.set_xlabel("Δx [µT]"); ax.set_ylabel("Δy [µT]"); ax.set_zlabel("Δz [µT]")
     ax.set_title(title)
     fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1, label=clabel); ax.legend(fontsize=8)
@@ -769,7 +793,7 @@ def fig11_sample_level_fit(sf: dict, pdm, idle, dB0, out: Path) -> None:
         xs, ys = _fit_points(pdm, idle, dB0, i, duties, include_duty0=True)
         da, db_, dr2 = fit_line(xs, ys)
         ax = axarr[0, i]
-        ax.scatter(cur, f["y"], s=6, alpha=0.3, color="silver", label="サンプル")
+        ax.scatter(cur, f["y"], s=6, alpha=0.3, color="gray", label="サンプル")
         xline = np.linspace(np.nanmin(cur), np.nanmax(cur), 50)
         ax.plot(xline, f["a"] * xline + f["b"], "g-", lw=2,
                 label=f"全サンプル a={f['a']:.3f}±{f['se']:.3f}\nR²={f['r2']:.3f}")
@@ -796,7 +820,7 @@ def _temp_regression_panel(ax, temp, y, ylabel, title, color) -> tuple[float, fl
     ax.scatter(temp, y, s=6, alpha=0.3, color=color)
     if np.isfinite(slope):
         xline = np.linspace(np.nanmin(temp), np.nanmax(temp), 50)
-        ax.plot(xline, slope * xline + b, "w-", lw=2,
+        ax.plot(xline, slope * xline + b, "-", color="#111111", lw=2,
                 label=f"傾き {slope:+.3f} µT/°C\nr={r:.3f}")
         ax.legend(fontsize=8)
     ax.axhline(0, color="gray", lw=0.8)
@@ -936,6 +960,17 @@ def aggregate_run(data: dict, idle: float, label: str, motors: str) -> dict:
     return {"label": label, "motors": motors, "idle": float(idle), "pd": pd_}
 
 
+def _idle_from(meta: dict | None, data: dict) -> float:
+    """アイドル電流。meta の idle_current_a → 無ければ base 行（duty=0）の平均電流。"""
+    idle = math.nan
+    if meta is not None:
+        idle = _f(str(meta.get("idle_current_a", "")))
+    if not math.isfinite(idle):
+        b = data["phase"] == "base"
+        idle = float(np.nanmean(data["current_a"][b])) if b.any() else math.nan
+    return idle
+
+
 def load_sequence_runs(meta_path: Path, csv_dir: Path) -> tuple[list[dict], dict]:
     """sequence meta JSON から完了済み run を全て読み込んで集計する。
 
@@ -954,16 +989,157 @@ def load_sequence_runs(meta_path: Path, csv_dir: Path) -> tuple[list[dict], dict
         if not spath.is_file():
             sys.exit(f"samples CSV が見つかりません: {spath}（--results-dir でディレクトリを指定できます）")
         data = load_samples(spath)
-        idle = math.nan
+        meta = None
         if r.get("meta"):
             mpath = csv_dir / r["meta"]
             if mpath.is_file():
-                idle = _f(str(json.loads(mpath.read_text(encoding="utf-8")).get("idle_current_a", "")))
-        if not math.isfinite(idle):  # フォールバック: base 行（duty=0）の平均電流
-            b = data["phase"] == "base"
-            idle = float(np.nanmean(data["current_a"][b])) if b.any() else math.nan
-        runs.append(aggregate_run(data, idle, label=spath.stem, motors=motors))
+                meta = json.loads(mpath.read_text(encoding="utf-8"))
+        runs.append(aggregate_run(data, _idle_from(meta, data),
+                                  label=spath.stem, motors=motors))
     return runs, seq
+
+
+# ------------------------------------------- 外部比較対象（全機スイープ）------
+def _meta_epoch(meta: dict | None, path: Path) -> float:
+    """meta の取得時刻を epoch 秒で返す（started_at_epoch → created_at → mtime）。"""
+    if meta:
+        ep = meta.get("started_at_epoch")
+        if isinstance(ep, (int, float)) and math.isfinite(ep):
+            return float(ep)
+        ca = meta.get("created_at")
+        if isinstance(ca, str):
+            try:
+                return datetime.strptime(ca, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+            except ValueError:
+                pass
+    return path.stat().st_mtime
+
+
+def _sequence_epoch(seq: dict, meta_path: Path) -> float:
+    """シーケンスの開始時刻（run_id → created_at → mtime）。"""
+    rid = seq.get("run_id")
+    if isinstance(rid, str):
+        try:
+            return time.mktime(time.strptime(rid, "%Y%m%d_%H%M%S"))
+        except ValueError:
+            pass
+    return _meta_epoch(seq, meta_path)
+
+
+def find_multi_candidates(csv_dir: Path, exclude_samples: set[str],
+                          singles_avail: set[str]) -> list[dict]:
+    """csv_dir から比較対象になれる多機スイープ候補を探す（新しい順）。
+
+    条件: motors が全機（FL+FR+RL+RR）か対角ペア、aborted=false、
+    samples CSV が実在、構成モーターの単機 run がシーケンス側に揃っている。
+    """
+    cands = []
+    for mp in csv_dir.glob("sweep_*_meta.json"):
+        try:
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if meta.get("aborted"):
+            continue
+        tokens = frozenset(t for t in str(meta.get("motors", "")).split("+") if t)
+        if tokens not in ALLOWED_MULTI or not tokens <= singles_avail:
+            continue
+        stem = _strip_suffix(mp.stem, "_meta")
+        spath = csv_dir / f"{stem}_samples.csv"
+        if not spath.is_file() or spath.name in exclude_samples:
+            continue
+        cands.append({
+            "stem": stem,
+            "samples": spath,
+            "motors": meta.get("motors", "?"),
+            "orientation": (meta.get("notes") or {}).get("orientation") or "-",
+            "epoch": _meta_epoch(meta, mp),
+        })
+    cands.sort(key=lambda c: c["epoch"], reverse=True)
+    return cands
+
+
+def _select_external_targets(cands: list[dict], seq_orient: str | None,
+                             seq_epoch: float) -> list[dict] | None:
+    """候補一覧から比較対象を対話選択する。返り値: 選択候補リスト / None（中止）。
+
+    Enter はシーケンス（単機）と同姿勢で時刻が最も近い1本を自動選択。
+    対話入力が無い（EOF）場合も同じ自動選択を行う。
+    """
+    print("\nシーケンスは単機のみです。比較対象の全機スイープを選択してください")
+    print("（複数可、カンマ区切り、Enter=単機と同姿勢で時刻が最も近い1本、q=中止）:\n")
+    for i, c in enumerate(cands, 1):
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["epoch"]))
+        same = "  ← 同姿勢" if c["orientation"] == seq_orient else ""
+        print(f"  [{i}] {c['stem']}   motors={c['motors']}   "
+              f"orientation={c['orientation']}   {ts}{same}")
+    print()
+    same_or = [c for c in cands if c["orientation"] == seq_orient]
+    default = min(same_or, key=lambda c: abs(c["epoch"] - seq_epoch)) if same_or else None
+    while True:
+        try:
+            raw = input(f"番号を入力 [1-{len(cands)}]（カンマ区切り可 / Enter=自動 / q=中止）: ").strip()
+        except EOFError:
+            if default is not None:
+                print(f"（対話入力なし → 同姿勢・時刻最近傍 {default['stem']} を自動選択）")
+                return [default]
+            print("（対話入力なし・同姿勢の候補なし → 中止）")
+            return None
+        if raw == "":
+            if default is not None:
+                print(f"（同姿勢・時刻最近傍 {default['stem']} を自動選択）")
+                return [default]
+            print("  同じ姿勢（orientation）の候補がありません。番号で明示選択するか q で中止してください。")
+            continue
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if parts and all(p.isdigit() and 1 <= int(p) <= len(cands) for p in parts):
+            seen: set[int] = set()
+            sel = []
+            for p in parts:
+                idx = int(p)
+                if idx not in seen:
+                    seen.add(idx)
+                    sel.append(cands[idx - 1])
+            return sel
+        print(f"  '{raw}' は無効です。1〜{len(cands)} の番号（カンマ区切り）を入力してください。")
+
+
+def _resolve_target_samples(spec: str, csv_dir: Path) -> Path:
+    """--target の値（stem または samples.csv パス）を samples CSV パスに解決する。"""
+    p = Path(spec)
+    if p.is_file():
+        if p.name.endswith("_meta.json"):
+            p = p.with_name(_strip_suffix(p.stem, "_meta") + "_samples.csv")
+        return p
+    stem = spec
+    for suf in (".csv", ".json"):
+        if stem.endswith(suf):
+            stem = stem[: -len(suf)]
+    stem = _strip_suffix(_strip_suffix(stem, "_samples"), "_meta")
+    return csv_dir / f"{stem}_samples.csv"
+
+
+def load_external_run(samples: Path, motors: str | None = None) -> dict:
+    """外部指定の多機スイープを run 辞書に読み込む（source='external'）。"""
+    if not samples.is_file():
+        sys.exit(f"比較対象の samples CSV が見つかりません: {samples}")
+    meta = load_meta(samples)
+    data = load_samples(samples)
+    if motors is None:
+        motors = (meta or {}).get("motors")
+    if not motors and "motors" in data:
+        motors = next((m for m in data["motors"] if m), None)
+    if not motors:
+        sys.exit(f"比較対象のモーター構成（motors）が不明です: {samples}")
+    if meta is not None and meta.get("aborted"):
+        print(f"  警告: {samples.name} は aborted=true のスイープです（続行します）。")
+    run = aggregate_run(data, _idle_from(meta, data),
+                        label=_strip_suffix(samples.stem, "_samples"), motors=str(motors))
+    run["source"] = "external"
+    run["orientation"] = ((meta or {}).get("notes") or {}).get("orientation") or "-"
+    return run
 
 
 # ------------------------------------------------------------- analysis -------
@@ -1111,7 +1287,7 @@ def fig_verdict_summary(verdicts: list[dict], out: Path) -> None:
     ax.set_xlim(0, 1); ax.set_ylim(0, 1)
     ax.text(0.02, 0.96, "加算性 判定サマリ", fontsize=15, fontweight="bold", va="top")
     ax.text(0.02, 0.96 - 0.10, f"判定基準: 最大|残差| <= max({NOISE_SIGMA:.0f}σ×RMS(合成ノイズ), "
-            f"{NOISE_FLOOR_UT:.1f} µT)", fontsize=9, color="lightgray", va="top")
+            f"{NOISE_FLOOR_UT:.1f} µT)", fontsize=9, color="#555555", va="top")
     y = 0.96 - 0.24
     dy = 0.72 / max(1, n)
     for v in verdicts:
@@ -1146,45 +1322,100 @@ def build_comparisons(runs: list[dict]) -> list[tuple[dict, list[dict]]]:
     return comps
 
 
-def analyze_comparisons(comps: list[tuple[dict, list[dict]]], out: Path) -> None:
+def _target_note(target: dict, seq_orient: str | None) -> str:
+    """比較対象の由来（sequence 内 / 外部選択）と姿勢の注記（フッター・表用）。"""
+    orient = target.get("orientation") or "-"
+    src = "外部選択" if target.get("source") == "external" else "シーケンス内"
+    note = f"比較対象={src} {target['label']} (orientation={orient})"
+    if seq_orient and orient not in ("-", seq_orient):
+        note += " ※姿勢が異なる比較（参考）"
+    return note
+
+
+def analyze_comparisons(comps: list[tuple[dict, list[dict]]], out: Path,
+                        seq_orient: str | None = None) -> None:
     """全比較ペアについて 主検証・副検証・電流チェック・図 を実行し判定サマリを出す。"""
+    global _COND_FOOTER
+    base_footer = _COND_FOOTER
     verdicts = []
     for idx, (target, singles) in enumerate(comps, 1):
         name = f"{' + '.join(s['motors'] for s in singles)} → {target['motors']}"
+        note = _target_note(target, seq_orient)
+        print(f"\n--- {note} ---")
+        _COND_FOOTER = f"{base_footer}  |  {note}" if base_footer else note
         keys, meas, pred, resid, noise = compare_additivity(target, singles)
         print_main_table(name, keys, meas, pred, resid)
         print_slope_check(name, target, singles)
         print_current_check(name, target, singles, keys)
-        fname = f"{idx:02d}_additivity_{target['motors'].replace('+', '_')}.png"
+        fname = f"{idx:02d}_additivity_{target['motors'].replace('+', '_')}_{target['label']}.png"
         fig_additivity(name, fname, keys, meas, pred, resid, noise, out)
         verdicts.append(verdict_info(name, resid, noise))
+    _COND_FOOTER = base_footer
+    if any(t.get("source") == "external" for t, _ in comps):
+        ext = ", ".join(_target_note(t, seq_orient) for t, _ in comps
+                        if t.get("source") == "external")
+        _COND_FOOTER = f"{base_footer}  |  {ext}" if base_footer else ext
     print("\n=== 判定サマリ ===")
     for v in verdicts:
         print(f"  {v['line']}")
     fig_verdict_summary(verdicts, out)
+    _COND_FOOTER = base_footer
     print(f"\n図 {len(comps) + 1} 枚（比較 {len(comps)} + 判定サマリ 1）を {out} に出力しました。")
 
 
 # ------------------------------------------------------- additivity main ------
-def run_additivity(meta_path: Path, csv_dir: Path, out: Path) -> None:
-    """sequence meta JSON から加算性検証の図と判定を出力する。"""
+def run_additivity(meta_path: Path, csv_dir: Path, out: Path,
+                   targets: list[str] | None = None) -> None:
+    """sequence meta JSON から加算性検証の図と判定を出力する。
+
+    シーケンスが単機のみの場合は csv_dir から多機スイープ候補を探し、
+    対話選択（または --target 指定）で外部の比較対象を組み合わせる。
+    """
     global _COND_FOOTER
     out.mkdir(parents=True, exist_ok=True)
     print(f"入力: {meta_path}\nCSVディレクトリ: {csv_dir}\n出力: {out}")
     runs, seq = load_sequence_runs(meta_path, csv_dir)
     if not runs:
         sys.exit("完了済み（phase=='done'）の run がありません。")
+    seq_orient = (seq.get("notes") or {}).get("orientation")
     for r in runs:
+        r.setdefault("source", "sequence")
+        r.setdefault("orientation", seq_orient or "-")
         print(f"  {r['label']}: motors={r['motors']} idle={r['idle']:.3f} A "
               f"duty段数={len(r['pd'])}")
     cond = [meta_path.name, f"pattern={seq.get('pattern', '-')}"]
     if seq.get("notes"):
         cond.append(f"notes={seq['notes']}")
     _COND_FOOTER = "  |  ".join(cond)
-    comps = build_comparisons(runs)
+
+    # --target 明示指定（対話質問なし）
+    external: list[dict] = []
+    if targets:
+        for spec in targets:
+            external.append(load_external_run(_resolve_target_samples(spec, csv_dir)))
+
+    # シーケンスが単機のみ → csv_dir から多機スイープ候補を探して対話選択
+    has_multi = any(len([t for t in r["motors"].split("+") if t]) >= 2 for r in runs)
+    if not has_multi and not external:
+        singles_avail = {r["motors"] for r in runs if r["motors"] in SINGLES}
+        exclude = {Path(str(r2.get("samples", ""))).name for r2 in seq.get("runs", [])}
+        cands = find_multi_candidates(csv_dir, exclude, singles_avail)
+        if cands:
+            sel = _select_external_targets(cands, seq_orient,
+                                           _sequence_epoch(seq, meta_path))
+            if sel is None:
+                sys.exit("中止しました（比較対象が選択されていません）。")
+            for c in sel:
+                external.append(load_external_run(c["samples"], motors=c["motors"]))
+
+    for r in external:
+        print(f"  外部比較対象 {r['label']}: motors={r['motors']} idle={r['idle']:.3f} A "
+              f"duty段数={len(r['pd'])} orientation={r.get('orientation', '-')}")
+    comps = build_comparisons(runs + external)
     if not comps:
-        sys.exit("比較できる組み合わせがありません（単機4本＋同時 run が必要です）。")
-    analyze_comparisons(comps, out)
+        sys.exit("加算性検証には全機同時スイープが必要です。\n"
+                 "Experiment タブの電流×磁場スイープで FL+FR+RL+RR を1本取得してください。")
+    analyze_comparisons(comps, out, seq_orient=seq_orient)
 
 
 # ==============================================================================
@@ -1246,6 +1477,9 @@ def main() -> None:
     ap.add_argument("--results-dir",
                     help="スイープ結果ディレクトリ（一覧の探索先 / シーケンスの samples CSV の場所。"
                          "既定: ../pc_server/data/sweep_results/）")
+    ap.add_argument("--target", action="append", metavar="STEM_OR_CSV",
+                    help="加算性検証の比較対象（多機スイープの stem または samples.csv パス。"
+                         "複数指定可）。指定時は対話質問しない。sequence 入力時のみ有効。")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir) if args.results_dir else default_results_dir()
@@ -1262,6 +1496,8 @@ def main() -> None:
         mode, path = sel
 
     if mode == "sweep":
+        if args.target:
+            print("警告: --target はスイープ解析では使いません（無視します）。")
         stem = _strip_suffix(path.stem, "_samples")
         out = Path(args.out) if args.out else graphs_dir() / stem
         run_sweep(path, out)
@@ -1270,7 +1506,7 @@ def main() -> None:
         csv_dir = Path(args.results_dir) if args.results_dir else path.parent
         stem = _strip_suffix(path.stem, "_meta")
         out = Path(args.out) if args.out else graphs_dir() / f"additivity_{stem}"
-        run_additivity(path, csv_dir, out)
+        run_additivity(path, csv_dir, out, targets=args.target)
 
 
 if __name__ == "__main__":

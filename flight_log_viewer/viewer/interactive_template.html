@@ -1,0 +1,1762 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StampFly インタラクティブ フライトログ プレーヤー</title>
+<!--
+  StampFly V2 フライトログ インタラクティブ HTML プレーヤー(テンプレート)
+
+  - interactive.py が「const EMBED = …null;」の契約行を JSON リテラルに置換して出力する
+    (プレースホルダ文字列そのものをこのコメントに書くと置換対象が二重になるため書かない)。
+  - EMBED === null(テンプレート単体で開いた場合)は内蔵デモデータ
+    (30秒・50Hz・58系列の合成飛行データ)で全機能が動作する。
+  - 自己完結 1 ファイル。外部 CDN・ネットワーク接続は一切使わない。
+  - データ契約(58系列の格納順・単位)は INTERACTIVE_VIEWER_SPEC.md に従う。
+-->
+<style>
+:root {
+  /* 白基調ライトテーマ(viewer/constants.py FIG_BG/AX_BG/TEXT_COLOR と統一) */
+  --bg: #ffffff;          /* ページ背景(FIG_BG) */
+  --panel-bg: #ffffff;    /* パネル背景 */
+  --panel-head: #f1f5f9;  /* パネルヘッダ背景 */
+  --plot-bg: #ffffff;     /* グラフ描画領域背景(AX_BG) */
+  --border: #d4dae3;
+  --text: #222222;        /* TEXT_COLOR */
+  --text-dim: #64748b;
+  --accent: #0284c7;
+  --danger: #dc2626;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg); color: var(--text);
+  font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif;
+  font-size: 14px;
+}
+button {
+  background: #f4f6f9; color: var(--text);
+  border: 1px solid #c6cdd8; border-radius: 6px;
+  padding: 4px 10px; cursor: pointer; font-size: 13px;
+}
+button:hover { background: #e8ecf2; }
+button.active { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+input[type="text"], input[type="number"] {
+  background: #ffffff; color: var(--text);
+  border: 1px solid #c6cdd8; border-radius: 4px; padding: 3px 6px;
+  font-size: 13px;
+}
+input[type="range"] { accent-color: var(--accent); }
+
+/* ===== ヘッダ(プレーヤーバー) ===== */
+#header {
+  position: sticky; top: 0; z-index: 50;
+  background: #f8fafc; border-bottom: 1px solid var(--border);
+  padding: 8px 14px; display: flex; flex-wrap: wrap;
+  align-items: center; gap: 8px 12px;
+}
+#logName { font-weight: 700; font-size: 15px; }
+#demoBadge {
+  background: #d97706; color: #ffffff; font-size: 12px; font-weight: 700;
+  border-radius: 999px; padding: 2px 10px; display: none;
+}
+#seekBar { flex: 1 1 240px; min-width: 160px; }
+#timeBox { display: flex; align-items: center; gap: 4px; }
+#timeNow { width: 84px; text-align: right; }
+#timeTotal { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.btn-group { display: flex; gap: 4px; }
+#panelMenuWrap { position: relative; }
+#panelMenu {
+  display: none; position: absolute; right: 0; top: calc(100% + 6px);
+  background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px; min-width: 260px; max-height: 70vh; overflow-y: auto;
+  box-shadow: 0 8px 24px rgba(15,23,42,.18); z-index: 60;
+}
+#panelMenu.open { display: block; }
+#panelMenu label {
+  display: flex; align-items: center; gap: 6px; padding: 2px 4px;
+  cursor: pointer; border-radius: 4px; font-size: 13px;
+}
+#panelMenu label:hover { background: #eef2f7; }
+#panelMenu hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+#panelMenu .menu-btns { display: flex; flex-direction: column; gap: 6px; }
+
+/* ===== パネルグリッド ===== */
+#grid {
+  display: grid; gap: 10px; padding: 10px 14px 40px;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+}
+@media (max-width: 420px) {
+  #grid { grid-template-columns: 1fr; }
+}
+.panel {
+  background: var(--panel-bg); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden; display: flex; flex-direction: column;
+}
+@media (min-width: 800px) {
+  .panel.wide { grid-column: span 2; }
+}
+.panel.dragging { opacity: .45; outline: 2px dashed var(--accent); }
+.panel.drop-target { outline: 2px solid var(--accent); outline-offset: -2px; }
+.panel-head {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--panel-head); padding: 5px 8px;
+  cursor: grab; user-select: none; touch-action: none;
+  border-bottom: 1px solid var(--border);
+}
+.panel-head .p-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
+.panel-head .p-vals {
+  flex: 1; display: flex; flex-wrap: wrap; gap: 2px 10px;
+  font-size: 11.5px; font-variant-numeric: tabular-nums;
+  color: var(--text-dim); overflow: hidden; max-height: 2.6em;
+}
+.panel-head .p-vals b { font-weight: 600; }
+.panel-head .p-unit { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.panel-head button {
+  padding: 1px 7px; font-size: 12px; line-height: 1.5; flex: 0 0 auto;
+}
+.panel-body { position: relative; }
+.panel-body canvas { display: block; width: 100%; cursor: crosshair; }
+.xy-tools {
+  position: absolute; right: 6px; top: 6px; display: flex; gap: 4px;
+}
+.xy-tools button { font-size: 11px; padding: 1px 6px; opacity: .85; }
+
+/* ===== 動画パネル ===== */
+.video-body { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.video-drop {
+  position: relative; background: #f1f5f9; border-radius: 6px;
+  min-height: 180px; display: flex; align-items: center; justify-content: center;
+  border: 1px dashed #b6c0cd;
+}
+.video-drop.dragover { border-color: var(--accent); background: #e0f2fe; }
+.video-drop video { width: 100%; max-height: 340px; border-radius: 6px; display: none; }
+.video-drop .vd-hint {
+  color: var(--text-dim); font-size: 12.5px; text-align: center; padding: 12px;
+  pointer-events: none;
+}
+.video-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12.5px; }
+.video-row input[type="text"] { flex: 1; min-width: 120px; }
+.video-row input[type="range"] { flex: 1; min-width: 100px; }
+.video-row .off-num { width: 76px; }
+.video-note { font-size: 11px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <span id="logName">-</span>
+  <span id="demoBadge">デモデータ</span>
+  <div class="btn-group">
+    <button id="btnPlay" title="再生/停止(Space)">再生</button>
+    <button id="btnStepB" title="1フレーム戻る(←)">−1f</button>
+    <button id="btnStepF" title="1フレーム進む(→)">+1f</button>
+  </div>
+  <input type="range" id="seekBar" min="0" max="30" step="0.01" value="0">
+  <div id="timeBox">
+    <input type="number" id="timeNow" step="0.01" value="0"> s
+    <span id="timeTotal">/ 0.00 s</span>
+  </div>
+  <div class="btn-group" id="speedGroup">
+    <button data-speed="0.25">0.25×</button>
+    <button data-speed="0.5">0.5×</button>
+    <button data-speed="1" class="active">1×</button>
+    <button data-speed="2">2×</button>
+  </div>
+  <div id="panelMenuWrap">
+    <button id="btnPanelMenu">パネル ▾</button>
+    <div id="panelMenu">
+      <div id="panelChecks"></div>
+      <hr>
+      <div class="menu-btns">
+        <button id="btnResetLayout">初期配置に戻す</button>
+        <button id="btnExportLayout">レイアウト書き出し(JSON)</button>
+        <button id="btnImportLayout">レイアウト読み込み(JSON)</button>
+        <input type="file" id="importLayoutFile" accept=".json,application/json" style="display:none">
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="grid"></div>
+
+<script>
+"use strict";
+/*
+ * ここから プレーヤー本体(非モジュール・自己完結)。
+ * 前半はデータ契約・純関数(node 単体テスト可能)、後半が UI(init 以降)。
+ */
+
+/* エクスポータが置換する埋め込みデータ(この行は完全一致契約。編集禁止) */
+const EMBED = /*__EMBED_JSON__*/null;
+
+/* ===================== データ契約(58系列・格納順) ===================== */
+/* INTERACTIVE_VIEWER_SPEC.md「系列定義」と 1:1。順序自体が契約。 */
+const SERIES_NAMES = [
+  "t",                                                    // 0  [s]
+  "alt_est", "alt_tof", "alt_ref",                        // 1-3  [m]
+  "pos_x", "pos_y", "target_x", "target_y",               // 4-7  [m]
+  "roll", "pitch", "yaw_mad", "yaw_ekf",                  // 8-11 [deg]
+  "roll_ref", "pitch_ref", "yaw_ref",                     // 12-14 [deg]
+  "err_roll", "err_pitch", "err_yaw",                     // 15-17 [deg]
+  "p", "q", "r",                                          // 18-20 [deg/s]
+  "p_ref", "q_ref", "r_ref",                              // 21-23 [deg/s]
+  "err_p", "err_q", "err_r",                              // 24-26 [deg/s]
+  "pid_ang_roll_p", "pid_ang_roll_i", "pid_ang_roll_d",   // 27-29 [deg/s]
+  "pid_ang_pitch_p", "pid_ang_pitch_i", "pid_ang_pitch_d",// 30-32 [deg/s]
+  "pid_ang_yaw_p", "pid_ang_yaw_i", "pid_ang_yaw_d",      // 33-35 [deg/s]
+  "pid_rate_roll_p", "pid_rate_roll_i", "pid_rate_roll_d",   // 36-38 [-]
+  "pid_rate_pitch_p", "pid_rate_pitch_i", "pid_rate_pitch_d",// 39-41 [-]
+  "pid_rate_yaw_p", "pid_rate_yaw_i", "pid_rate_yaw_d",      // 42-44 [-]
+  "duty_fr", "duty_fl", "duty_rr", "duty_rl",             // 45-48 [0-1]
+  "current_a",                                            // 49 [A]
+  "ff_x", "ff_y", "ff_norm",                              // 50-52 [µT]
+  "bm_x", "bm_y",                                         // 53-54 [µT]
+  "alt_vel", "z_dot_ref",                                 // 55-56 [m/s]
+  "ctrl_flags",                                           // 57 [bit]
+];
+const N_SERIES = 58;
+if (SERIES_NAMES.length !== N_SERIES) {
+  throw new Error("系列定義が契約(58系列)と不一致: " + SERIES_NAMES.length);
+}
+
+/* tlm_ctrl_flags のビット(viewer/constants.py と同値) */
+const CTRL_FLAG_XY_ONBOARD = 1;  // bit0
+const CTRL_FLAG_YAW_CTRL = 2;    // bit1
+const CTRL_FLAG_FLYING = 4;      // bit2
+
+/* ===================== 汎用ユーティリティ(純関数) ===================== */
+
+/* 角度を ±180° に折り返す(loader.wrap_deg と同実装) */
+function wrap180(deg) {
+  return ((deg + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+}
+
+/* base64 → Uint8Array(atob はバイナリセーフでないため 1 文字ずつ詰める) */
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/* Uint8Array → base64(デモデータ生成用。チャンク分割でスタック回避) */
+function bytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/* 実行環境がリトルエンディアンか(契約は little-endian float32) */
+function isLittleEndian() {
+  const buf = new ArrayBuffer(4);
+  new Uint32Array(buf)[0] = 0x11223344;
+  return new Uint8Array(buf)[0] === 0x44;
+}
+
+/* base64 の連結 float32 を 58 系列の名前付き Float32Array 群に分解する */
+function decodeSeriesMap(dataB64, n) {
+  const bytes = base64ToBytes(dataB64);
+  const expected = N_SERIES * n * 4;
+  if (bytes.length !== expected) {
+    throw new Error("data_b64 のバイト長が契約と不一致: " +
+                    bytes.length + " != " + expected);
+  }
+  let f32;
+  if (isLittleEndian()) {
+    f32 = new Float32Array(bytes.buffer, 0, N_SERIES * n);
+  } else {
+    /* ビッグエンディアン環境ではバイトスワップして読む */
+    const dv = new DataView(bytes.buffer);
+    f32 = new Float32Array(N_SERIES * n);
+    for (let i = 0; i < f32.length; i++) f32[i] = dv.getFloat32(i * 4, true);
+  }
+  const S = {};
+  for (let k = 0; k < N_SERIES; k++) {
+    S[SERIES_NAMES[k]] = f32.subarray(k * n, (k + 1) * n);
+  }
+  return S;
+}
+
+/* PID 合計と無効区間マスクの派生量を S に追加する */
+function addDerived(S, n) {
+  const sum3 = (a, b, c) => {
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = a[i] + b[i] + c[i];
+    return out;
+  };
+  S.sum_ang_roll = sum3(S.pid_ang_roll_p, S.pid_ang_roll_i, S.pid_ang_roll_d);
+  S.sum_ang_pitch = sum3(S.pid_ang_pitch_p, S.pid_ang_pitch_i, S.pid_ang_pitch_d);
+  S.sum_ang_yaw = sum3(S.pid_ang_yaw_p, S.pid_ang_yaw_i, S.pid_ang_yaw_d);
+  S.sum_rate_roll = sum3(S.pid_rate_roll_p, S.pid_rate_roll_i, S.pid_rate_roll_d);
+  S.sum_rate_pitch = sum3(S.pid_rate_pitch_p, S.pid_rate_pitch_i, S.pid_rate_pitch_d);
+  S.sum_rate_yaw = sum3(S.pid_rate_yaw_p, S.pid_rate_yaw_i, S.pid_rate_yaw_d);
+
+  /* 無効区間(plots.py _ctrl_invalid_mask と同じ意味):
+     非飛行(bit2=0)または未受信(NaN)。yaw 系は加えてヨー制御OFF(bit1=0)。 */
+  const invalidFly = new Uint8Array(n);
+  const invalidYaw = new Uint8Array(n);
+  const cf = S.ctrl_flags;
+  for (let i = 0; i < n; i++) {
+    const v = cf[i];
+    if (!isFinite(v)) { invalidFly[i] = 1; invalidYaw[i] = 1; continue; }
+    const bits = v | 0;
+    if ((bits & CTRL_FLAG_FLYING) === 0) invalidFly[i] = 1;
+    if (invalidFly[i] || (bits & CTRL_FLAG_YAW_CTRL) === 0) invalidYaw[i] = 1;
+  }
+  S._invalid_fly = invalidFly;
+  S._invalid_yaw = invalidYaw;
+  return S;
+}
+
+/* データセット記述(EMBED.datasets[i])→ 実行時データセットに変換 */
+function decodeDataset(dsSpec) {
+  const n = dsSpec.n | 0;
+  if (!(n > 0)) throw new Error("データセットの行数が不正: " + dsSpec.n);
+  const S = decodeSeriesMap(dsSpec.data_b64, n);
+  addDerived(S, n);
+  return {
+    label: dsSpec.label || "A",
+    n: n,
+    durationS: +dsSpec.duration_s || (n > 1 ? S.t[n - 1] - S.t[0] : 0),
+    mode: dsSpec.mode || "unknown",
+    S: S,
+  };
+}
+
+/* 1-99 パーセンタイルから y レンジを決める(余白10%。plots 相当の自動レンジ) */
+function percentileRange(arrays) {
+  const vals = [];
+  for (const a of arrays) {
+    for (let i = 0; i < a.length; i++) {
+      const v = a[i];
+      if (isFinite(v)) vals.push(v);
+    }
+  }
+  if (vals.length === 0) return [-1, 1];
+  vals.sort((a, b) => a - b);
+  const lo = vals[Math.floor(0.01 * (vals.length - 1))];
+  const hi = vals[Math.ceil(0.99 * (vals.length - 1))];
+  let span = hi - lo;
+  if (!(span > 0)) span = Math.max(Math.abs(hi), 1e-3) * 0.2;
+  return [lo - 0.1 * span, hi + 0.1 * span];
+}
+
+/* きりのよい目盛り間隔(1-2-5 系列) */
+function niceStep(span, targetCount) {
+  const raw = span / Math.max(targetCount, 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 5, 10]) {
+    if (raw <= m * mag) return m * mag;
+  }
+  return 10 * mag;
+}
+
+/* t 配列(単調増加)で tau 以下の最終インデックスを二分探索 */
+function indexOfTime(t, tau) {
+  let lo = 0, hi = t.length - 1;
+  if (tau <= t[0]) return 0;
+  if (tau >= t[hi]) return hi;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] <= tau) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+/* t(単調増加)で v 以上の最初のインデックス(np.searchsorted left 相当) */
+function lowerBound(t, v) {
+  let lo = 0, hi = t.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] < v) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/* t(単調増加)で v より大きい最初のインデックス(np.searchsorted right 相当) */
+function upperBound(t, v) {
+  let lo = 0, hi = t.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] <= v) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/* スライディングウィンドウ [tLo, now] の描画インデックス範囲 [i0, i1) を返す
+   (animation.py _update_ts_panels の searchsorted と同義)。i0 は窓左端に
+   入り込む線分をクリップ描画するため直前 1 点を含める。 */
+function windowIndexRange(t, tLo, now) {
+  const i1 = upperBound(t, now);
+  const i0 = Math.max(0, lowerBound(t, tLo) - 1);
+  return [i0, i1];
+}
+
+/* 数値表示(欠損は "–") */
+function fmtVal(v, digits) {
+  return isFinite(v) ? v.toFixed(digits) : "–";
+}
+
+/* ===================== 内蔵デモデータ(EMBED===null 時) ===================== */
+/*
+ * 30秒・50Hz の「もっともらしい」合成飛行データ。物理整合の契約:
+ *  - err_* = ref − 現在(yaw は wrap180)
+ *  - 角度ループ P+I+D = 指令角速度(p_ref/q_ref。yaw はクランプ前合計で、
+ *    r_ref = クランプ後 ±120deg/s)
+ *  - ff_norm = √(ff_x²+ff_y²)
+ *  - 非飛行区間は PID 成分 0(機体の PID リセットを模擬)
+ *  - TLM_CTRL 系(ctrl_flags・*_ref 角速度・PID 成分)は先頭 0.5s を NaN
+ *    (未受信を模擬)
+ */
+
+/* 決定論的な擬似乱数(mulberry32。デモを再現可能にする) */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function generateDemoSeries() {
+  const rate = 50.0, dt = 1.0 / rate;
+  const n = Math.round(30.0 * rate) + 1;  /* 30秒+終端 = 1501行 */
+  const rnd = mulberry32(20260717);
+  const noise = (amp) => (rnd() * 2 - 1) * amp;
+  const cols = {};
+  for (const name of SERIES_NAMES) cols[name] = new Float64Array(n).fill(NaN);
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const YAW_RATE_CLAMP = 120.0;  /* r_ref クランプ [deg/s] */
+
+  /* 1次遅れフィルタの状態 */
+  let altEst = 0, posX = 0.05, posY = -0.03, roll = 0, pitch = 0;
+  let yawEkfU = 5.0;             /* アンラップ ψ [deg] */
+  let iRoll = 0, iPitch = 0, iYaw = 0;                  /* 角度ループ I */
+  let irR = 0, irP = 0, irY = 0;                        /* 角速度ループ I */
+  let prevRoll = 0, prevPitch = 0, prevYawU = yawEkfU, prevAlt = 0;
+
+  for (let i = 0; i < n; i++) {
+    const t = i * dt;
+    cols.t[i] = t;
+    const flying = t >= 3.0 && t < 27.0;
+    const yawCtrl = t >= 5.0 && t < 25.0;
+    const ctrlRecv = t >= 0.5;   /* TLM_CTRL 受信開始(先頭は NaN) */
+
+    /* --- 高度 --- */
+    let altRef = 0;
+    if (t >= 3.0 && t < 25.0) altRef = 0.6 * Math.min(1, (t - 3.0) / 3.0);
+    else if (t >= 25.0 && t < 27.0) altRef = 0.6 * (27.0 - t) / 2.0;
+    const zDotRef = clamp((altRef - (cols.alt_ref[i - 1] ?? 0)) / dt, -0.5, 0.5);
+    altEst += (dt / 0.4) * (altRef - altEst);
+    const altVel = (altEst - prevAlt) / dt;
+    prevAlt = altEst;
+    cols.alt_ref[i] = altRef;
+    cols.alt_est[i] = altEst + noise(0.004);
+    cols.alt_tof[i] = altEst + noise(0.015);
+    cols.alt_vel[i] = altVel + noise(0.02);
+    cols.z_dot_ref[i] = isFinite(zDotRef) ? zDotRef : 0;
+
+    /* --- 位置 XY(離陸後に半径0.5m・周期12sの円) --- */
+    let tgtX = NaN, tgtY = NaN;
+    if (flying) {
+      if (t < 6.0) { tgtX = 0; tgtY = 0; }
+      else {
+        const th = 2 * Math.PI * (t - 6.0) / 12.0;
+        tgtX = 0.5 * Math.cos(th);
+        tgtY = 0.5 * Math.sin(th);
+      }
+      posX += (dt / 0.8) * (tgtX - posX);
+      posY += (dt / 0.8) * (tgtY - posY);
+    }
+    cols.target_x[i] = tgtX;
+    cols.target_y[i] = tgtY;
+    cols.pos_x[i] = posX + noise(0.008);
+    cols.pos_y[i] = posY + noise(0.008);
+
+    /* --- 姿勢(ref → 1次遅れ+振動ノイズ) --- */
+    const rollRef = flying ? 2.5 * Math.sin(0.8 * t) + 1.2 * Math.sin(0.23 * t) : 0;
+    const pitchRef = flying ? 2.0 * Math.cos(0.6 * t) - 0.8 * Math.sin(0.31 * t) : 0;
+    roll += (dt / 0.15) * (rollRef - roll);
+    pitch += (dt / 0.15) * (pitchRef - pitch);
+    const rollMeas = roll + 0.25 * Math.sin(2 * Math.PI * 7 * t) + noise(0.1);
+    const pitchMeas = pitch + 0.2 * Math.sin(2 * Math.PI * 6.3 * t + 1) + noise(0.1);
+    cols.roll_ref[i] = rollRef;
+    cols.pitch_ref[i] = pitchRef;
+    cols.roll[i] = rollMeas;
+    cols.pitch[i] = pitchMeas;
+    cols.err_roll[i] = rollRef - rollMeas;      /* 契約: err = ref − 現在 */
+    cols.err_pitch[i] = pitchRef - pitchMeas;
+
+    /* --- ヨー(アンラップで生成 → wrap180 で格納。±180 跨ぎを含む) --- */
+    let yawRefU = 5.0;
+    if (yawCtrl) {
+      yawRefU = 5.0 + 12.0 * (t - 5.0);        /* 20s で +240° → wrap 跨ぎ */
+      if (t >= 15.0) yawRefU += 60.0;          /* ステップでクランプを誘発 */
+    }
+    yawEkfU += (dt / 0.35) * (yawRefU - yawEkfU);
+    const yawRef = wrap180(yawRefU);
+    const yawEkf = wrap180(yawEkfU + noise(0.4));
+    cols.yaw_ref[i] = yawRef;
+    cols.yaw_ekf[i] = yawEkf;
+    cols.yaw_mad[i] = wrap180(yawEkfU + 0.35 * t + noise(0.4));  /* ドリフト */
+    cols.err_yaw[i] = wrap180(yawRef - yawEkf);
+
+    /* --- 角速度(姿勢の数値微分+ノイズ) --- */
+    const p = (roll - prevRoll) / dt + noise(3);
+    const q = (pitch - prevPitch) / dt + noise(3);
+    const r = (yawEkfU - prevYawU) / dt + noise(2);
+    prevRoll = roll; prevPitch = pitch; prevYawU = yawEkfU;
+    cols.p[i] = p; cols.q[i] = q; cols.r[i] = r;
+
+    /* --- ctrl_flags と TLM_CTRL 系(未受信区間は NaN のまま) --- */
+    if (!ctrlRecv) continue;
+    cols.ctrl_flags[i] = (flying ? CTRL_FLAG_XY_ONBOARD : 0) |
+                         (yawCtrl ? CTRL_FLAG_YAW_CTRL : 0) |
+                         (flying ? CTRL_FLAG_FLYING : 0);
+
+    /* 角度ループ PID(P+I+D=指令角速度。非飛行はリセットで全成分0) */
+    let apP = 0, apI = 0, apD = 0, aqP = 0, aqI = 0, aqD = 0;
+    let ayP = 0, ayI = 0, ayD = 0;
+    if (flying) {
+      apP = 6.0 * cols.err_roll[i];
+      iRoll = clamp(iRoll + 1.5 * cols.err_roll[i] * dt, -20, 20);
+      apI = iRoll;
+      apD = -0.05 * p;
+      aqP = 6.0 * cols.err_pitch[i];
+      iPitch = clamp(iPitch + 1.5 * cols.err_pitch[i] * dt, -20, 20);
+      aqI = iPitch;
+      aqD = -0.05 * q;
+    } else { iRoll = 0; iPitch = 0; }
+    if (flying && yawCtrl) {
+      ayP = 4.0 * cols.err_yaw[i];
+      iYaw = clamp(iYaw + 0.8 * cols.err_yaw[i] * dt, -40, 40);
+      ayI = iYaw;
+      ayD = -0.03 * r;
+    } else { iYaw = 0; }
+    cols.pid_ang_roll_p[i] = apP; cols.pid_ang_roll_i[i] = apI; cols.pid_ang_roll_d[i] = apD;
+    cols.pid_ang_pitch_p[i] = aqP; cols.pid_ang_pitch_i[i] = aqI; cols.pid_ang_pitch_d[i] = aqD;
+    cols.pid_ang_yaw_p[i] = ayP; cols.pid_ang_yaw_i[i] = ayI; cols.pid_ang_yaw_d[i] = ayD;
+
+    /* 指令角速度 = 角度ループ合計(yaw はクランプ後を r_ref に) */
+    const pRef = apP + apI + apD;
+    const qRef = aqP + aqI + aqD;
+    const rRefPre = ayP + ayI + ayD;
+    const rRef = clamp(rRefPre, -YAW_RATE_CLAMP, YAW_RATE_CLAMP);
+    cols.p_ref[i] = pRef; cols.q_ref[i] = qRef; cols.r_ref[i] = rRef;
+    cols.err_p[i] = pRef - p;
+    cols.err_q[i] = qRef - q;
+    cols.err_r[i] = rRef - r;
+
+    /* 角速度ループ PID(合計=ループ出力。正規化トルク相当の小振幅) */
+    let rrP = 0, rrI = 0, rrD = 0, rpP = 0, rpI = 0, rpD = 0, ryP = 0, ryI = 0, ryD = 0;
+    if (flying) {
+      rrP = 0.004 * cols.err_p[i];
+      irR = clamp(irR + 0.002 * cols.err_p[i] * dt, -0.05, 0.05);
+      rrI = irR;
+      rrD = noise(0.003);
+      rpP = 0.004 * cols.err_q[i];
+      irP = clamp(irP + 0.002 * cols.err_q[i] * dt, -0.05, 0.05);
+      rpI = irP;
+      rpD = noise(0.003);
+      ryP = 0.006 * cols.err_r[i];
+      irY = clamp(irY + 0.003 * cols.err_r[i] * dt, -0.08, 0.08);
+      ryI = irY;
+      ryD = noise(0.002);
+    } else { irR = 0; irP = 0; irY = 0; }
+    cols.pid_rate_roll_p[i] = rrP; cols.pid_rate_roll_i[i] = rrI; cols.pid_rate_roll_d[i] = rrD;
+    cols.pid_rate_pitch_p[i] = rpP; cols.pid_rate_pitch_i[i] = rpI; cols.pid_rate_pitch_d[i] = rpD;
+    cols.pid_rate_yaw_p[i] = ryP; cols.pid_rate_yaw_i[i] = ryI; cols.pid_rate_yaw_d[i] = ryD;
+
+    /* --- duty・電流(ミキサー模擬: ベース+ロール/ピッチ/ヨー出力の混合) --- */
+    const rollOut = rrP + rrI + rrD, pitchOut = rpP + rpI + rpD, yawOut = ryP + ryI + ryD;
+    const base = flying ? 0.44 + 0.15 * clamp(altRef - altEst + 0.3, 0, 1) : 0;
+    const duty = (sr, sp, sy) => flying
+      ? clamp(base + sr * rollOut + sp * pitchOut + sy * yawOut + noise(0.004), 0, 1)
+      : 0;
+    cols.duty_fr[i] = duty(-1, +1, +1);
+    cols.duty_fl[i] = duty(+1, +1, -1);
+    cols.duty_rr[i] = duty(-1, -1, -1);
+    cols.duty_rl[i] = duty(+1, -1, +1);
+    cols.current_a[i] = flying ? 1.8 + 4.5 * base + noise(0.12) : 0.25 + noise(0.02);
+
+    /* --- FF補正 ΔB̂ と EKF 磁気バイアス [µT] --- */
+    const ffx = 6.0 * Math.sin(0.4 * t) * (cols.current_a[i] / 4.5) + noise(0.15);
+    const ffy = 5.0 * Math.cos(0.3 * t) * (cols.current_a[i] / 4.5) + noise(0.15);
+    cols.ff_x[i] = ffx;
+    cols.ff_y[i] = ffy;
+    cols.ff_norm[i] = Math.hypot(ffx, ffy);   /* 契約: ノルム整合 */
+    cols.bm_x[i] = 2.0 * Math.sin(0.05 * t) + noise(0.05);
+    cols.bm_y[i] = 1.5 * Math.cos(0.07 * t) + noise(0.05);
+  }
+  return { cols: cols, n: n, rate: rate };
+}
+
+/* デモの列群 → EMBED と同形のオブジェクト(base64 経由で契約どおり格納) */
+function generateDemoEmbed() {
+  const d = generateDemoSeries();
+  const flat = new Float32Array(N_SERIES * d.n);
+  for (let k = 0; k < N_SERIES; k++) {
+    flat.set(Float32Array.from(d.cols[SERIES_NAMES[k]]), k * d.n);
+  }
+  let bytes = new Uint8Array(flat.buffer);
+  if (!isLittleEndian()) {                    /* 契約は little-endian */
+    bytes = new Uint8Array(bytes.length);
+    const dv = new DataView(bytes.buffer);
+    for (let i = 0; i < flat.length; i++) dv.setFloat32(i * 4, flat[i], true);
+  }
+  return {
+    version: 1,
+    log_name: "demo_30s_position",
+    generated_at: "2026-07-17T00:00:00",
+    rate_hz: d.rate,
+    datasets: [{
+      label: "A",
+      n: d.n,
+      duration_s: (d.n - 1) / d.rate,
+      mode: "position",
+      data_b64: bytesToBase64(bytes),
+    }],
+  };
+}
+
+/* ===================== 描画スタイル・パネル定義 ===================== */
+/* viewer/constants.py の COLORS(白背景ライトテーマ)と同色相 */
+const C = {
+  rollAxis: "#ca8a04",   /* Roll 系(COLORS["meas_roll"]) */
+  pitchAxis: "#9B59B6",  /* Pitch 系(COLORS["meas_pitch"]) */
+  yawAxis: "#e74c3c",    /* Yaw 系(COLORS["yaw_ekf"]) */
+  yawMad: "#a16207",     /* Madgwick ヨー(Roll と区別する暗色) */
+  pidP: "#dc2626",       /* PID P(COLORS["p"]) */
+  pidI: "#0d9488",       /* PID I(COLORS["i"]) */
+  pidD: "#16a34a",       /* PID D(COLORS["d"]) */
+  pidSum: "#111111",     /* PID 合計(COLORS["pid_sum"]。白背景では黒) */
+  refGray: "#64748b",    /* 指令(クランプ後)などの破線 */
+  altEst: "#0284c7",     /* alt_est(COLORS["alt_est"]) */
+  altTof: "#64748b",     /* alt_tof(COLORS["alt_tof"]) */
+  altRef: "#111111",     /* alt_ref(COLORS["alt_ref"]) */
+  traj: "#3498db",       /* 軌跡(COLORS["trajectory"]) */
+  target: "#ca8a04",     /* 目標(COLORS["target"]) */
+  currentPos: "#e74c3c", /* 現在位置(COLORS["current_pos"]) */
+  dutyFr: "#0d9488", dutyFl: "#dc2626", dutyRr: "#9333ea", dutyRl: "#16a34a",
+  current: "#f97316",    /* 電流(COLORS["current"]) */
+  ffX: "#d97706", ffY: "#db2777", ffNorm: "#64748b",
+  bmX: "#2563eb", bmY: "#16a34a",
+  invalidSpan: "rgba(148,163,184,0.15)",  /* plots.py INVALID_SPAN と同色 */
+  gridLine: "rgba(128,128,128,0.25)",     /* GRID_COLOR=gray, GRID_ALPHA 相当 */
+  zeroLine: "rgba(96,96,96,0.55)",
+  axisText: "#444444",
+};
+
+/* グラフ描画領域の背景色(CSS 変数 --plot-bg。init で一度だけ解決して
+   キャッシュし、毎フレームの getComputedStyle を避ける) */
+let PLOT_BG = "#ffffff";
+
+/*
+ * パネル定義(仕様書「パネル定義」の初期レイアウト順にハードコード)。
+ * ts 系列: {key: S のキー, label, color, w: 線幅, dash, wrap, faded}
+ * shade: "fly"=非飛行網掛け / "fly+yaw"=非飛行またはヨー制御OFF網掛け
+ */
+const PANEL_DEFS = [
+  { id: "video", title: "スマホ動画", type: "video" },
+  { id: "altitude", title: "高度", type: "ts", unit: "m", digits: 3, series: [
+    { key: "alt_est", label: "推定", color: C.altEst, w: 2.0 },
+    { key: "alt_tof", label: "ToF", color: C.altTof, w: 0.8 },
+    { key: "alt_ref", label: "目標", color: C.altRef, w: 1.2, dash: true },
+  ]},
+  { id: "position", title: "位置 XY", type: "xy" },
+  { id: "attitude", title: "現在の姿勢", type: "ts", unit: "deg", digits: 2, series: [
+    { key: "roll", label: "Roll", color: C.rollAxis, w: 1.4 },
+    { key: "pitch", label: "Pitch", color: C.pitchAxis, w: 1.4 },
+    { key: "yaw_ekf", label: "Yaw(EKF)", color: C.yawAxis, w: 1.4, wrap: true },
+    { key: "yaw_mad", label: "Yaw(Mad)", color: C.yawMad, w: 0.9, wrap: true, faded: true },
+  ]},
+  { id: "att_cmd", title: "姿勢指令角度", type: "ts", unit: "deg", digits: 2, series: [
+    { key: "roll_ref", label: "Roll", color: C.rollAxis, w: 1.4 },
+    { key: "pitch_ref", label: "Pitch", color: C.pitchAxis, w: 1.4 },
+    { key: "yaw_ref", label: "Yaw", color: C.yawAxis, w: 1.4, wrap: true },
+  ]},
+  { id: "att_err", title: "目標姿勢−現在姿勢", type: "ts", unit: "deg", digits: 2, series: [
+    { key: "err_roll", label: "Roll", color: C.rollAxis, w: 1.4 },
+    { key: "err_pitch", label: "Pitch", color: C.pitchAxis, w: 1.4 },
+    { key: "err_yaw", label: "Yaw", color: C.yawAxis, w: 1.4 },
+  ]},
+  { id: "rate", title: "現在の姿勢角速度", type: "ts", unit: "deg/s", digits: 1, series: [
+    { key: "p", label: "p", color: C.rollAxis, w: 1.2 },
+    { key: "q", label: "q", color: C.pitchAxis, w: 1.2 },
+    { key: "r", label: "r", color: C.yawAxis, w: 1.2 },
+  ]},
+  { id: "rate_ref", title: "目標の姿勢角速度", type: "ts", unit: "deg/s", digits: 1, series: [
+    { key: "p_ref", label: "p", color: C.rollAxis, w: 1.2 },
+    { key: "q_ref", label: "q", color: C.pitchAxis, w: 1.2 },
+    { key: "r_ref", label: "r", color: C.yawAxis, w: 1.2 },
+  ]},
+  { id: "rate_err", title: "目標−現在 角速度", type: "ts", unit: "deg/s", digits: 1, series: [
+    { key: "err_p", label: "p", color: C.rollAxis, w: 1.2 },
+    { key: "err_q", label: "q", color: C.pitchAxis, w: 1.2 },
+    { key: "err_r", label: "r", color: C.yawAxis, w: 1.2 },
+  ]},
+  { id: "pid_ang_roll", title: "角度ループ Roll PID成分", type: "ts", unit: "deg/s",
+    digits: 1, shade: "fly", series: [
+    { key: "pid_ang_roll_p", label: "P", color: C.pidP, w: 1.0 },
+    { key: "pid_ang_roll_i", label: "I", color: C.pidI, w: 1.0 },
+    { key: "pid_ang_roll_d", label: "D", color: C.pidD, w: 1.0 },
+    { key: "sum_ang_roll", label: "合計", color: C.pidSum, w: 1.5 },
+  ]},
+  { id: "pid_ang_pitch", title: "角度ループ Pitch PID成分", type: "ts", unit: "deg/s",
+    digits: 1, shade: "fly", series: [
+    { key: "pid_ang_pitch_p", label: "P", color: C.pidP, w: 1.0 },
+    { key: "pid_ang_pitch_i", label: "I", color: C.pidI, w: 1.0 },
+    { key: "pid_ang_pitch_d", label: "D", color: C.pidD, w: 1.0 },
+    { key: "sum_ang_pitch", label: "合計", color: C.pidSum, w: 1.5 },
+  ]},
+  { id: "pid_ang_yaw", title: "角度ループ Yaw PID成分", type: "ts", unit: "deg/s",
+    digits: 1, shade: "fly+yaw", series: [
+    { key: "pid_ang_yaw_p", label: "P", color: C.pidP, w: 1.0 },
+    { key: "pid_ang_yaw_i", label: "I", color: C.pidI, w: 1.0 },
+    { key: "pid_ang_yaw_d", label: "D", color: C.pidD, w: 1.0 },
+    { key: "sum_ang_yaw", label: "合計(クランプ前)", color: C.pidSum, w: 1.5 },
+    { key: "r_ref", label: "クランプ後", color: C.refGray, w: 1.2, dash: true },
+  ]},
+  { id: "pid_rate_roll", title: "角速度ループ Roll PID成分", type: "ts", unit: "出力",
+    digits: 4, shade: "fly", series: [
+    { key: "pid_rate_roll_p", label: "P", color: C.pidP, w: 1.0 },
+    { key: "pid_rate_roll_i", label: "I", color: C.pidI, w: 1.0 },
+    { key: "pid_rate_roll_d", label: "D", color: C.pidD, w: 1.0 },
+    { key: "sum_rate_roll", label: "合計", color: C.pidSum, w: 1.5 },
+  ]},
+  { id: "pid_rate_pitch", title: "角速度ループ Pitch PID成分", type: "ts", unit: "出力",
+    digits: 4, shade: "fly", series: [
+    { key: "pid_rate_pitch_p", label: "P", color: C.pidP, w: 1.0 },
+    { key: "pid_rate_pitch_i", label: "I", color: C.pidI, w: 1.0 },
+    { key: "pid_rate_pitch_d", label: "D", color: C.pidD, w: 1.0 },
+    { key: "sum_rate_pitch", label: "合計", color: C.pidSum, w: 1.5 },
+  ]},
+  { id: "pid_rate_yaw", title: "角速度ループ Yaw PID成分", type: "ts", unit: "出力",
+    digits: 4, shade: "fly+yaw", series: [
+    { key: "pid_rate_yaw_p", label: "P", color: C.pidP, w: 1.0 },
+    { key: "pid_rate_yaw_i", label: "I", color: C.pidI, w: 1.0 },
+    { key: "pid_rate_yaw_d", label: "D", color: C.pidD, w: 1.0 },
+    { key: "sum_rate_yaw", label: "合計", color: C.pidSum, w: 1.5 },
+  ]},
+  { id: "duty", title: "プロペラ duty比", type: "ts", unit: "0-1", digits: 3, series: [
+    { key: "duty_fr", label: "FR", color: C.dutyFr, w: 1.0 },
+    { key: "duty_fl", label: "FL", color: C.dutyFl, w: 1.0 },
+    { key: "duty_rr", label: "RR", color: C.dutyRr, w: 1.0 },
+    { key: "duty_rl", label: "RL", color: C.dutyRl, w: 1.0 },
+  ]},
+  { id: "current", title: "総電流", type: "ts", unit: "A", digits: 2, series: [
+    { key: "current_a", label: "電流", color: C.current, w: 1.4 },
+  ]},
+  { id: "ff", title: "FF補正 ΔB̂", type: "ts", unit: "µT", digits: 2, series: [
+    { key: "ff_x", label: "ΔB̂x", color: C.ffX, w: 1.3 },
+    { key: "ff_y", label: "ΔB̂y", color: C.ffY, w: 1.3 },
+    { key: "ff_norm", label: "|ΔB̂|", color: C.ffNorm, w: 0.9, faded: true },
+  ]},
+  { id: "bm", title: "EKF 磁気バイアス", type: "ts", unit: "µT", digits: 2, series: [
+    { key: "bm_x", label: "b̂m x", color: C.bmX, w: 1.3 },
+    { key: "bm_y", label: "b̂m y", color: C.bmY, w: 1.3 },
+  ]},
+  { id: "altvel", title: "高度速度と指令", type: "ts", unit: "m/s", digits: 3, series: [
+    { key: "alt_vel", label: "実測", color: C.altEst, w: 1.4 },
+    { key: "z_dot_ref", label: "指令", color: C.altRef, w: 1.2, dash: true },
+  ]},
+];
+const DEFAULT_ORDER = PANEL_DEFS.map((d) => d.id);
+if (PANEL_DEFS.length !== 20) {
+  throw new Error("パネル定義が仕様(20枠)と不一致: " + PANEL_DEFS.length);
+}
+
+/* ===================== アプリ状態 ===================== */
+const App = {
+  demo: false,
+  logName: "-",
+  rateHz: 50.0,
+  ds: null,            /* datasets[0](初版は単機のみ使用。構造は配列前提) */
+  datasets: [],
+  t0: 0, t1: 0, dur: 0, frameDt: 0.02,
+  tau: 0,              /* 再生ヘッド時刻(ログ経過秒) */
+  playing: false,
+  speed: 1.0,
+  panels: new Map(),   /* id → ランタイム {def, el, ...} */
+  layout: null,        /* {order, hidden, wide, videoOffset, speed, xyAuto} */
+  video: null,         /* 動画パネルのランタイム */
+  needRedraw: true,
+  dragging: null,
+};
+
+const TS_HEIGHT = 210;   /* ts パネルの描画高さ [CSSpx] */
+const XY_HEIGHT = 330;   /* xy パネルの描画高さ [CSSpx] */
+const PLOT_MARGIN = { left: 46, right: 10, top: 8, bottom: 20 };
+
+function defaultLayout() {
+  return {
+    order: DEFAULT_ORDER.slice(),
+    hidden: [],
+    wide: [],
+    videoOffset: 0.0,
+    speed: 1.0,
+    xyAuto: false,
+  };
+}
+
+/* ===================== ts パネル描画 ===================== */
+/*
+ * mp4 アニメ(animation.py _update_ts_panels)と同じスライディングウィンドウ:
+ * 表示窓 x = [now − TS_WINDOW_S, now + TS_WINDOW_S×TS_LEAD_FRAC]。データは
+ * now まで描画し、曲線の右端が現在時刻(カーソル縦線なし)。x 軸目盛りは
+ * 絶対秒で窓の移動に合わせて流れる。y レンジは全データの 1-99 パーセンタイル
+ * 固定(p.yRange キャッシュ)。窓内は最大でも数百点×数系列なので
+ * 毎フレーム直接描画で 60fps を維持できる。devicePixelRatio 対応。
+ */
+const TS_WINDOW_S = 5.0;    /* 表示窓の過去側幅 [s](animation.py TRAIL_WINDOW_S) */
+const TS_LEAD_FRAC = 0.1;   /* now より先側の空白余白(窓幅に対する比率) */
+
+/* 無効区間マスク(Uint8Array)→ [開始i, 終了i(排他)] の区間リスト */
+function maskToSpans(mask) {
+  const spans = [];
+  let start = -1;
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i] && start < 0) start = i;
+    if (!mask[i] && start >= 0) { spans.push([start, i]); start = -1; }
+  }
+  if (start >= 0) spans.push([start, mask.length]);
+  return spans;
+}
+
+/* 網掛け区間リスト(データセット不変なので S にキャッシュして毎フレーム再利用) */
+function shadeSpans(S, kind) {
+  if (kind === "fly+yaw") {
+    if (!S._spans_yaw) S._spans_yaw = maskToSpans(S._invalid_yaw);
+    return S._spans_yaw;
+  }
+  if (!S._spans_fly) S._spans_fly = maskToSpans(S._invalid_fly);
+  return S._spans_fly;
+}
+
+/* 1 本の系列の [i0, i1) 区間を折れ線で描く
+   (NaN で切断、wrap 系列は ±180 跨ぎでも切断) */
+function strokeSeries(ctx, t, y, xOf, yOf, spec, i0, i1) {
+  ctx.strokeStyle = spec.color;
+  ctx.lineWidth = spec.w || 1.2;
+  ctx.globalAlpha = spec.faded ? 0.55 : 0.92;
+  ctx.setLineDash(spec.dash ? [5, 4] : []);
+  ctx.beginPath();
+  let pen = false, prev = NaN;
+  for (let i = i0; i < i1; i++) {
+    const v = y[i];
+    if (!isFinite(v)) { pen = false; continue; }
+    if (spec.wrap && pen && Math.abs(v - prev) > 180.0) pen = false;
+    const x = xOf(t[i]), yy = yOf(v);
+    if (!pen) { ctx.moveTo(x, yy); pen = true; } else { ctx.lineTo(x, yy); }
+    prev = v;
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1.0;
+}
+
+/* ts パネルの canvas サイズ・プロット領域・y レンジを(再)設定する */
+function setupTsCanvas(p) {
+  const cssW = p.canvas.clientWidth || 380;
+  const cssH = TS_HEIGHT;
+  const dpr = window.devicePixelRatio || 1;
+  p.canvas.width = Math.round(cssW * dpr);
+  p.canvas.height = Math.round(cssH * dpr);
+  p.canvas.style.height = cssH + "px";
+  p.cssW = cssW; p.cssH = cssH; p.dpr = dpr;
+  const m = PLOT_MARGIN;
+  p.plotX0 = m.left; p.plotX1 = cssW - m.right;
+  p.plotY0 = m.top; p.plotY1 = cssH - m.bottom;
+  /* y レンジはデータセット不変なのでパネルごとに1回だけ計算する
+     (巨大ログでの表示切替・リサイズ時の全ソート再計算を避ける) */
+  if (!p.yRange) {
+    p.yRange = percentileRange(p.def.series.map((s) => App.ds.S[s.key]));
+  }
+  p.ready = true;
+}
+
+/* ts パネルの毎フレーム描画(スライディングウィンドウを直接描画) */
+function drawTsFrame(p) {
+  if (!p.ready) return;
+  const S = App.ds.S, t = S.t;
+  const now = App.tau;
+  const tLo = now - TS_WINDOW_S;
+  const tHi = now + TS_WINDOW_S * TS_LEAD_FRAC;
+  const [ylo, yhi] = p.yRange;
+  const plotW = p.plotX1 - p.plotX0, plotH = p.plotY1 - p.plotY0;
+  const xOf = (tv) => p.plotX0 + (tv - tLo) / (tHi - tLo) * plotW;
+  const yOf = (v) => p.plotY0 + (yhi - v) / (yhi - ylo) * plotH;
+
+  const ctx = p.canvas.getContext("2d");
+  ctx.setTransform(p.dpr, 0, 0, p.dpr, 0, 0);
+  ctx.clearRect(0, 0, p.cssW, p.cssH);
+  ctx.fillStyle = PLOT_BG;
+  ctx.fillRect(p.plotX0, p.plotY0, plotW, plotH);
+
+  /* 無効区間の網掛け(PID 系のみ。plots.py の網掛けと同じ意味)。
+     曲線と同じく now までに揃える(now より先の空白余白には描かない) */
+  if (p.def.shade) {
+    ctx.fillStyle = C.invalidSpan;
+    for (const [s0, s1] of shadeSpans(S, p.def.shade)) {
+      const spanT0 = t[s0];
+      /* 区間右端は次サンプル境界まで(幅ゼロ防止。plots.py と同処理) */
+      const spanT1 = s1 < t.length ? t[s1] : t[t.length - 1] + App.frameDt;
+      const a = Math.max(spanT0, tLo), b = Math.min(spanT1, now);
+      if (b <= a) continue;
+      ctx.fillRect(xOf(a), p.plotY0, Math.max(xOf(b) - xOf(a), 1), plotH);
+    }
+  }
+
+  /* グリッド+軸目盛り(x は絶対秒。窓の移動に合わせてラベルが流れる) */
+  ctx.font = "10px sans-serif";
+  ctx.fillStyle = C.axisText;
+  ctx.strokeStyle = C.gridLine;
+  ctx.lineWidth = 1;
+  const tStep = niceStep(tHi - tLo, 6);
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let tv = Math.ceil(tLo / tStep) * tStep; tv <= tHi + 1e-9; tv += tStep) {
+    const x = xOf(tv);
+    ctx.beginPath(); ctx.moveTo(x, p.plotY0); ctx.lineTo(x, p.plotY1); ctx.stroke();
+    ctx.fillText(tStep < 1 ? tv.toFixed(1) : String(Math.round(tv)), x, p.plotY1 + 4);
+  }
+  const yStep = niceStep(yhi - ylo, 4);
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let yv = Math.ceil(ylo / yStep) * yStep; yv <= yhi + 1e-9; yv += yStep) {
+    const yy = yOf(yv);
+    ctx.beginPath(); ctx.moveTo(p.plotX0, yy); ctx.lineTo(p.plotX1, yy); ctx.stroke();
+    const digits = yStep >= 1 ? 0 : Math.min(3, Math.ceil(-Math.log10(yStep)));
+    ctx.fillText(yv.toFixed(digits), p.plotX0 - 4, yy);
+  }
+  /* 0 線(レンジ内にあれば強調) */
+  if (ylo < 0 && yhi > 0) {
+    ctx.strokeStyle = C.zeroLine;
+    ctx.beginPath(); ctx.moveTo(p.plotX0, yOf(0)); ctx.lineTo(p.plotX1, yOf(0));
+    ctx.stroke();
+  }
+
+  /* 曲線(窓内のみ描画。曲線の右端 = 現在時刻) */
+  const [i0, i1] = windowIndexRange(t, tLo, now);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(p.plotX0, p.plotY0, plotW, plotH); ctx.clip();
+  for (const spec of p.def.series) {
+    strokeSeries(ctx, t, S[spec.key], xOf, yOf, spec, i0, i1);
+  }
+  ctx.restore();
+}
+
+/* ===================== xy パネル描画 ===================== */
+function buildXyRange(p) {
+  const S = App.ds.S;
+  if (App.layout.xyAuto) {
+    const [xlo, xhi] = percentileRange([S.pos_x, S.target_x]);
+    const [ylo, yhi] = percentileRange([S.pos_y, S.target_y]);
+    const half = Math.max((xhi - xlo) / 2, (yhi - ylo) / 2, 0.25);
+    p.cx = (xlo + xhi) / 2; p.cy = (ylo + yhi) / 2; p.half = half;
+  } else {
+    p.cx = 0; p.cy = 0; p.half = 2.0;   /* 仕様: ±2m 固定 */
+  }
+}
+
+function buildXyCanvas(p) {
+  const cssW = p.canvas.clientWidth || 380;
+  const cssH = XY_HEIGHT;
+  const dpr = window.devicePixelRatio || 1;
+  p.canvas.width = Math.round(cssW * dpr);
+  p.canvas.height = Math.round(cssH * dpr);
+  p.canvas.style.height = cssH + "px";
+  p.cssW = cssW; p.cssH = cssH; p.dpr = dpr;
+  buildXyRange(p);
+  p.ready = true;
+}
+
+function drawXyFrame(p) {
+  if (!p.ready) return;
+  const S = App.ds.S, t = S.t;
+  const ctx = p.canvas.getContext("2d");
+  ctx.setTransform(p.dpr, 0, 0, p.dpr, 0, 0);
+  ctx.clearRect(0, 0, p.cssW, p.cssH);
+  const size = Math.min(p.cssW - 20, p.cssH - 20);
+  const ox = (p.cssW - size) / 2, oy = (p.cssH - size) / 2;
+  const scale = size / (2 * p.half);
+  const xOf = (wx) => ox + (wx - p.cx + p.half) * scale;
+  const yOf = (wy) => oy + (p.cy + p.half - wy) * scale;  /* Y 上向き */
+
+  ctx.fillStyle = PLOT_BG;
+  ctx.fillRect(ox, oy, size, size);
+
+  /* グリッド(0.5m 間隔)+軸ラベル */
+  ctx.strokeStyle = C.gridLine; ctx.lineWidth = 1;
+  ctx.fillStyle = C.axisText; ctx.font = "10px sans-serif";
+  const gStep = p.half > 3 ? niceStep(p.half, 3) : 0.5;
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let gx = Math.ceil((p.cx - p.half) / gStep) * gStep;
+       gx <= p.cx + p.half + 1e-9; gx += gStep) {
+    const x = xOf(gx);
+    ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + size); ctx.stroke();
+    ctx.fillText(gx.toFixed(1), x, oy + size + 3);
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let gy = Math.ceil((p.cy - p.half) / gStep) * gStep;
+       gy <= p.cy + p.half + 1e-9; gy += gStep) {
+    const y = yOf(gy);
+    ctx.beginPath(); ctx.moveTo(ox, y); ctx.lineTo(ox + size, y); ctx.stroke();
+    ctx.fillText(gy.toFixed(1), ox - 3, y);
+  }
+  /* 原点軸 */
+  ctx.strokeStyle = C.zeroLine;
+  if (Math.abs(p.cx) < p.half) {
+    ctx.beginPath(); ctx.moveTo(xOf(0), oy); ctx.lineTo(xOf(0), oy + size); ctx.stroke();
+  }
+  if (Math.abs(p.cy) < p.half) {
+    ctx.beginPath(); ctx.moveTo(ox, yOf(0)); ctx.lineTo(ox + size, yOf(0)); ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(ox, oy, size, size); ctx.clip();
+
+  /* 軌跡: 直近 10 秒をフェード付き折れ線で(古いほど薄く) */
+  const iNow = indexOfTime(t, App.tau);
+  const iFrom = indexOfTime(t, App.tau - 10.0);
+  const SEGMENTS = 8;
+  const total = iNow - iFrom;
+  if (total > 1) {
+    for (let s = 0; s < SEGMENTS; s++) {
+      const a0 = iFrom + Math.floor(total * s / SEGMENTS);
+      const a1 = iFrom + Math.floor(total * (s + 1) / SEGMENTS);
+      ctx.strokeStyle = C.traj;
+      ctx.globalAlpha = 0.12 + 0.78 * (s + 1) / SEGMENTS;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      let pen = false;
+      for (let i = a0; i <= Math.min(a1, iNow); i++) {
+        const x = S.pos_x[i], y = S.pos_y[i];
+        if (!isFinite(x) || !isFinite(y)) { pen = false; continue; }
+        if (!pen) { ctx.moveTo(xOf(x), yOf(y)); pen = true; }
+        else ctx.lineTo(xOf(x), yOf(y));
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1.0;
+  }
+
+  /* 目標位置(◎ 二重丸) */
+  const tx = S.target_x[iNow], ty = S.target_y[iNow];
+  if (isFinite(tx) && isFinite(ty)) {
+    ctx.strokeStyle = C.target; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(xOf(tx), yOf(ty), 8, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.arc(xOf(tx), yOf(ty), 3, 0, 2 * Math.PI); ctx.stroke();
+  }
+  /* 現在位置(点) */
+  const px = S.pos_x[iNow], py = S.pos_y[iNow];
+  if (isFinite(px) && isFinite(py)) {
+    ctx.fillStyle = C.currentPos;
+    ctx.beginPath(); ctx.arc(xOf(px), yOf(py), 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ===================== パネル DOM 構築 ===================== */
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function buildPanelDom(def) {
+  const p = { def: def, ready: false, valEls: [] };
+  const panel = el("div", "panel");
+  panel.dataset.id = def.id;
+  p.el = panel;
+
+  /* ヘッダ: タイトル+現在値+単位+幅切替+非表示。ドラッグで並び替え */
+  const head = el("div", "panel-head");
+  head.appendChild(el("span", "p-title", def.title));
+  const vals = el("span", "p-vals");
+  head.appendChild(vals);
+  if (def.unit) head.appendChild(el("span", "p-unit", "[" + def.unit + "]"));
+  const btnWide = el("button", null, "⇔");
+  btnWide.title = "幅切替(1列 / 2列)";
+  btnWide.addEventListener("click", (e) => { e.stopPropagation(); toggleWide(def.id); });
+  head.appendChild(btnWide);
+  p.btnWide = btnWide;
+  const btnHide = el("button", null, "×");
+  btnHide.title = "このパネルを非表示";
+  btnHide.addEventListener("click", (e) => { e.stopPropagation(); setPanelHidden(def.id, true); });
+  head.appendChild(btnHide);
+  panel.appendChild(head);
+  attachDragHandlers(p, head);
+
+  const body = el("div", "panel-body");
+  panel.appendChild(body);
+  p.body = body;
+
+  if (def.type === "ts" || def.type === "xy") {
+    const canvas = document.createElement("canvas");
+    body.appendChild(canvas);
+    p.canvas = canvas;
+    if (def.type === "ts") {
+      /* 曲線クリックでシーク(表示窓内の x → 絶対時刻。範囲外は seekTo が
+         [t0, t1] にクランプする) */
+      canvas.addEventListener("click", (e) => {
+        if (!p.ready) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        if (x < p.plotX0 || x > p.plotX1) return;
+        const frac = (x - p.plotX0) / (p.plotX1 - p.plotX0);
+        const tLo = App.tau - TS_WINDOW_S;
+        seekTo(tLo + frac * TS_WINDOW_S * (1 + TS_LEAD_FRAC));
+      });
+      /* 凡例(現在値)スパン */
+      for (const spec of def.series) {
+        const sp = el("span");
+        const name = el("b", null, spec.label);
+        name.style.color = spec.color;
+        sp.appendChild(name);
+        sp.appendChild(document.createTextNode(" "));
+        const num = el("span", null, "–");
+        sp.appendChild(num);
+        vals.appendChild(sp);
+        p.valEls.push({ el: num, key: spec.key });
+      }
+    } else {
+      /* xy: 範囲切替(±2m 固定 / 自動フィット) */
+      const tools = el("div", "xy-tools");
+      const btnRange = el("button", null, "±2m");
+      btnRange.title = "表示範囲: ±2m固定 / 自動フィット";
+      btnRange.addEventListener("click", () => {
+        App.layout.xyAuto = !App.layout.xyAuto;
+        btnRange.textContent = App.layout.xyAuto ? "自動" : "±2m";
+        buildXyRange(p);
+        App.needRedraw = true;
+        saveLayout();
+      });
+      p.btnRange = btnRange;
+      tools.appendChild(btnRange);
+      body.appendChild(tools);
+      /* 現在値(位置と目標) */
+      const sp = el("span");
+      const num = el("span", null, "–");
+      sp.appendChild(num);
+      vals.appendChild(sp);
+      p.valEls.push({ el: num, key: "__xy__" });
+    }
+  } else if (def.type === "video") {
+    buildVideoBody(p, body, vals);
+  }
+  return p;
+}
+
+/* --- 動画パネル(ファイル選択+D&D+パス/URL入力+オフセット調整) --- */
+function buildVideoBody(p, body, vals) {
+  body.classList.add("video-body");
+  const drop = el("div", "video-drop");
+  const video = document.createElement("video");
+  video.muted = true;             /* 仕様: muted 再生 */
+  video.playsInline = true;
+  video.preload = "auto";
+  drop.appendChild(video);
+  const hint = el("div", "vd-hint",
+    "ここに動画ファイルをドロップ / 下のボタンで選択 / パス・URL入力");
+  drop.appendChild(hint);
+  body.appendChild(drop);
+
+  /* 差し替え時に前回の blob URL を revoke する(File 参照のリーク防止。
+     パス/URL 読込の非 blob ソースは revoke 対象にしない) */
+  let curBlobUrl = null;
+  const setSrc = (src, label) => {
+    if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
+    if (src.startsWith("blob:")) curBlobUrl = src;
+    video.src = src;
+    video.style.display = "block";
+    hint.style.display = "none";
+    App.video.loaded = true;
+    App.video.label = label || src;
+    syncVideo(true);
+  };
+
+  /* ドラッグ&ドロップ */
+  drop.addEventListener("dragover", (e) => {
+    e.preventDefault(); drop.classList.add("dragover");
+  });
+  drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault(); drop.classList.remove("dragover");
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) setSrc(URL.createObjectURL(f), f.name);
+  });
+
+  /* ファイル選択 */
+  const row1 = el("div", "video-row");
+  const btnFile = el("button", null, "動画ファイルを選択");
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = "video/*";
+  fileInput.style.display = "none";
+  fileInput.addEventListener("change", () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (f) setSrc(URL.createObjectURL(f), f.name);
+  });
+  btnFile.addEventListener("click", () => fileInput.click());
+  row1.appendChild(btnFile);
+  row1.appendChild(fileInput);
+  /* 相対パス / URL 入力(HTML と同じフォルダに置いた動画を想定) */
+  const pathInput = document.createElement("input");
+  pathInput.type = "text";
+  pathInput.placeholder = "相対パス または URL(例: flight.mp4)";
+  const btnLoad = el("button", null, "読込");
+  const loadPath = () => { if (pathInput.value.trim()) setSrc(pathInput.value.trim()); };
+  btnLoad.addEventListener("click", loadPath);
+  pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") loadPath(); });
+  row1.appendChild(pathInput);
+  row1.appendChild(btnLoad);
+  body.appendChild(row1);
+
+  /* オフセット調整(±10s・0.01s刻み+数値入力) */
+  const row2 = el("div", "video-row");
+  row2.appendChild(el("span", null, "オフセット"));
+  const offSlider = document.createElement("input");
+  offSlider.type = "range";
+  offSlider.min = "-10"; offSlider.max = "10"; offSlider.step = "0.01";
+  const offNum = document.createElement("input");
+  offNum.type = "number";
+  offNum.step = "0.01";
+  offNum.className = "off-num";
+  const applyOffset = (v) => {
+    const off = Math.max(-10, Math.min(10, +v || 0));
+    App.layout.videoOffset = off;
+    offSlider.value = String(off);
+    offNum.value = off.toFixed(2);
+    syncVideo(true);
+    saveLayout();
+  };
+  offSlider.addEventListener("input", () => applyOffset(offSlider.value));
+  offNum.addEventListener("change", () => applyOffset(offNum.value));
+  row2.appendChild(offSlider);
+  row2.appendChild(offNum);
+  row2.appendChild(el("span", null, "s"));
+  body.appendChild(row2);
+  body.appendChild(el("div", "video-note",
+    "規約: スマホ動画は START と同時に録画開始(オフセット初期値 0)。" +
+    "video.currentTime = 再生時刻 + オフセット で同期。"));
+
+  App.video = {
+    el: video, loaded: false, label: null,
+    slider: offSlider, num: offNum, applyOffset: applyOffset,
+  };
+  const sp = el("span");
+  const num = el("span", null, "動画未読込");
+  sp.appendChild(num);
+  vals.appendChild(sp);
+  p.valEls.push({ el: num, key: "__video__" });
+}
+
+/* 動画同期: video.currentTime = 再生時刻 + オフセット(仕様の同期規約)。
+   動画範囲外(負オフセットのプリロール/動画終端後)は端のフレームで
+   一時停止して保持する(範囲外で play したままだと 0 への巻き戻しループに、
+   target を端にクランプしないと毎フレーム冗長シークになるため)。 */
+function syncVideo(force) {
+  const v = App.video;
+  if (!v || !v.loaded) return;
+  const dur = v.el.duration || Infinity;
+  const raw = App.tau - App.t0 + App.layout.videoOffset;
+  const target = Math.max(0, Math.min(raw, dur));
+  const outside = raw < 0 || raw >= dur;
+  if (v.el.playbackRate !== App.speed) v.el.playbackRate = App.speed;
+  if (App.playing && !outside) {
+    if (v.el.paused) { v.el.play().catch(() => {}); }
+    /* 再生中はドリフトが大きいときだけ再同期(カクつき防止) */
+    if (force || Math.abs(v.el.currentTime - target) > 0.15) {
+      v.el.currentTime = target;
+    }
+  } else {
+    if (!v.el.paused) v.el.pause();
+    if (force || Math.abs(v.el.currentTime - target) > 0.01) {
+      v.el.currentTime = target;
+    }
+  }
+}
+
+/* ===================== 並び替え(Pointer Events 自前実装) ===================== */
+function attachDragHandlers(p, head) {
+  head.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest("button") || e.target.closest("input")) return;
+    const drag = {
+      p: p, startX: e.clientX, startY: e.clientY,
+      active: false, target: null,
+    };
+    App.dragging = drag;
+    head.setPointerCapture(e.pointerId);
+
+    const onMove = (ev) => {
+      if (!drag.active) {
+        if (Math.hypot(ev.clientX - drag.startX, ev.clientY - drag.startY) < 6) return;
+        drag.active = true;
+        p.el.classList.add("dragging");
+      }
+      const under = document.elementsFromPoint(ev.clientX, ev.clientY);
+      let cand = null;
+      for (const node of under) {
+        const panelEl = node.closest ? node.closest(".panel") : null;
+        if (panelEl && panelEl !== p.el) { cand = panelEl; break; }
+      }
+      if (drag.target && drag.target !== cand) {
+        drag.target.classList.remove("drop-target");
+      }
+      drag.target = cand;
+      if (cand) cand.classList.add("drop-target");   /* ドロップ先ハイライト */
+    };
+    const onUp = () => {
+      head.removeEventListener("pointermove", onMove);
+      head.removeEventListener("pointerup", onUp);
+      head.removeEventListener("pointercancel", onUp);
+      p.el.classList.remove("dragging");
+      if (drag.target) {
+        drag.target.classList.remove("drop-target");
+        if (drag.active) reorderPanel(p.el, drag.target);
+      }
+      App.dragging = null;
+    };
+    head.addEventListener("pointermove", onMove);
+    head.addEventListener("pointerup", onUp);
+    head.addEventListener("pointercancel", onUp);
+  });
+}
+
+/* dragged を target の位置へ移動(target が前なら before、後なら after) */
+function reorderPanel(draggedEl, targetEl) {
+  const grid = document.getElementById("grid");
+  const children = Array.from(grid.children);
+  const iDrag = children.indexOf(draggedEl);
+  const iTarget = children.indexOf(targetEl);
+  if (iDrag < 0 || iTarget < 0) return;
+  if (iDrag < iTarget) grid.insertBefore(draggedEl, targetEl.nextSibling);
+  else grid.insertBefore(draggedEl, targetEl);
+  syncOrderFromDom();
+  saveLayout();
+}
+
+/* DOM の並びから layout.order を更新(表示中 DOM 順 → 非表示は旧順で末尾) */
+function syncOrderFromDom() {
+  const grid = document.getElementById("grid");
+  const visibleOrder = Array.from(grid.children).map((c) => c.dataset.id);
+  const hiddenSet = new Set(App.layout.hidden);
+  App.layout.order = visibleOrder.concat(
+    App.layout.order.filter((id) => hiddenSet.has(id)));
+}
+
+/* ===================== レイアウト永続化(localStorage + JSON) ===================== */
+function storageKey() { return "sfiv:" + App.logName; }
+
+/* 未知 id の除去・欠落 id の補完をして layout を正規化する */
+function normalizeLayout(raw) {
+  const lay = defaultLayout();
+  if (!raw || typeof raw !== "object") return lay;
+  const known = new Set(DEFAULT_ORDER);
+  if (Array.isArray(raw.order)) {
+    const seen = new Set();
+    const order = [];
+    for (const id of raw.order) {
+      if (known.has(id) && !seen.has(id)) { order.push(id); seen.add(id); }
+    }
+    for (const id of DEFAULT_ORDER) if (!seen.has(id)) order.push(id);
+    lay.order = order;
+  }
+  if (Array.isArray(raw.hidden)) {
+    lay.hidden = raw.hidden.filter((id) => known.has(id));
+  }
+  if (Array.isArray(raw.wide)) {
+    lay.wide = raw.wide.filter((id) => known.has(id));
+  }
+  if (isFinite(+raw.videoOffset)) {
+    lay.videoOffset = Math.max(-10, Math.min(10, +raw.videoOffset));
+  }
+  if ([0.25, 0.5, 1, 2].includes(+raw.speed)) lay.speed = +raw.speed;
+  lay.xyAuto = !!raw.xyAuto;
+  return lay;
+}
+
+function saveLayout() {
+  try {
+    localStorage.setItem(storageKey(), JSON.stringify(App.layout));
+  } catch (e) { /* プライベートモード等では保存しない */ }
+}
+
+function loadLayout() {
+  try {
+    const raw = localStorage.getItem(storageKey());
+    return normalizeLayout(raw ? JSON.parse(raw) : null);
+  } catch (e) {
+    return defaultLayout();
+  }
+}
+
+/* レイアウト JSON の書き出し(ダウンロード) */
+function exportLayout() {
+  const payload = Object.assign(
+    { format: "sfiv-layout", version: 1, log_name: App.logName }, App.layout);
+  const blob = new Blob([JSON.stringify(payload, null, 2)],
+                       { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "sfiv_layout_" + App.logName + ".json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+/* レイアウト JSON の読み込み(取込 → 再構築 → 保存) */
+function importLayoutFromFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const raw = JSON.parse(String(reader.result));
+      /* 無関係な JSON を取り込むとレイアウトが黙って初期化されるため、
+         書き出し時に付与している format マーカーを必須にする */
+      if (!raw || typeof raw !== "object" || raw.format !== "sfiv-layout") {
+        alert("レイアウト JSON ではありません" +
+              "(「レイアウト書き出し」で保存したファイルを選んでください)");
+        return;
+      }
+      App.layout = normalizeLayout(raw);
+      applyLayout();
+      saveLayout();
+      syncVideo(true);   /* 取り込んだ動画オフセットを停止中の表示にも反映 */
+    } catch (e) {
+      alert("レイアウト JSON を読み込めませんでした: " + e.message);
+    }
+  };
+  reader.onerror = () => {
+    alert("レイアウト JSON を読み取れませんでした: " +
+          (reader.error && reader.error.message ? reader.error.message
+                                                : "ファイルを読み取れません"));
+  };
+  reader.readAsText(file);
+}
+
+/* ===================== 表示 ON/OFF・幅切替・グリッド再構築 ===================== */
+function setPanelHidden(id, hidden) {
+  const set = new Set(App.layout.hidden);
+  if (hidden) set.add(id); else set.delete(id);
+  App.layout.hidden = Array.from(set);
+  applyLayout();
+  saveLayout();
+}
+
+function toggleWide(id) {
+  const set = new Set(App.layout.wide);
+  if (set.has(id)) set.delete(id); else set.add(id);
+  App.layout.wide = Array.from(set);
+  applyLayout();
+  saveLayout();
+}
+
+/* layout の内容を DOM に反映する(並び順・表示・幅・速度・動画オフセット) */
+function applyLayout() {
+  const grid = document.getElementById("grid");
+  const hiddenSet = new Set(App.layout.hidden);
+  const wideSet = new Set(App.layout.wide);
+  /* いったん外して order 順に付け直す(付け外しでも動画は src を保持) */
+  for (const [, p] of App.panels) {
+    if (p.el.parentNode) p.el.parentNode.removeChild(p.el);
+  }
+  for (const id of App.layout.order) {
+    const p = App.panels.get(id);
+    if (!p || hiddenSet.has(id)) continue;
+    p.el.classList.toggle("wide", wideSet.has(id));
+    grid.appendChild(p.el);
+  }
+  /* 速度・動画オフセット・xy レンジボタンの表示を同期 */
+  setSpeed(App.layout.speed, { skipSave: true });
+  if (App.video) {
+    App.video.slider.value = String(App.layout.videoOffset);
+    App.video.num.value = App.layout.videoOffset.toFixed(2);
+  }
+  const xyPanel = App.panels.get("position");
+  if (xyPanel && xyPanel.btnRange) {
+    xyPanel.btnRange.textContent = App.layout.xyAuto ? "自動" : "±2m";
+  }
+  refreshMenuChecks();
+  /* サイズ確定後に canvas サイズを再同期して再描画 */
+  requestAnimationFrame(() => { resizeAllCanvases(); });
+}
+
+/* 表示中パネルの canvas サイズを再同期する(リサイズ・レイアウト変更時) */
+function resizeAllCanvases() {
+  const hiddenSet = new Set(App.layout.hidden);
+  for (const [id, p] of App.panels) {
+    if (hiddenSet.has(id)) continue;
+    if (p.def.type === "ts") setupTsCanvas(p);
+    else if (p.def.type === "xy") buildXyCanvas(p);
+  }
+  App.needRedraw = true;
+}
+
+/* ===================== パネルメニュー(チェックリスト) ===================== */
+function buildPanelMenu() {
+  const checks = document.getElementById("panelChecks");
+  checks.textContent = "";
+  for (const def of PANEL_DEFS) {
+    const label = el("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.id = def.id;
+    cb.addEventListener("change", () => setPanelHidden(def.id, !cb.checked));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(def.title));
+    checks.appendChild(label);
+  }
+  refreshMenuChecks();
+}
+
+function refreshMenuChecks() {
+  const hiddenSet = new Set(App.layout.hidden);
+  document.querySelectorAll("#panelChecks input[type=checkbox]").forEach((cb) => {
+    cb.checked = !hiddenSet.has(cb.dataset.id);
+  });
+}
+
+/* ===================== 再生エンジン(requestAnimationFrame) ===================== */
+function setSpeed(speed, opts) {
+  App.speed = speed;
+  App.layout.speed = speed;
+  document.querySelectorAll("#speedGroup button").forEach((b) => {
+    b.classList.toggle("active", +b.dataset.speed === speed);
+  });
+  if (App.video && App.video.loaded) App.video.el.playbackRate = speed;
+  if (!(opts && opts.skipSave)) saveLayout();
+}
+
+function setPlaying(playing) {
+  App.playing = playing;
+  document.getElementById("btnPlay").textContent = playing ? "停止" : "再生";
+  syncVideo(true);
+}
+
+function seekTo(tau, opts) {
+  App.tau = Math.max(App.t0, Math.min(App.t1, tau));
+  App.needRedraw = true;
+  if (!(opts && opts.fromSeekBar)) {
+    document.getElementById("seekBar").value = String(App.tau - App.t0);
+  }
+  if (!(opts && opts.fromTimeInput)) {
+    document.getElementById("timeNow").value = (App.tau - App.t0).toFixed(2);
+  }
+  syncVideo(true);
+}
+
+/* 凡例の現在値表示を更新する */
+function updateLegendValues() {
+  const S = App.ds.S;
+  const i = indexOfTime(S.t, App.tau);
+  const hiddenSet = new Set(App.layout.hidden);
+  for (const [id, p] of App.panels) {
+    if (hiddenSet.has(id)) continue;
+    for (const v of p.valEls) {
+      if (v.key === "__xy__") {
+        v.el.textContent =
+          "位置 (" + fmtVal(S.pos_x[i], 2) + ", " + fmtVal(S.pos_y[i], 2) +
+          ") 目標 (" + fmtVal(S.target_x[i], 2) + ", " + fmtVal(S.target_y[i], 2) + ")";
+      } else if (v.key === "__video__") {
+        v.el.textContent = App.video && App.video.loaded
+          ? (App.video.label || "動画") +
+            "  offset " + App.layout.videoOffset.toFixed(2) + "s"
+          : "動画未読込";
+      } else {
+        v.el.textContent = fmtVal(S[v.key][i], p.def.digits ?? 2);
+      }
+    }
+  }
+}
+
+/* メインループ: 再生中は tau を進め、tau が変わったフレームだけ再描画 */
+function mainLoop(nowMs) {
+  if (App.playing) {
+    if (App._lastMs !== undefined) {
+      /* 1フレームの前進量は実時間 0.1s までにクランプする(タブ非表示中は
+         rAF が停止するため、復帰時に隠れていた時間ぶん一気にジャンプするのを防ぐ) */
+      const dt = Math.min((nowMs - App._lastMs) / 1000, 0.1) * App.speed;
+      App.tau += dt;
+      if (App.tau >= App.t1) {           /* 終端で自動停止(その場停止) */
+        App.tau = App.t1;
+        setPlaying(false);
+      }
+      /* ユーザー操作中の要素は上書きしない(シークバーはドラッグ中の
+         ジッタ防止、時刻入力は再生中のタイピングが毎フレーム消える防止) */
+      if (!App._seeking) {
+        document.getElementById("seekBar").value = String(App.tau - App.t0);
+      }
+      const timeNowEl = document.getElementById("timeNow");
+      if (document.activeElement !== timeNowEl) {
+        timeNowEl.value = (App.tau - App.t0).toFixed(2);
+      }
+      App.needRedraw = true;
+      syncVideo(false);
+    }
+    App._lastMs = nowMs;
+  } else {
+    App._lastMs = nowMs;
+  }
+  if (App.needRedraw) {
+    App.needRedraw = false;
+    const hiddenSet = new Set(App.layout.hidden);
+    for (const [id, p] of App.panels) {
+      if (hiddenSet.has(id)) continue;
+      if (p.def.type === "ts") drawTsFrame(p);
+      else if (p.def.type === "xy") drawXyFrame(p);
+    }
+    updateLegendValues();
+  }
+  requestAnimationFrame(mainLoop);
+}
+
+/* ===================== ヘッダ UI・キーボード ===================== */
+function bindHeaderUi() {
+  document.getElementById("btnPlay").addEventListener("click", () => {
+    if (!App.playing && App.tau >= App.t1) seekTo(App.t0);  /* 終端から再生 */
+    setPlaying(!App.playing);
+  });
+  document.getElementById("btnStepB").addEventListener("click", () => {
+    setPlaying(false); seekTo(App.tau - App.frameDt);
+  });
+  document.getElementById("btnStepF").addEventListener("click", () => {
+    setPlaying(false); seekTo(App.tau + App.frameDt);
+  });
+  const seekBar = document.getElementById("seekBar");
+  seekBar.addEventListener("input", () => {
+    seekTo(App.t0 + (+seekBar.value), { fromSeekBar: true });
+  });
+  /* ドラッグ中フラグ(mainLoop がサムを書き戻してジッタが出るのを防ぐ) */
+  seekBar.addEventListener("pointerdown", () => { App._seeking = true; });
+  seekBar.addEventListener("pointerup", () => { App._seeking = false; });
+  seekBar.addEventListener("pointercancel", () => { App._seeking = false; });
+  const timeNow = document.getElementById("timeNow");
+  timeNow.addEventListener("change", () => {
+    seekTo(App.t0 + (+timeNow.value || 0), { fromTimeInput: true });
+  });
+  document.querySelectorAll("#speedGroup button").forEach((b) => {
+    b.addEventListener("click", () => setSpeed(+b.dataset.speed));
+  });
+
+  /* パネルメニュー開閉 */
+  const menu = document.getElementById("panelMenu");
+  document.getElementById("btnPanelMenu").addEventListener("click", (e) => {
+    e.stopPropagation();
+    menu.classList.toggle("open");
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#panelMenuWrap")) menu.classList.remove("open");
+  });
+  document.getElementById("btnResetLayout").addEventListener("click", () => {
+    const keepOffset = App.layout.videoOffset;   /* 動画オフセットは維持 */
+    App.layout = defaultLayout();
+    App.layout.videoOffset = keepOffset;
+    applyLayout();
+    saveLayout();
+  });
+  document.getElementById("btnExportLayout").addEventListener("click", exportLayout);
+  const importFile = document.getElementById("importLayoutFile");
+  document.getElementById("btnImportLayout").addEventListener("click", () => {
+    importFile.value = "";
+    importFile.click();
+  });
+  importFile.addEventListener("change", () => {
+    if (importFile.files && importFile.files[0]) {
+      importLayoutFromFile(importFile.files[0]);
+    }
+  });
+
+  /* キーボード: Space=再生停止 / ←→=コマ送り / Shift+←→=1s移動 */
+  document.addEventListener("keydown", (e) => {
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (e.repeat) return;   /* 長押しのキーリピートで再生/停止が明滅するのを防ぐ */
+      if (!App.playing && App.tau >= App.t1) seekTo(App.t0);
+      setPlaying(!App.playing);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setPlaying(false);
+      seekTo(App.tau - (e.shiftKey ? 1.0 : App.frameDt));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setPlaying(false);
+      seekTo(App.tau + (e.shiftKey ? 1.0 : App.frameDt));
+    }
+  });
+}
+
+/* ===================== 初期化 ===================== */
+function init() {
+  /* グラフ背景色を CSS 変数から一度だけ解決する */
+  PLOT_BG = getComputedStyle(document.documentElement)
+    .getPropertyValue("--plot-bg").trim() || "#ffffff";
+
+  /* EMBED === null ならデモデータ(テンプレート単体の動作確認用) */
+  App.demo = (EMBED === null);
+  const embed = App.demo ? generateDemoEmbed() : EMBED;
+  App.logName = embed.log_name || "unknown_log";
+  App.rateHz = +embed.rate_hz || 50.0;
+  App.frameDt = 1.0 / App.rateHz;
+
+  /* データセット配列(将来拡張フック。初版は先頭のみ使用) */
+  App.datasets = embed.datasets.map(decodeDataset);
+  App.ds = App.datasets[0];
+  const t = App.ds.S.t;
+  App.t0 = t[0];
+  App.t1 = t[App.ds.n - 1];
+  App.dur = App.t1 - App.t0;
+  App.tau = App.t0;
+
+  document.title = "StampFly ログプレーヤー - " + App.logName;
+  document.getElementById("logName").textContent =
+    App.logName + "(" + App.ds.n + "行 / " + App.dur.toFixed(1) + "s / " +
+    App.ds.mode + ")";
+  if (App.demo) document.getElementById("demoBadge").style.display = "inline-block";
+  const seekBar = document.getElementById("seekBar");
+  seekBar.max = App.dur.toFixed(2);
+  seekBar.value = "0";
+  document.getElementById("timeTotal").textContent = "/ " + App.dur.toFixed(2) + " s";
+
+  /* レイアウト復元 → パネル構築 → 反映 */
+  App.layout = loadLayout();
+  for (const def of PANEL_DEFS) App.panels.set(def.id, buildPanelDom(def));
+  buildPanelMenu();
+  bindHeaderUi();
+  applyLayout();
+
+  /* リサイズで canvas サイズ再同期+再描画(デバウンス) */
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resizeAllCanvases, 120);
+  });
+
+  /* ドロップゾーン外へのファイルドロップでページごと動画へ遷移する
+     ブラウザ既定動作を全面的に抑止する(.video-drop 側のハンドラは
+     バブリングで先に発火するため影響しない) */
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => e.preventDefault());
+
+  seekTo(App.t0);
+  requestAnimationFrame(mainLoop);
+}
+
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+}
+</script>
+</body>
+</html>

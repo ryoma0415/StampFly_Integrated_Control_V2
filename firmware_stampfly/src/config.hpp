@@ -34,7 +34,11 @@ struct FlightConfig {
     // (kp, ti, td) 形式のため ki は ti=kp/ki=10.0 で表現する。
     // ※ 未飛行の初期値であり、要飛行チューニング。
     PidGainConfig yaw_angle{3.0f, 10.0f, 0.0f, 0.125f};
-    float yaw_rate_limit_rad_s = 1.0f;      // psi_pid 出力クランプ [rad/s]
+    // psi_pid 出力クランプ [rad/s]。2026-07-17 ログ解析: ヨー角速度ループ出力が
+    // ミキサ差動の最大消費者で duty=0.95 天井の主要因(相関+0.77)だったため
+    // 1.0 → 0.5 に縮小(実運用のヨーレート指令 RMS は 0.15 rad/s で影響僅少。
+    // PC 側ヨースルー 45°/s=0.785rad/s に対しランプ中は遅れが増える点に注意)
+    float yaw_rate_limit_rad_s = 0.5f;
 
     // --- 機上XY位置制御(v2.1: CMD_POS_ERR。位置誤差 → roll/pitch 角度指令) ---
     // アルゴリズム・数値は旧 PC 側 XY PID(飛行実績あり。v4 で PC 側実装は
@@ -96,8 +100,16 @@ struct FlightConfig {
     float takeoff_complete_margin_m = 0.05f;    // alt_ref - margin 到達でHOVERへ
 
     // --- トリムデューティ(電圧→ホバリングデューティの一次近似) ---
+    // 2026-07-17 ログ解析: z_dot PID の積分が常時 +7.3%(+0.054duty)分を負担して
+    // おり、切片が現機体の実ホバー推力を過小評価していたため +0.054 再校正。
+    // これで ±15% スラストクランプ帯の中心が実ホバー点に一致し上下対称になる。
     float trim_duty_slope = -0.2448f;
-    float trim_duty_intercept = 1.5892f;
+    float trim_duty_intercept = 1.643f;     // 製品版値: 1.5892
+    // Thrust0(トリムFF)計算に使う電圧の1次LPF時定数 [s]。
+    // 負荷電流による電圧サグ(dV/dduty≈-0.7V/duty)が Thrust0 経由で
+    // dT0/dduty≈+0.18 の正帰還を作り 0.45Hz 上下ボビングの減衰を削るため、
+    // 秒スケールで遮断する(低電圧フェイルセーフ判定は生値のまま)
+    float trim_voltage_filter_tc_s = 1.5f;
 
     // --- 高度制御 ---
     float thrust_cmd_max_ratio = 1.15f;     // スラスト指令の Thrust0 比上限

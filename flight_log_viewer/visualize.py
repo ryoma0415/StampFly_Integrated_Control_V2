@@ -54,6 +54,7 @@ _SINGLE_MENU = (
     "アニメーション MP4(スマホ動画と同期)",
     "すべて生成(静止画+レポート+アニメーション)",
     "2 ログのヨー安定性比較",
+    "インタラクティブ HTML プレーヤー(ブラウザ再生・自己完結 1 ファイル)",
 )
 
 # 対話ステップ2: 出力内容メニュー(Multi)
@@ -282,6 +283,13 @@ def run_comparison(log_a: FlightLog, log_b: FlightLog, output_root: Path) -> Non
     report.generate_comparison(log_a, log_b, out_dir)
 
 
+def run_interactive_html(log: FlightLog, output_root: Path) -> Path:
+    """インタラクティブ HTML プレーヤー(自己完結 1 ファイル)を生成する。"""
+    from interactive import export_interactive_html  # noqa: PLC0415
+
+    return export_interactive_html(log, output_root)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -306,6 +314,10 @@ def _parse_args() -> argparse.Namespace:
                         help="アニメーション MP4 を生成")
     parser.add_argument("--all", action="store_true",
                         help="--figures と --animation の両方")
+    parser.add_argument("--interactive", action="store_true",
+                        help="インタラクティブ HTML プレーヤー"
+                             "(output/<ログ名>/interactive.html)を生成"
+                             "(単機のみ)")
     parser.add_argument("--video", type=Path, default=None,
                         help="同期合成するスマホ動画(MP4)。--animation と併用")
     parser.add_argument("--track", action="store_true",
@@ -345,6 +357,9 @@ def _run_batch(args: argparse.Namespace) -> int:
         run_animation(log, args.output, args.video, args.track,
                       args.fps, args.start, args.end)
         did_something = True
+    if args.interactive:
+        run_interactive_html(log, args.output)
+        did_something = True
     if not did_something:
         # CSV だけ指定された場合は静止画+レポートを既定動作にする
         run_figures_and_report(log, args.output)
@@ -355,6 +370,10 @@ def _run_batch_multi(args: argparse.Namespace) -> int:
     """multi グループのバッチ実行(--group <ts> または --mode multi <代表CSV>)。"""
     if args.compare is not None:
         print("エラー: --compare は multi グループでは使えません。")
+        return 2
+    if args.interactive:
+        print("エラー: --interactive は multi グループでは使えません"
+              "(初版は単機のみ)。")
         return 2
     if args.video is not None or args.track:
         print("警告: multi では動画合成・ROI 追跡は非対応のため無視します。")
@@ -407,6 +426,11 @@ def _interactive_single(args: argparse.Namespace, mode: str) -> int:
         run_comparison(log, log_b, args.output)
         print(f"\n=== 処理完了 === 出力先: "
               f"{args.output / f'compare_{log.name}_vs_{log_b.name}'}")
+        return 0
+
+    if menu_idx == 5:  # インタラクティブ HTML プレーヤー
+        html_path = run_interactive_html(log, args.output)
+        print(f"\n=== 処理完了 === 出力先: {html_path}")
         return 0
 
     # ステップ4: 動画選択(動画同期アニメーションのみ)
@@ -489,7 +513,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n中止しました。")
         return 130
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
+    except (OSError, ValueError, RuntimeError) as e:
         print(f"エラー: {e}")
         return 1
 

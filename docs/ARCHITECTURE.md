@@ -437,7 +437,7 @@ _enter_experiment / _exit_experiment)と
 |---|---|---|---|
 | UI | ±5°(既定) | 0.1–1.0m | スライダ ±180°(0.1° 刻み) |
 | pc_server | ±10° + スルーレート30°/s | 0.1–1.2m + 0.3m/s | ±180°(`max_yaw_deg`)+最短経路 wrap+スルーレート 45°/s(`yaw_slew_rate_deg_per_s`) |
-| ファーム | ±30°(継承) | 0.05–1.5m | 角度誤差を wrapPi(±π)して psi_pid → 出力ヨーレートを ±1.0 rad/s にクランプ(`yaw_rate_limit_rad_s`) |
+| ファーム | ±30°(継承) | 0.05–1.5m | 角度誤差を wrapPi(±π)して psi_pid → 出力ヨーレートを ±0.5 rad/s にクランプ(`yaw_rate_limit_rad_s`。2026-07-17 に duty 天井対策で 1.0→0.5) |
 
 ヨーの値は `pc_server/config/server.json` の clamps 節と
 `firmware_stampfly/src/config.hpp`(yaw_angle / yaw_rate_limit_rad_s)が実体。

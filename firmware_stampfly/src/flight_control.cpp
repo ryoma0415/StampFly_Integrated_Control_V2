@@ -333,6 +333,33 @@ float get_trim_duty(float voltage) {
     return FLIGHT_CONFIG.trim_duty_slope * voltage + FLIGHT_CONFIG.trim_duty_intercept;
 }
 
+// Thrust0(トリムFF)用の電圧1次LPF(config.hpp trim_voltage_filter_tc_s)。
+// 負荷電流による電圧サグが Thrust0 経由で正帰還(dT0/dduty≈+0.18)を作り
+// 0.45Hz 上下ボビングの減衰を削るため、トリム計算に使う電圧だけ秒スケールで
+// 平滑する。低電圧フェイルセーフ判定(Under_voltage_flag)は生値のまま。
+static float trim_voltage_state = 0.0f;
+static bool trim_voltage_seeded = false;
+
+// 毎tick(400Hz)呼ぶ。初回の有効電圧でシードし、以後1次LPFで追従する。
+void update_trim_voltage(void) {
+    const float v = sensor_state.Voltage;
+    if (!(v > 0.5f)) return;                 // 起動直後の未計測値では更新しない
+    if (!trim_voltage_seeded) {
+        trim_voltage_state = v;
+        trim_voltage_seeded = true;
+        return;
+    }
+    float dt = flight_control_state.timing.Interval_time;
+    if (dt <= 0.0f || dt > 0.01f) dt = FLIGHT_CONFIG.control_period_s;
+    const float alpha = dt / (FLIGHT_CONFIG.trim_voltage_filter_tc_s + dt);
+    trim_voltage_state += alpha * (v - trim_voltage_state);
+}
+
+// トリムFF計算用の平滑済み電圧(未シード時は生電圧にフォールバック)
+float trim_voltage(void) {
+    return trim_voltage_seeded ? trim_voltage_state : sensor_state.Voltage;
+}
+
 bool low_voltage_detected(void) {
     return sensor_state.Under_voltage_flag >= UNDER_VOLTAGE_COUNT;
 }
@@ -586,11 +613,11 @@ void update_thrust_and_attitude_command(void) {
         auto_takeoff_counter++;
     } else if (auto_takeoff_counter < cfg.takeoff_ramp_total_ticks) {
         out.Thrust0 = (float)auto_takeoff_counter / cfg.takeoff_ramp_divisor;
-        const float cap = get_trim_duty(sensor_state.Voltage);
+        const float cap = get_trim_duty(trim_voltage());
         if (out.Thrust0 > cap) out.Thrust0 = cap;
         auto_takeoff_counter++;
     } else {
-        out.Thrust0 = get_trim_duty(sensor_state.Voltage);
+        out.Thrust0 = get_trim_duty(trim_voltage());
     }
 
     // 高度センサ喪失時の安全降下(流用ロジック)
@@ -864,7 +891,7 @@ uint8_t auto_landing_step(void) {
     if (landing_state == 0) {
         landing_state = 1;
         prev_alt = sensor_state.Altitude2;
-        out.Thrust0 = get_trim_duty(sensor_state.Voltage);
+        out.Thrust0 = get_trim_duty(trim_voltage());
     }
 
     // 降下中はスラストを徐々に絞る
@@ -1478,6 +1505,7 @@ void loop_400Hz(void) {
 
     update_loop_timing();
     sensor_read();
+    update_trim_voltage();   // トリムFF用電圧LPF(毎tick。§config trim_voltage_filter_tc_s)
 
     // 受信コマンドの取り出しと setpoint / pos_err 適用
     CommandSnapshot cmd;

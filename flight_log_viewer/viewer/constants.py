@@ -151,6 +151,9 @@ COLORS: dict[str, str] = {
     "start": "#16a34a",
     "end": "#e74c3c",
     "current_pos": "#e74c3c",
+    # XY 位置誤差
+    "err_x": "#dc2626",
+    "err_y": "#0d9488",
     # 姿勢(指令 vs 実測)
     "cmd_roll": "#dc2626",
     "cmd_pitch": "#0d9488",

@@ -1,16 +1,16 @@
 """同期アニメーション MP4 の生成(matplotlib FuncAnimation)。
 
 旧 Drone_Log_Viewer の 7 パネル構成を参考に、V2 列構成で再構築した。
-パネル: [スマホ動画(オプション) / XY 軌跡] + 高度 + 電源 + ヨー4系統 +
-姿勢 + duty + ヨー誤差。スマホ動画との同期合成(OpenCV)はオプションで、
-動画なしでも生成できる。
+パネル: [スマホ動画(オプション) / XY 軌跡(現在位置+目標位置)] + 高度 +
+電源 + ヨー(Madgwick/EKF/指令) + 姿勢 + duty + XY 位置誤差。
+スマホ動画との同期合成(OpenCV)はオプションで、動画なしでも生成できる。
 
 - 動画あり: 出力 fps は動画 fps に合わせ、CSV(50Hz)を動画フレーム時刻へ
   線形補間する(旧実装と同じ同期方法。動画は飛行開始と同時に録画開始した
   前提。CSV の長さで動画をカットする)。
 - 動画なし: 既定 20fps でログのみのアニメーションを生成。
-- ROI 追跡(--track): OpenCV トラッカー(CSRT→KCF→MOSSE)で機体を追跡し
-  赤枠を合成する。ROI 選択ウィンドウが開くため GUI 環境が必要。
+- ROI 追跡(--track): OpenCV トラッカー(CSRT→KCF→MOSSE→MIL)で機体を
+  追跡し赤枠を合成する。ROI 選択ウィンドウが開くため GUI 環境が必要。
 """
 
 from __future__ import annotations
@@ -72,28 +72,36 @@ def _import_cv2():
 
 
 def _create_tracker(cv2):
-    """利用可能なトラッカーを作成(CSRT → KCF → MOSSE。旧実装踏襲)。"""
+    """利用可能なトラッカーを作成(CSRT → KCF → MOSSE → MIL)。
+
+    OpenCV 4.x は `TrackerXXX_create` 関数、4.5 以降/5.x はクラスの
+    `.create()` で生成する(両形式を探索)。opencv-python 5.x の本体
+    パッケージには CSRT/KCF/MOSSE が含まれない(contrib へ移動)ため、
+    モデルファイル不要で常に使える MIL を最後の受け皿にする
+    (Vit/Nano/DaSiamRPN は ONNX モデルの別途配置が必要なため除外)。
+    """
     legacy = getattr(cv2, "legacy", None)
-    for module, name in (
-        (legacy, "TrackerCSRT_create"),
-        (cv2, "TrackerCSRT_create"),
-        (legacy, "TrackerKCF_create"),
-        (cv2, "TrackerKCF_create"),
-        (legacy, "TrackerMOSSE_create"),
-        (cv2, "TrackerMOSSE_create"),
-    ):
-        if module is None:
-            continue
-        ctor = getattr(module, name, None)
-        if ctor is None:
-            continue
+    candidates = []
+    for name in ("TrackerCSRT", "TrackerKCF", "TrackerMOSSE", "TrackerMIL"):
+        for module in (legacy, cv2):
+            if module is None:
+                continue
+            ctor = getattr(module, f"{name}_create", None)
+            if ctor is not None:
+                candidates.append(ctor)
+            cls = getattr(module, name, None)
+            if cls is not None and hasattr(cls, "create"):
+                candidates.append(cls.create)
+    for ctor in candidates:
         try:
             tracker = ctor()
             print(f"トラッカー: {tracker.__class__.__name__} を使用します。")
             return tracker
         except Exception:  # noqa: BLE001 (ビルド差異による生成失敗は次候補へ)
             continue
-    print("警告: 利用可能な OpenCV トラッカーが無いため追跡を無効化します。")
+    print("警告: 利用可能な OpenCV トラッカーが無いため追跡を無効化します。\n"
+          "  (高精度な CSRT/KCF を使うには opencv-contrib-python の導入か\n"
+          "   opencv-python 4.x への変更を検討してください)")
     return None
 
 
@@ -309,20 +317,32 @@ class _AnimationBuilder:
         self.ax_xy.set_xlabel("X [m]", fontsize=9)
         self.ax_xy.set_ylabel("Y [m]", fontsize=9)
         self.has_pos = self.log.has("pos_x") and self.log.has("pos_y")
+        self.pt_target = None
         if self.has_pos:
-            if "target_x" in self.df.columns and np.isfinite(
-                    self.df["target_x"].to_numpy(dtype=float)).any():
-                self.ax_xy.plot(self.df["target_x"], self.df["target_y"],
-                                color=COLORS["target"], linewidth=1.0,
-                                linestyle="--", alpha=0.7, label="目標軌道")
+            # 目標位置(target_x/target_y)は現在値をマーカーで動かす
+            # (軌道線は円軌道以外ではほぼ点になり見えないため廃止)
+            self.has_target = ("target_x" in self.df.columns and np.isfinite(
+                self.df["target_x"].to_numpy(dtype=float)).any())
+            if self.has_target:
+                (self.pt_target,) = self.ax_xy.plot(
+                    [], [], marker="o", markersize=13, markerfacecolor="none",
+                    markeredgecolor=COLORS["target"], markeredgewidth=2.5,
+                    linestyle="none", label="目標位置")
             (self.ln_trail,) = self.ax_xy.plot(
                 [], [], color=COLORS["trajectory"], linewidth=1.5, alpha=0.9,
                 label="軌跡")
             (self.pt_current,) = self.ax_xy.plot(
                 [], [], marker="o", markersize=10, color=COLORS["current_pos"],
                 markeredgecolor="#111111", linestyle="none", label="現在位置")
-            x = self.df["pos_x"].to_numpy(dtype=float)
-            y = self.df["pos_y"].to_numpy(dtype=float)
+            # 軸範囲は実位置+目標位置の全範囲から固定(目標が視野外に
+            # 出ないようにする)
+            xs = [self.df["pos_x"].to_numpy(dtype=float)]
+            ys = [self.df["pos_y"].to_numpy(dtype=float)]
+            if self.has_target:
+                xs.append(self.df["target_x"].to_numpy(dtype=float))
+                ys.append(self.df["target_y"].to_numpy(dtype=float))
+            x = np.concatenate(xs)
+            y = np.concatenate(ys)
             if np.isfinite(x).any():
                 margin = 0.2
                 self.ax_xy.set_xlim(np.nanmin(x) - margin, np.nanmax(x) + margin)
@@ -351,16 +371,20 @@ class _AnimationBuilder:
             (("tlm_voltage_v", "電圧", COLORS["voltage"], "-"),
              ("tlm_current_a", "電流", COLORS["current"], "-")))
 
-        # --- ヨー4系統パネル ---
+        # --- ヨーパネル(Madgwick / EKF / 指令) ---
+        # MoCap 真値・ジャイロ積算は表示しない(2026-07 仕様変更。
+        # MoCap ヨーは信頼性が低く、ジャイロ積算は参考値のため)
         slot_yaw = gs[1, 3] if video_frames else gs[1, 2:]
         self.ax_yaw = self.fig.add_subplot(slot_yaw)
         # ラップ表示のため補間はアンラップ列で行い、描画時に ±180° へ畳む
         yaw_specs = []
         for key, _col, label, color, _deg in YAW_SOURCES:
+            if key not in ("madgwick", "ekf"):
+                continue
             yaw_specs.append((f"yaw_{key}_unwrap_deg", label, color, "-"))
         yaw_specs.append(("cmd_yaw_ref_deg", "指令", COLORS["yaw_cmd"], "--"))
         self.yaw_lines = self._make_ts_panel(
-            self.ax_yaw, "ヨー4系統 [deg]（±180）", tuple(yaw_specs),
+            self.ax_yaw, "ヨー [deg]（±180）", tuple(yaw_specs),
             wrap_angle=True)
 
         # --- 姿勢パネル ---
@@ -381,17 +405,16 @@ class _AnimationBuilder:
              ("tlm_duty_rl", "RL", COLORS["duty_rl"], "-"),
              ("tlm_duty_rr", "RR", COLORS["duty_rr"], "-")))
 
-        # --- ヨー誤差パネル ---
-        self.ax_yaw_err = self.fig.add_subplot(gs[2, 3])
-        err_specs = []
-        for key in ("madgwick", "ekf", "gyro_int"):
-            col = f"yaw_err_{key}_deg"
-            if col in self.df.columns:
-                label = {"madgwick": "Madgwick", "ekf": "EKF",
-                         "gyro_int": "ジャイロ積算"}[key]
-                err_specs.append((col, label, COLORS[f"yaw_{'gyro' if key == 'gyro_int' else key}"], "-"))
-        self.yaw_err_lines = self._make_ts_panel(
-            self.ax_yaw_err, "ヨー誤差 [deg]", tuple(err_specs))
+        # --- XY 位置誤差パネル ---
+        # 旧ヨー誤差パネル(対 MoCap 真値)は MoCap ヨーの信頼性が低いため
+        # 廃止し、位置制御実験で有用な XY 追従誤差に差し替え(2026-07)
+        self.ax_xy_err = self.fig.add_subplot(gs[2, 3])
+        self.xy_err_lines = self._make_ts_panel(
+            self.ax_xy_err, "XY 位置誤差 [m]",
+            (("error_x", "誤差 X", COLORS["err_x"], "-"),
+             ("error_y", "誤差 Y", COLORS["err_y"], "-")))
+        if self.xy_err_lines:
+            self.ax_xy_err.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
 
         self.ts_panels = (
             (self.ax_alt, self.alt_lines),
@@ -399,7 +422,7 @@ class _AnimationBuilder:
             (self.ax_yaw, self.yaw_lines),
             (self.ax_att, self.att_lines),
             (self.ax_duty, self.duty_lines),
-            (self.ax_yaw_err, self.yaw_err_lines),
+            (self.ax_xy_err, self.xy_err_lines),
         )
         self.title = self.fig.suptitle("", fontsize=13, color=TEXT_COLOR)
 
@@ -425,6 +448,11 @@ class _AnimationBuilder:
             py = self.df["pos_y"].iloc[frame_idx]
             if np.isfinite(px) and np.isfinite(py):
                 self.pt_current.set_data([px], [py])
+            if self.pt_target is not None:
+                tx = self.df["target_x"].iloc[frame_idx]
+                ty = self.df["target_y"].iloc[frame_idx]
+                if np.isfinite(tx) and np.isfinite(ty):
+                    self.pt_target.set_data([tx], [ty])
 
         _update_ts_panels(self.ts_panels, now)
 

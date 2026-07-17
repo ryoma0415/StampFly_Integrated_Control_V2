@@ -6,4 +6,7 @@ matplotlib>=3.7
 # --- オプション ---
 # スマホ動画の同期合成・ROI 追跡を使う場合のみ必要(README.md 参照):
 #   pip install opencv-python>=4.8
+# 注: opencv-python 5.x 本体には CSRT/KCF トラッカーが含まれない(MIL に
+# フォールバックする)。高精度な追跡には opencv-contrib-python か
+# opencv-python<5 を使う。
 # アニメーション MP4 出力には ffmpeg 本体も必要(macOS: brew install ffmpeg)

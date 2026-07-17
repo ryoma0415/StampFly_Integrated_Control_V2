@@ -1,8 +1,9 @@
 """ヨー解析(本プロジェクトの主目的)。
 
-- 4系統比較: tlm_yaw_rad(Madgwick)/ tlm_yaw_est_rad(EKF)/
-  tlm_yaw_gyro_int_rad(ジャイロ積算)/ mocap_yaw_deg(真値)
-- 対基準誤差の時系列と RMS / ドリフト率 [°/min]
+- ヨー比較図: tlm_yaw_rad(Madgwick)/ tlm_yaw_est_rad(EKF)/ ヨー指令
+  (MoCap 真値・ジャイロ積算は 2026-07 に図から除外。MoCap ヨーは信頼性が
+  低いため。統計 compute_yaw_stats は従来どおり全系統で計算しレポートに使う)
+- 対基準誤差の統計(RMS / ドリフト率 [°/min])— レポート・2ログ比較用
 - EKF 診断: NIS・磁気バイアス b_m・FF 補正 db_hat・ffg ゲートタイムライン
 - ヨー指令追従: cmd_yaw_ref vs 機体適用目標 vs 実測
 """
@@ -157,12 +158,15 @@ def compute_yaw_stats(log: FlightLog) -> dict:
 # 図
 # ---------------------------------------------------------------------------
 
-def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
-    """10: ヨー4系統比較(アンラップ+±180° ラップ)。"""
+def _fig_yaw_comparison(log: FlightLog, out_dir: Path) -> Path | None:
+    """10: ヨー比較(Madgwick / EKF / 指令。アンラップ+±180° ラップ)。
+
+    MoCap 真値・ジャイロ積算は表示しない(2026-07 仕様変更)。
+    """
     available = [
         (key, label, color)
         for key, _col, label, color, _deg in YAW_SOURCES
-        if log.has(f"yaw_{key}_deg")
+        if key in ("madgwick", "ekf") and log.has(f"yaw_{key}_deg")
     ]
     if not available:
         return None
@@ -178,7 +182,7 @@ def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
         ax.plot(t, unwrap_deg(df["cmd_yaw_ref_deg"].to_numpy(dtype=float)),
                 color=COLORS["yaw_cmd"], linewidth=1.0, linestyle="--", alpha=0.8,
                 label="ヨー指令(PC)")
-    ax.set_title("ヨー4系統比較(アンラップ)", fontsize=14)
+    ax.set_title("ヨー比較: Madgwick / EKF / 指令(アンラップ)", fontsize=14)
     ax.set_ylabel("ヨー角 [deg](連続)", fontsize=10)
     styled_legend(ax, ncol=2)
 
@@ -194,43 +198,7 @@ def _fig_yaw_four_sources(log: FlightLog, out_dir: Path) -> Path | None:
     ax.set_ylabel("ヨー角 [deg](±180)", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
     styled_legend(ax, ncol=2)
-    return save_fig(fig, out_dir, "10_yaw_four_sources.png")
-
-
-def _fig_yaw_error(log: FlightLog, out_dir: Path, stats: dict) -> Path | None:
-    """11: 対基準ヨー誤差時系列(RMS / ドリフト率つき)。"""
-    ref = stats.get("reference")
-    if ref is None or not stats["errors"]:
-        return None
-    t = log.t
-    df = log.df
-    ref_label = _SOURCE_INFO[ref][0]
-    fig, ax = new_fig(figsize=(13.0, 6.0))
-
-    for stat in stats["errors"]:
-        err_col = f"yaw_err_{stat.key}_deg"
-        if err_col not in df.columns:
-            continue
-        _label, color = _SOURCE_INFO[stat.key]
-        label = (
-            f"{stat.label}  RMS={stat.rms_deg:.2f}°  "
-            f"最大={stat.max_abs_deg:.2f}°  "
-            f"ドリフト={stat.drift_deg_per_min:+.2f}°/min"
-        )
-        ax.plot(t, df[err_col], color=color, linewidth=0.9, alpha=0.9, label=label)
-
-    # 飛行区間を淡く表示
-    flying = log.flying_mask()
-    if flying.any():
-        ax.fill_between(t, *ax.get_ylim(), where=flying, color="#64748b",
-                        alpha=0.12, step="mid", label="飛行区間")
-
-    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.6)
-    ax.set_title(f"ヨー誤差(基準: {ref_label})", fontsize=14)
-    ax.set_xlabel("時間 [s]", fontsize=11)
-    ax.set_ylabel("誤差 [deg](±180 ラップ)", fontsize=10)
-    styled_legend(ax, loc="best", fontsize=9)
-    return save_fig(fig, out_dir, "11_yaw_error.png")
+    return save_fig(fig, out_dir, "10_yaw_comparison.png")
 
 
 def _fig_ekf_diagnostics(log: FlightLog, out_dir: Path) -> Path | None:
@@ -390,8 +358,7 @@ def generate_yaw_figures(log: FlightLog, out_dir: str | Path,
     print("\nヨー解析図を生成します...")
     saved: list[Path] = []
     for path in (
-        _fig_yaw_four_sources(log, out_dir),
-        _fig_yaw_error(log, out_dir, stats),
+        _fig_yaw_comparison(log, out_dir),
         _fig_ekf_diagnostics(log, out_dir),
         _fig_ff_status(log, out_dir),
         _fig_yaw_tracking(log, out_dir, stats),

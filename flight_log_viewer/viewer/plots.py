@@ -44,7 +44,7 @@ def _style_time_colorbar(fig, ax, norm, cmap, **kwargs):
 
 
 def _fig_xy_trajectory(log: FlightLog, out_dir: Path) -> Path | None:
-    """01: XY 軌跡+目標(円軌道の目標軌道も重畳)。"""
+    """01: XY 軌跡(生位置+フィルタ後+開始/終了位置)。"""
     if not (log.has("pos_x") and log.has("pos_y")):
         return None
     df = log.df
@@ -56,11 +56,6 @@ def _fig_xy_trajectory(log: FlightLog, out_dir: Path) -> Path | None:
     ax.plot(df["pos_x"], df["pos_y"], color=COLORS["trajectory"],
             linewidth=1.0, alpha=0.85, label="飛行軌跡(フィルタ後)")
 
-    # 目標(ホバ時は点、円軌道時は目標軌道の線が現れる)
-    if log.has("target_x") and log.has("target_y"):
-        ax.plot(df["target_x"], df["target_y"], color=COLORS["target"],
-                linewidth=1.2, linestyle="--", alpha=0.9, label="目標軌道")
-
     valid = df["pos_x"].notna() & df["pos_y"].notna()
     if valid.any():
         first = df.index[valid][0]
@@ -70,7 +65,7 @@ def _fig_xy_trajectory(log: FlightLog, out_dir: Path) -> Path | None:
         ax.scatter(df.at[last, "pos_x"], df.at[last, "pos_y"], color=COLORS["end"],
                    s=110, zorder=5, edgecolors="#111111", linewidth=1.5, label="終了位置")
 
-    ax.set_title("XY 飛行軌跡と目標", fontsize=14)
+    ax.set_title("XY 飛行軌跡", fontsize=14)
     ax.set_xlabel("X [m]", fontsize=11)
     ax.set_ylabel("Y [m]", fontsize=11)
     ax.set_aspect("equal")
@@ -163,9 +158,11 @@ def _fig_position_tracking(log: FlightLog, out_dir: Path) -> Path | None:
 
     ax = axes[2]
     if log.has("error_x"):
-        ax.plot(t, df["error_x"], color="#dc2626", linewidth=1.0, alpha=0.9, label="誤差 X")
+        ax.plot(t, df["error_x"], color=COLORS["err_x"], linewidth=1.0,
+                alpha=0.9, label="誤差 X")
     if log.has("error_y"):
-        ax.plot(t, df["error_y"], color="#0d9488", linewidth=1.0, alpha=0.9, label="誤差 Y")
+        ax.plot(t, df["error_y"], color=COLORS["err_y"], linewidth=1.0,
+                alpha=0.9, label="誤差 Y")
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("誤差 [m]", fontsize=10)
     ax.set_xlabel("時間 [s]", fontsize=11)
@@ -387,9 +384,6 @@ def _fig_xy_time(log: FlightLog, out_dir: Path) -> Path | None:
     norm = plt.Normalize(tmin, tmax if tmax > tmin else tmin + 1.0)
     ax.plot(x, y, color=COLORS["trajectory"], linewidth=1.0, alpha=0.6)
     ax.scatter(x, y, c=t, cmap=cmap, norm=norm, s=10, alpha=0.9)
-    if log.has("target_x") and log.has("target_y"):
-        ax.plot(df["target_x"], df["target_y"], color=COLORS["target"],
-                linewidth=1.0, linestyle="--", alpha=0.7, label="目標軌道")
     ax.scatter(x[:1], y[:1], color=COLORS["start"], s=110, zorder=5,
                edgecolors="#111111", linewidth=1.5, label="開始位置")
     ax.scatter(x[-1:], y[-1:], color=COLORS["end"], s=110, zorder=5,

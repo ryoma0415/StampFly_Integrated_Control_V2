@@ -46,6 +46,11 @@ python3 -m venv .venv
   .venv/bin/pip install opencv-python
   ```
 
+  ROI 追跡のトラッカーは CSRT → KCF → MOSSE → MIL の順で探索する。
+  **opencv-python 5.x の本体パッケージには CSRT/KCF/MOSSE が含まれない**
+  (5.x で contrib へ移動)ため MIL が使われる。より高精度な CSRT を使い
+  たい場合は `opencv-contrib-python` の導入か `opencv-python<5` を検討する。
+
 - アニメーション(MP4)出力には ffmpeg 本体が必要:
   `brew install ffmpeg`(macOS)/ `apt install ffmpeg`(Linux)
 
@@ -122,7 +127,7 @@ python3 -m venv .venv
 
 | ファイル | 内容 | モード |
 | --- | --- | --- |
-| `01_xy_trajectory.png` | XY 軌跡+目標(円軌道の目標軌道も重畳) | Position |
+| `01_xy_trajectory.png` | XY 軌跡(生位置+フィルタ後) | Position |
 | `02_attitude.png` | 姿勢: 指令 vs 実測 | 全 |
 | `03_altitude.png` | 高度(目標/ToF/推定)と昇降速度 | 全 |
 | `04_position_tracking.png` | 位置追従(目標 vs 実測+誤差) | Position |
@@ -131,8 +136,7 @@ python3 -m venv .venv
 | `07_power.png` | 電圧(低電圧しきい値つき)/ 総電流 | 全 |
 | `08_latency_loop_dt.png` | 往復レイテンシ / 機体 loop_dt | 全 |
 | `09_mocap_diagnostics.png` | MoCap 診断(マーカー数・フレーム間隔) | Position |
-| `10_yaw_four_sources.png` | **ヨー4系統比較**(Madgwick/EKF/ジャイロ積算/MoCap) | 全 |
-| `11_yaw_error.png` | 対 MoCap ヨー誤差時系列+RMS/ドリフト率 [°/min] | 全 |
+| `10_yaw_comparison.png` | **ヨー比較**(Madgwick/EKF/指令。MoCap 真値・ジャイロ積算は 2026-07 に図から除外) | 全 |
 | `12_ekf_diagnostics.png` | EKF 診断(NIS・b_m・db̂・ffg ゲートタイムライン) | 全 |
 | `13_ff_status.png` | ff_status タイムライン(ff_mode・アンカー等) | 全 |
 | `14_yaw_tracking.png` | ヨー指令追従(PC 指令/機体適用目標/実測) | 全 |
@@ -141,12 +145,12 @@ python3 -m venv .venv
 | `17_cmd_echo.png` | **指令エコー**: 送信指令 vs 機体適用エコー(Roll/Pitch 2 段重畳、伝達遅延確認) | 全 |
 | `summary.txt` | テキストサマリ(飛行時間・RMS・ドリフト率・電圧推移) | 全 |
 | `index.html` | 統計テーブル+全グラフをまとめた HTML レポート | 全 |
-| `<ログ名>_animation.mp4` | 7 パネル同期アニメーション(1920×1080)。動画同期時は実写パネルが加わり `<ログ名>_animation_with_video.mp4` | 全 |
+| `<ログ名>_animation.mp4` | 7 パネル同期アニメーション(1920×1080。XY 軌跡+目標位置 / 高度 / 電源 / ヨー(Madgwick・EKF・指令)/ 姿勢 / duty / XY 位置誤差)。動画同期時は実写パネルが加わり `<ログ名>_animation_with_video.mp4` | 全 |
 
 - 必要列にデータが無いグラフは自動でスキップされる
   (Posture では位置系 01/04/05/09/15/16 が出ない)。
-- MoCap 真値が無いログのヨー誤差は Madgwick 基準の相対比較になる
-  (レポートに注記が出る)。
+- MoCap 真値が無いログのヨー誤差統計(レポート)は Madgwick 基準の
+  相対比較になる(レポートに注記が出る)。
 - 比較モードは `output/compare_<A>_vs_<B>/comparison.html` に出力。
 
 ### Multi — `output/<ts>_multi/` 配下
@@ -188,7 +192,7 @@ flight_log_viewer/
 │   ├── constants.py      # 100 列定義・ffg/ff_status ビット・スタイル定数・機体別色
 │   ├── loader.py         # CSV 読み込み(破損末尾復旧)+派生量計算+Multi グループ読込
 │   ├── plots.py          # 静止画グラフ一式(01-09, 15-17)
-│   ├── yaw_analysis.py   # ヨー4系統比較・EKF 診断(10-14、主目的)
+│   ├── yaw_analysis.py   # ヨー比較・EKF 診断(10-14、主目的)
 │   ├── multi_plots.py    # Multi 用: 共有 XY 図(M01)+機体別図一式
 │   ├── animation.py      # 7 パネルアニメーション(動画同期はオプション)+複数機アニメーション
 │   ├── report.py         # サマリ / HTML / 2 ログ比較 / Multi レポート

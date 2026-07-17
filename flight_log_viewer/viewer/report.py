@@ -29,7 +29,7 @@ from .yaw_analysis import _SOURCE_INFO, compute_yaw_stats  # noqa: E402
 
 # 図キャプション(ファイル名 → 表示名)
 _FIGURE_CAPTIONS: dict[str, str] = {
-    "01_xy_trajectory.png": "XY 飛行軌跡と目標",
+    "01_xy_trajectory.png": "XY 飛行軌跡",
     "02_attitude.png": "姿勢: 指令 vs 実測",
     "03_altitude.png": "高度と昇降速度",
     "04_position_tracking.png": "位置追従(目標 vs 実測)",
@@ -38,8 +38,7 @@ _FIGURE_CAPTIONS: dict[str, str] = {
     "07_power.png": "電源(電圧 / 電流)",
     "08_latency_loop_dt.png": "通信レイテンシ / 制御周期",
     "09_mocap_diagnostics.png": "MoCap 診断",
-    "10_yaw_four_sources.png": "ヨー4系統比較",
-    "11_yaw_error.png": "ヨー誤差時系列",
+    "10_yaw_comparison.png": "ヨー比較(Madgwick / EKF / 指令)",
     "12_ekf_diagnostics.png": "EKF 診断(NIS / b_m / db̂ / ゲート)",
     "13_ff_status.png": "ff_status タイムライン",
     "14_yaw_tracking.png": "ヨー指令追従",

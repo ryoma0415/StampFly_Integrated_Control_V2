@@ -108,6 +108,7 @@ const els = {
   stateBadge: $("stateBadge"), phaseLabel: $("phaseLabel"), btnRearm: $("btnRearm"),
   attRollBar: $("attRollBar"), attPitchBar: $("attPitchBar"), attYawBar: $("attYawBar"),
   attRollNum: $("attRollNum"), attPitchNum: $("attPitchNum"), attYawNum: $("attYawNum"),
+  attYawName: $("attYawName"),
   altCurBar: $("altCurBar"), altRefMarker: $("altRefMarker"),
   altCurNum: $("altCurNum"), altRefNum: $("altRefNum"),
   dutyBars: { fr: $("dutyFR"), fl: $("dutyFL"), rr: $("dutyRR"), rl: $("dutyRL") },
@@ -763,13 +764,23 @@ function renderDrone() {
   // 姿勢(契約: TLM_STATE全フィールド・角度はdeg換算)
   const roll = pick(d, "roll", "roll_deg");
   const pitch = pick(d, "pitch", "pitch_deg");
-  const yaw = pick(d, "yaw", "yaw_deg");
+  // Yaw は機体が制御に使うソースへ追従する: EKF 有効(est_mode=1)かつ健全なら
+  // EKF ヨー(yaw_est)、それ以外は Madgwick(ファーム yaw_used と同じ選択規範。
+  // 健全判定は EKF 健全性バッジと同一: anchor_valid && mag_fresh)
+  const ekfYaw = pick(d, "yaw_est");
+  const yawFromEkf = !!(d && d.est_mode_ekf && d.anchor_valid && d.mag_fresh
+                        && typeof ekfYaw === "number");
+  const yaw = yawFromEkf ? ekfYaw : pick(d, "yaw", "yaw_deg");
   setBipolarBar(els.attRollBar, roll, UI.ATT_BAR_RANGE_DEG);
   setBipolarBar(els.attPitchBar, pitch, UI.ATT_BAR_RANGE_DEG);
   setBipolarBar(els.attYawBar, yaw, UI.YAW_BAR_RANGE_DEG);
   els.attRollNum.textContent = fmtNum(roll, 1);
   els.attPitchNum.textContent = fmtNum(pitch, 1);
   els.attYawNum.textContent = fmtNum(yaw, 1);
+  els.attYawName.textContent = yawFromEkf ? "Yaw(EKF)" : "Yaw";
+  els.attYawName.title = yawFromEkf
+    ? "EKF 有効・健全のため EKF ヨーを表示中(機体の制御ヨーと同じ選択)"
+    : "Madgwick ヨーを表示中(EKF 無効または健全性低下時のフォールバック)";
 
   // 高度: 現在(カルマン推定) vs 目標
   const altEst = pick(d, "altitude_est");

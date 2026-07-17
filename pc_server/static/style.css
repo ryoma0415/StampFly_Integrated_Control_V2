@@ -372,7 +372,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
 /* バーゲージ */
 .gauge-row {
   display: grid;
-  grid-template-columns: 42px 1fr 110px;
+  grid-template-columns: 62px 1fr 110px; /* 62px: 「Yaw(EKF)」ラベルが収まる幅 */
   align-items: center;
   gap: 10px;
   margin-bottom: 5px;

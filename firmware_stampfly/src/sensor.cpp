@@ -157,6 +157,7 @@ float sensor_read(void) {
     static uint8_t first_flag      = 0;
     static AutoFlightState preAutoState = AUTO_INIT;
     static uint8_t outlier_counter = 0;
+    static float tof_height_m      = 0.0f;  // チルト補正後のToF高度 [m](ゲート棄却中は直前値保持)
     const uint8_t interval         = 400 / 30 + 1;
     float old_sensor_time          = 0.0;
     uint32_t st;
@@ -295,13 +296,24 @@ float sensor_read(void) {
                     old_range[1]    = sensor_state.Range;
                 }
 
+                // ToF チルト補正: スラント距離を鉛直高度へ変換(height = slant·cosφ·cosθ)。
+                // チルトがゲート超のときは新規測距を高度系に反映せず直前値を保持(外れ値処理と同方針)
+                if (FLIGHT_CONFIG.tof_tilt_comp_enabled) {
+                    float tilt = sqrtf(sensor_state.Roll_angle * sensor_state.Roll_angle + sensor_state.Pitch_angle * sensor_state.Pitch_angle);
+                    if (tilt <= FLIGHT_CONFIG.tof_tilt_gate_rad) {
+                        tof_height_m = (float)sensor_state.Range / 1000.0f * cosf(sensor_state.Roll_angle) * cosf(sensor_state.Pitch_angle);
+                    }
+                } else {
+                    tof_height_m = (float)sensor_state.Range / 1000.0f;
+                }
+
                 // USBSerial.printf("%9.6f, %9.6f, %9.6f, %9.6f, %9.6f\r\n",flight_control_state.timing.Elapsed_time,sensor_state.Altitude/1000.0,  sensor_state.Altitude2,
                 // sensor_state.Alt_velocity,-(sensor_state.Accel_z_raw - Accel_z_offset)*9.81/(-Accel_z_offset));
             }
         } else
             dcnt++;
 
-        sensor_state.Altitude = alt_filter.update((float)sensor_state.Range / 1000.0, flight_control_state.timing.Interval_time);
+        sensor_state.Altitude = alt_filter.update(tof_height_m, flight_control_state.timing.Interval_time);
         if (first_flag == 1)
             sensor_state.EstimatedAltitude.update(sensor_state.Altitude, sensor_state.Az, flight_control_state.timing.Interval_time);
         else

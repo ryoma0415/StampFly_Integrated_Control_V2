@@ -117,6 +117,10 @@ struct FlightConfig {
     float range_loss_thrust_step = 0.02f;   // 高度センサ喪失時の降下ステップ
     uint8_t range0_flag_max = 20;           // Range0flag の飽和値
 
+    // --- ToF チルト補正(スラント距離→鉛直高度。eco版 ESKF updateToF と同方針) ---
+    bool tof_tilt_comp_enabled = true;      // 補正の有効/無効(※飛行検証待ち)
+    float tof_tilt_gate_rad = 0.70f;        // チルト角 √(φ²+θ²) がこれ超で新規測距を棄却(直前値保持)
+
     // --- 着陸シーケンス ---
     float landing_z_dot_ref = -0.15f;       // 着陸時の降下速度指令 [m/s]
     float landing_decay_slow = 0.9999f;     // 降下中のスラスト減衰率/tick

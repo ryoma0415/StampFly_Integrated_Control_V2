@@ -32,6 +32,8 @@ flight_log_viewer/output/*
 !flight_log_viewer/output/.gitkeep
 data_analysis/graphs/*
 !data_analysis/graphs/.gitkeep
+data_analysis/replay/build/
+data_analysis/replay/out/
 
 # エディタ
 .vscode/

@@ -146,7 +146,7 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
 | 列 | 型 | 単位 | 説明 |
 | --- | --- | --- | --- |
 | `tlm_alt_ref_m` | float | m | 機体側で適用中の目標高度。 |
-| `tlm_altitude_tof_m` | float | m | ToF 生値。 |
+| `tlm_altitude_tof_m` | float | m | ToF 距離(チルト補正済み: slant·cosφ·cosθ。チルト>0.70rad は直前値保持)。 |
 | `tlm_altitude_est_m` | float | m | カルマン推定高度。 |
 | `tlm_alt_velocity_m_s` | float | m/s | 高度速度。 |
 | `tlm_z_dot_ref_m_s` | float | m/s | 高度速度指令。 |

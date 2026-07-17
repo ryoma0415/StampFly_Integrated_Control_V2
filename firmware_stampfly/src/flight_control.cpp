@@ -199,6 +199,7 @@ void reset_pos_control(void) {
     pos_yaw_fallback_prev_ok = true;
     pos_yaw_fallback_offset = 0.0f;
     flight_control_state.command.pos_err_fresh_sample = false;
+    flight_control_state.diag.xy_onboard_active = 0;
 }
 
 // --- v2: モーターテストサービス内部状態(yaw側 motor.cpp のソフトスタート/
@@ -640,12 +641,15 @@ void update_thrust_and_attitude_command(void) {
         update_pos_control(yaw_for_pos);
         out.Roll_angle_command = pos_cmd_roll_rad;
         out.Pitch_angle_command = pos_cmd_pitch_rad;
+        flight_control_state.diag.xy_onboard_active = 1;  // TLM_CTRL flags bit0
     } else if (link_fresh) {
         out.Roll_angle_command = cs.target_roll_rad;
         out.Pitch_angle_command = cs.target_pitch_rad;
+        flight_control_state.diag.xy_onboard_active = 0;
     } else {
         out.Roll_angle_command = 0.0f;
         out.Pitch_angle_command = 0.0f;
+        flight_control_state.diag.xy_onboard_active = 0;
         // 途絶中は XY 制御の出力状態も水平へ戻す(復帰時の段差防止)
         pos_target_roll_rad = 0.0f;
         pos_target_pitch_rad = 0.0f;
@@ -884,6 +888,7 @@ uint8_t auto_landing_step(void) {
     out.Pitch_angle_command = 0.0f;
     out.Yaw_rate_reference = 0.0f;
     reset_yaw_angle_control();
+    flight_control_state.diag.xy_onboard_active = 0;  // 着陸中は機上XY指令を生成しない
     return landed;
 }
 
@@ -1397,6 +1402,44 @@ void update_loop_timing(void) {
     t.Interval_time = t.Elapsed_time - t.Old_Elapsed_time;
 }
 
+// v2: 角度/角速度ループの PID 成分を TLM_CTRL 用に毎tick転記する(telemetry が
+// 25Hz で読む)。PID::reset() が成分も 0 にするため、リセット中(飛行中の
+// 低スラスト・ヨー制御OFF時の psi_pid 毎tickリセット等)はそのまま 0 が載る。
+// 非飛行状態では PID オブジェクトが直前飛行の値を保持したままになる経路が
+// ある(緩減衰着陸では低スラストリセットが発火しない)ため、契約
+// 「非飛行時は成分 0」を転記側で保証する(判定は TLM_STATE FLAG_FLYING と同一)。
+// yaw の角度ループ成分はクランプ前の値(psi_pid 出力の3分解)、
+// out.Yaw_rate_reference はクランプ後 → 差でクランプ発動が分かる(契約 §TLM_CTRL)。
+void update_control_diag(void) {
+    auto& diag = flight_control_state.diag;
+    const AutoFlightState st = flight_control_state.mode.auto_state;
+    if (st != AUTO_TAKEOFF && st != AUTO_HOVER && st != AUTO_LANDING) {
+        for (int i = 0; i < 9; ++i) {
+            diag.pid_ang[i] = 0.0f;
+            diag.pid_rate[i] = 0.0f;
+        }
+        return;
+    }
+    diag.pid_ang[0] = phi_pid.p_term();
+    diag.pid_ang[1] = phi_pid.i_term();
+    diag.pid_ang[2] = phi_pid.d_term();
+    diag.pid_ang[3] = theta_pid.p_term();
+    diag.pid_ang[4] = theta_pid.i_term();
+    diag.pid_ang[5] = theta_pid.d_term();
+    diag.pid_ang[6] = psi_pid.p_term();
+    diag.pid_ang[7] = psi_pid.i_term();
+    diag.pid_ang[8] = psi_pid.d_term();
+    diag.pid_rate[0] = p_pid.p_term();
+    diag.pid_rate[1] = p_pid.i_term();
+    diag.pid_rate[2] = p_pid.d_term();
+    diag.pid_rate[3] = q_pid.p_term();
+    diag.pid_rate[4] = q_pid.i_term();
+    diag.pid_rate[5] = q_pid.d_term();
+    diag.pid_rate[6] = r_pid.p_term();
+    diag.pid_rate[7] = r_pid.i_term();
+    diag.pid_rate[8] = r_pid.d_term();
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1517,7 @@ void loop_400Hz(void) {
             break;
     }
 
+    update_control_diag();  // PID 成分の転記(TLM_CTRL。telemetry_update より前)
     telemetry_update();
     indicators_update();
 }

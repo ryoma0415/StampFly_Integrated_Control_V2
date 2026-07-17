@@ -53,6 +53,7 @@ _INTEGER_COLUMNS = {
     "frame_number", "marker_count", "send_success", "control_active",
     "rb_marker_count", "tracking_valid", "consecutive_outliers",
     "tlm_flags", "tlm_ffg", "tlm_ff_status", "yaw_ctrl_on", "traj_mode",
+    "tlm_ctrl_flags",
 }
 
 

@@ -23,7 +23,6 @@
  * SOFTWARE.
  */
 
-#include <Arduino.h>
 #include "pid.hpp"
 
 PID::PID() {
@@ -35,6 +34,9 @@ PID::PID() {
     m_differential = 0.0f;
     m_err          = 0.0f;
     m_h            = 0.01f;
+    m_p_term       = 0.0f;
+    m_i_term       = 0.0f;
+    m_d_term       = 0.0f;
 }
 
 void PID::set_parameter(float kp, float ti, float td, float eta, float h) {
@@ -49,15 +51,14 @@ void PID::reset(void) {
     m_integral     = 0.0f;
     m_differential = 0.0f;
     m_err          = 0.0f;
-    m_err2         = 0.0f;
-    m_err3         = 0.0f;
+    m_p_term       = 0.0f;
+    m_i_term       = 0.0f;
+    m_d_term       = 0.0f;
 }
 
 void PID::i_reset(void) {
     m_integral = 0.0f;
-}
-void PID::printGain(void) {
-    Serial.printf("#Kp:%8.4f Ti:%8.4f Td:%8.4f Eta:%8.4f h:%8.4f\r\n", m_kp, m_ti, m_td, m_eta, m_h);
+    m_i_term   = 0.0f;
 }
 
 void PID::set_error(float err) {
@@ -65,7 +66,6 @@ void PID::set_error(float err) {
 }
 
 float PID::update(float err, float h) {
-    float d;
     m_h = h;
 
     // 積分
@@ -76,6 +76,10 @@ float PID::update(float err, float h) {
     m_differential = (2 * m_eta * m_td - m_h) * m_differential / (2 * m_eta * m_td + m_h) +
                      2 * m_td * (err - m_err) / (2 * m_eta * m_td + m_h);
     m_err = err;
+    // P/I/D 成分の保存(TLM_CTRL 用。合成式は原典どおり変更しない)
+    m_p_term = m_kp * err;
+    m_i_term = m_kp * m_integral;
+    m_d_term = m_kp * m_differential;
     return m_kp * (err + m_integral + m_differential);
 }
 

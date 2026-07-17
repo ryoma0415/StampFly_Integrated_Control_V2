@@ -489,6 +489,17 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.est_mode = ju8(f, "est_mode");
     ok = serialize(m, buf, sizeof(buf));
     n = TlmCalData::PAYLOAD_SIZE;
+  } else if (kind == "TLM_CTRL") {
+    TlmCtrl m;
+    m.elapsed_ms = ju32(f, "elapsed_ms");
+    m.roll_rate_ref = jf(f, "roll_rate_ref");
+    m.pitch_rate_ref = jf(f, "pitch_rate_ref");
+    m.yaw_rate_ref = jf(f, "yaw_rate_ref");
+    jfarr(f, "pid_ang", m.pid_ang, 9);
+    jfarr(f, "pid_rate", m.pid_rate, 9);
+    m.flags = ju8(f, "flags");
+    ok = serialize(m, buf, sizeof(buf));
+    n = TlmCtrl::PAYLOAD_SIZE;
   } else if (kind == "TLM_STATE") {
     TlmState m;
     m.seq_echo = ju32(f, "seq_echo");
@@ -697,6 +708,10 @@ std::vector<uint8_t> reserialize_payload(const std::string& kind,
     TlmCalData m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
     n = TlmCalData::PAYLOAD_SIZE;
+  } else if (kind == "TLM_CTRL") {
+    TlmCtrl m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = TlmCtrl::PAYLOAD_SIZE;
   } else if (kind == "TLM_STATE") {
     TlmState m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));

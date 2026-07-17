@@ -693,6 +693,44 @@
       "payload_hex": "3f00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde0201",
       "logical_hex": "0234ca000000703f00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde02019537",
       "wire_hex": "040234ca010103703f01034841010304c1014b70405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0103f0c0010346420114f04166660c42cdcc384208efbeadde0201953700"
+    },
+    {
+      "name": "tlm_ctrl_full",
+      "payload_kind": "TLM_CTRL",
+      "type": 53,
+      "seq": 203,
+      "fields": {
+        "elapsed_ms": 246810,
+        "roll_rate_ref": 0.85,
+        "pitch_rate_ref": -0.65,
+        "yaw_rate_ref": 0.5236,
+        "pid_ang": [
+          0.55,
+          0.2,
+          0.1,
+          -0.42,
+          -0.15,
+          -0.08,
+          0.3,
+          0.18,
+          0.04
+        ],
+        "pid_rate": [
+          0.021,
+          0.008,
+          0.003,
+          -0.017,
+          -0.006,
+          -0.002,
+          0.011,
+          0.004,
+          0.001
+        ],
+        "flags": 7
+      },
+      "payload_hex": "1ac403009a99593f666626bfa60a063fcdcc0c3fcdcc4c3ecdcccc3d3d0ad7be9a9919be0ad7a3bd9a99993eec51383e0ad7233d3108ac3c6f12033ca69b443b96438bbca69bc4bb6f1203bb5839343c6f12833b6f12833a07",
+      "logical_hex": "0235cb000000591ac403009a99593f666626bfa60a063fcdcc0c3fcdcc4c3ecdcccc3d3d0ad7be9a9919be0ad7a3bd9a99993eec51383e0ad7233d3108ac3c6f12033ca69b443b96438bbca69bc4bb6f1203bb5839343c6f12833b6f12833a0746aa",
+      "wire_hex": "040235cb010105591ac403589a99593f666626bfa60a063fcdcc0c3fcdcc4c3ecdcccc3d3d0ad7be9a9919be0ad7a3bd9a99993eec51383e0ad7233d3108ac3c6f12033ca69b443b96438bbca69bc4bb6f1203bb5839343c6f12833b6f12833a0746aa00"
     }
   ],
   "corruption": [

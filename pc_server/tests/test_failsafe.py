@@ -33,29 +33,38 @@ def connected_position_session(session_factory):
 
 
 class TestMocapDropout:
-    def test_sender_holds_level_after_300ms(self, server_config, control_config,
-                                            session_factory):
-        """途絶 >300ms: roll/pitch 水平固定、alt_ref 維持(送信は継続)。"""
+    def test_sender_drops_xy_valid_after_300ms(self, server_config,
+                                               control_config,
+                                               session_factory):
+        """途絶 >300ms: CMD_POS_ERR bit2=0(機体側が水平固定)、alt_ref 維持。
+
+        送信は継続し(ハートビート)、実誤差もそのまま送り続ける
+        (0 すり替えは復帰1サンプル目の D 項スパイクの原因)。
+        """
         session, transport, clock = connected_position_session(session_factory)
-        # 有効な mocap で非ゼロ指令を作る
+        # 有効な mocap で非ゼロ誤差を作る
         session.position.set_target(0.5, 0.0, 0.4)
         for _ in range(5):
             session.position.on_mocap_pose(make_pose(t=clock.advance(0.01)))
         session.position.step(clock())
         session.position.step(clock.advance(0.02))
-        active_roll = session.position.current_setpoint()[0]
-        assert active_roll > 0.0
+        sent = [proto.CmdPosErr.from_payload(f.payload)
+                for f in transport.frames_of_type(proto.MsgType.CMD_POS_ERR)]
+        assert sent, "CMD_POS_ERR が送信されていない"
+        assert sent[-1].flags & proto.CmdPosErr.FLAG_XY_ERR_VALID
+        assert sent[-1].err_x == pytest.approx(0.5, abs=0.05)
 
-        # 途絶: 350ms 進めると水平へ戻り始め、やがて0に到達する
+        # 途絶: 350ms 経過後の送信は bit2=0 になる(送信自体は継続)
         clock.advance(0.35)
-        for _ in range(60):   # 1.2s ぶん(スルーレートで水平へ復帰)
+        before = len(transport.frames_of_type(proto.MsgType.CMD_POS_ERR))
+        for _ in range(30):   # alt スルー制限(0.3m/s)が 0.4m に到達するまで
             session.position.step(clock.advance(0.02))
-        roll, pitch, alt = session.position.current_setpoint()
-        assert roll == pytest.approx(0.0)
-        assert pitch == pytest.approx(0.0)
-        assert alt == pytest.approx(0.4)   # alt_ref は維持
-        # CMD_SETPOINT は途絶中も送信され続ける(ハートビート)
-        assert len(transport.frames_of_type(proto.MsgType.CMD_SETPOINT)) > 0
+        frames = transport.frames_of_type(proto.MsgType.CMD_POS_ERR)
+        assert len(frames) > before        # ハートビートは継続
+        last = proto.CmdPosErr.from_payload(frames[-1].payload)
+        assert not (last.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID)
+        assert last.err_x == pytest.approx(0.5, abs=0.05)   # 実誤差は保持
+        assert last.alt_ref == pytest.approx(0.4)           # alt_ref は維持
 
     def test_supervisor_warns_after_300ms(self, session_factory):
         session, transport, clock = connected_position_session(session_factory)

@@ -32,8 +32,13 @@ class PID {
     float m_ti;
     float m_td;
     float m_eta;
-    float m_err, m_err2, m_err3;
+    float m_err;
     float m_h;
+    // 直近 update() の P/I/D 成分(P=kp*err, I=kp*integral, D=kp*differential。
+    // P+I+D=そのPIDの出力。TLM_CTRL テレメトリが読む)
+    float m_p_term;
+    float m_i_term;
+    float m_d_term;
 
    public:
     float m_differential;
@@ -42,9 +47,11 @@ class PID {
     void set_parameter(float kp, float ti, float td, float eta, float h);
     void reset(void);
     void i_reset(void);
-    void printGain(void);
     void set_error(float err);
     float update(float err, float h);
+    float p_term(void) const { return m_p_term; }
+    float i_term(void) const { return m_i_term; }
+    float d_term(void) const { return m_d_term; }
 };
 
 class Filter {

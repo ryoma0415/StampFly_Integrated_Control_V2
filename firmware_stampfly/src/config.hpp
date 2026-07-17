@@ -37,19 +37,18 @@ struct FlightConfig {
     float yaw_rate_limit_rad_s = 1.0f;      // psi_pid 出力クランプ [rad/s]
 
     // --- 機上XY位置制御(v2.1: CMD_POS_ERR。位置誤差 → roll/pitch 角度指令) ---
-    // アルゴリズム・数値は PC 側で飛行実績のある core/pid.py +
-    // config/control.json("pid" 節)と config/server.json("clamps" 節の
-    // slew_rate_deg_per_s)を踏襲する。PC 側計算(CMD_SETPOINT)との違いは
+    // アルゴリズム・数値は旧 PC 側 XY PID(飛行実績あり。v4 で PC 側実装は
+    // 削除済みで、以下の値が唯一の実体)を踏襲する。旧 PC 側計算との違いは
     // 誤差を機体ヨー推定で機体座標系へ回転(ヨー回転補償)してから PID に
     // 入れる点のみ。
-    float pos_kp = 0.139f;                   // control.json pid.x/y.kp
-    float pos_ki = 0.020f;                   // control.json pid.x/y.ki
-    float pos_kd = 0.204f;                   // control.json pid.x/y.kd
-    float pos_output_limit_rad = 0.087f;     // 出力クランプ ≈±5°(control.json output_limit)
-    float pos_d_filter_alpha = 0.6f;         // D項LPF係数(control.json d_filter_alpha)
+    float pos_kp = 0.139f;                   // XY PID 比例ゲイン(旧 PC 実績値)
+    float pos_ki = 0.020f;                   // XY PID 積分ゲイン(同上)
+    float pos_kd = 0.204f;                   // XY PID 微分ゲイン(同上)
+    float pos_output_limit_rad = 0.087f;     // 出力クランプ ≈±5°
+    float pos_d_filter_alpha = 0.6f;         // D項LPF係数
     float pos_i_decay_rate = 0.98f;          // 異常回復期間の I 項減衰率
     float pos_i_update_threshold_m = 0.3f;   // I 項を更新する誤差上限 [m]
-    float pos_invalid_i_decay = 0.995f;      // データ無効時の I 項微減衰率(pc pid.py と同値)
+    float pos_invalid_i_decay = 0.995f;      // データ無効時の I 項微減衰率(旧 PC 実績値)
     float pos_invalid_d_scale = 0.3f;        // データ無効時の D 項抑制係数(同上)
     uint8_t pos_anomaly_recovery_ticks = 10; // 異常回復後に I 項を減衰させ続ける回数(同上)
     float pos_integral_error_factor_gain = 2.0f;  // 動的アンチワインドアップの誤差感度(同上)
@@ -141,8 +140,9 @@ struct FlightConfig {
     uint8_t wifi_channel = 1;               // ESP-NOWチャネル(PC側機体プロファイルと一致させる)
 
     // --- テレメトリ・表示レート(400Hzループの分周比) ---
-    uint16_t telemetry_state_divider = 16;  // TLM_STATE 25Hz
-    uint16_t telemetry_exp_phase_ticks = 8; // TLM_EXP の位相オフセット(TLM_STATEと8tickずらす)
+    uint16_t telemetry_state_divider = 16;   // TLM_STATE 25Hz
+    uint16_t telemetry_exp_phase_ticks = 8;  // TLM_EXP の位相オフセット(TLM_STATEと8tickずらす)
+    uint16_t telemetry_ctrl_phase_ticks = 4; // TLM_CTRL の位相オフセット(TLM_STATEと4tickずらす)
     uint32_t event_resend_ms = 500;         // TLM_EVENT 2Hz 定期再送
     uint16_t led_show_divider = 16;         // LED更新 25Hz
     uint16_t led_blink_period_ticks = 200;  // 点滅の半周期(0.5s @400Hz)

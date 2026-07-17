@@ -87,6 +87,15 @@ def _build_message(kind: str, fields: dict):
             ff_crc32=fields["ff_crc32"],
             ff_mode=fields["ff_mode"],
             est_mode=fields["est_mode"])
+    if kind == "TLM_CTRL":
+        return sp.TlmCtrl(
+            elapsed_ms=fields["elapsed_ms"],
+            roll_rate_ref=fields["roll_rate_ref"],
+            pitch_rate_ref=fields["pitch_rate_ref"],
+            yaw_rate_ref=fields["yaw_rate_ref"],
+            pid_ang=tuple(fields["pid_ang"]),
+            pid_rate=tuple(fields["pid_rate"]),
+            flags=fields["flags"])
     if kind == "LOG_TEXT":
         return sp.LogText(**fields)
     if kind == "RLY_SET_TARGET":
@@ -141,7 +150,8 @@ def test_vector_file_metadata(vectors):
                      "cmd_ff_begin_nlut8", "cmd_ff_lut_point", "cmd_ff_mot_fl",
                      "cmd_ff_aux", "cmd_ff_commit", "cmd_ff_mode_b_ekf",
                      "cmd_ff_anchor_empty_payload", "cmd_led_mode_recording",
-                     "tlm_ack_ff_commit_ok", "tlm_exp_full", "tlm_cal_data_full"):
+                     "tlm_ack_ff_commit_ok", "tlm_exp_full", "tlm_cal_data_full",
+                     "tlm_ctrl_full"):
         assert required in names, required
     # マルチ機体拡張(0x55-0x58)のベクタが揃っていること
     for required in ("rly_set_peers_two", "rly_set_peers_clear",
@@ -283,6 +293,33 @@ def test_tlm_cal_data_field_offsets(vectors):
     assert struct.unpack_from("<I", payload, 106)[0] == f["ff_crc32"]
     assert payload[110] == f["ff_mode"]
     assert payload[111] == f["est_mode"]
+
+
+def test_tlm_ctrl_field_offsets(vectors):
+    """TLM_CTRL(89B)のオフセットが契約どおりであること(0x35)。"""
+    import struct
+    vec = next(f for f in vectors["frames"] if f["name"] == "tlm_ctrl_full")
+    payload = bytes.fromhex(vec["payload_hex"])
+    f = vec["fields"]
+    assert len(payload) == 89
+    assert struct.unpack_from("<I", payload, 0)[0] == f["elapsed_ms"]
+
+    def f32s(offset: int, count: int) -> tuple:
+        return struct.unpack_from(f"<{count}f", payload, offset)
+
+    def want32(values) -> tuple:
+        return struct.unpack(f"<{len(values)}f", struct.pack(f"<{len(values)}f", *values))
+
+    assert f32s(4, 1) == want32([f["roll_rate_ref"]])
+    assert f32s(8, 1) == want32([f["pitch_rate_ref"]])
+    assert f32s(12, 1) == want32([f["yaw_rate_ref"]])
+    assert f32s(16, 9) == want32(f["pid_ang"])
+    assert f32s(52, 9) == want32(f["pid_rate"])
+    assert payload[88] == f["flags"]
+    # bit0=xy_onboard_active, bit1=yaw_ctrl_active, bit2=flying
+    assert f["flags"] & sp.TlmCtrl.FLAG_XY_ONBOARD_ACTIVE
+    assert f["flags"] & sp.TlmCtrl.FLAG_YAW_CTRL_ACTIVE
+    assert f["flags"] & sp.TlmCtrl.FLAG_FLYING
 
 
 def test_zero_heavy_payload_has_no_zero_on_wire(vectors):

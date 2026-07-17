@@ -142,6 +142,8 @@ class FakeDroneResponder:
         # 整列する(次の磁気サンプルで新基準に揃うファーム挙動の近似)
         self.auto_tlm_state = False
         self.yaw_est_rad = 0.0
+        self.roll_rad = 0.0    # attitude_zero(TLM_STATE 姿勢ソース)用
+        self.pitch_rad = 0.0
         self.tlm_state_status_extra = proto.TlmState.FF_STATUS_MAG_FRESH
 
     def _update_cal_state(self, frame: proto.Frame) -> None:
@@ -230,8 +232,31 @@ class FakeDroneResponder:
         if self.cal_data.est_mode:
             ff_status |= proto.TlmState.FF_STATUS_EST_EKF
         ff_status |= self.tlm_state_status_extra
-        return proto.TlmState(yaw_est_rad=self.yaw_est_rad,
+        return proto.TlmState(roll=self.roll_rad, pitch=self.pitch_rad,
+                              yaw_est_rad=self.yaw_est_rad,
                               ff_status=ff_status)
+
+
+def make_tlm_ctrl(elapsed_ms: int = 1000,
+                  roll_rate_ref: float = 0.10, pitch_rate_ref: float = -0.20,
+                  yaw_rate_ref: float = 0.05,
+                  flags: int = proto.TlmCtrl.FLAG_FLYING,
+                  pid_ang: tuple = None,
+                  pid_rate: tuple = None) -> proto.TlmCtrl:
+    """TLM_CTRL(制御ループ診断)ペイロードの組み立てヘルパ。
+
+    pid_ang / pid_rate 省略時は判別可能な等差値(0.01, 0.02, ...)を入れる
+    (ログ列の転記順の検証に使える)。
+    """
+    if pid_ang is None:
+        pid_ang = tuple(0.01 * (i + 1) for i in range(9))
+    if pid_rate is None:
+        pid_rate = tuple(-0.01 * (i + 1) for i in range(9))
+    return proto.TlmCtrl(
+        elapsed_ms=elapsed_ms,
+        roll_rate_ref=roll_rate_ref, pitch_rate_ref=pitch_rate_ref,
+        yaw_rate_ref=yaw_rate_ref,
+        pid_ang=tuple(pid_ang), pid_rate=tuple(pid_rate), flags=flags)
 
 
 def make_tlm_exp(current_a: float = 0.2, vbat_v: float = 3.9,

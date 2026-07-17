@@ -5,9 +5,9 @@
   開閉は session.py(_open_flight_log / _finish_flight_log)が管理する。
   複数機モード(mode="multi")はスロットごとに1インスタンスを持ち、
   MultiControlManager(open_flight_logs / close_flight_logs)が管理する。
-- 50Hz の制御行(CMD_SETPOINT 送信ごとに1行)+最新テレメトリ/mocap
-  スナップショットの結合。列定義は docs/LOG_STRUCTURE.md に文書化
-  (旧 NatNet_PID_Controller の57列の語彙を継承し、TLM_STATE 列で拡張)。
+- 50Hz の制御行(CMD_POS_ERR / CMD_SETPOINT 送信ごとに1行)+最新テレメトリ
+  (TLM_STATE / TLM_CTRL とも 25Hz)/mocap スナップショットの結合。
+  列定義は docs/LOG_STRUCTURE.md v4(109列)と1対1で対応させること。
 - 値が未取得の列は空文字。0/1 フラグは文字列 "0"/"1"。
 - 経過時間は time.monotonic() 基準。timestamp 列のみ壁時計(ISO8601)。
 """
@@ -25,63 +25,71 @@ import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from .config import LOGS_DIR
 
-# 列定義(docs/LOG_STRUCTURE.md と1対1で対応させること)
+# 列定義 v4(109列。docs/LOG_STRUCTURE.md と1対1で対応させること)
 COLUMNS: tuple[str, ...] = (
-    # --- セッション / タイミング ---
+    # --- セッション / タイミング(7) ---
     "timestamp", "elapsed_time", "mode", "phase",
     "command_sequence", "send_success", "feedback_latency_ms",
-    # --- 指令(送信した CMD_SETPOINT、バイアス加算後) ---
-    "roll_ref_rad", "pitch_ref_rad", "roll_ref_deg", "pitch_ref_deg", "alt_ref_m",
-    "roll_bias_deg", "pitch_bias_deg",
-    # --- 位置と誤差(Position モードのみ。制御座標系 m) ---
+    # --- 目標と位置(制御座標系 m。Position/Multi のみ)(11) ---
+    "target_x", "target_y", "target_z",
     "pos_x", "pos_y", "pos_z",
     "raw_pos_x", "raw_pos_y", "raw_pos_z",
     "error_x", "error_y",
-    "target_x", "target_y", "target_z",
-    # --- PID 成分(Position モードのみ) ---
-    "pid_x_p", "pid_x_i", "pid_x_d",
-    "pid_y_p", "pid_y_i", "pid_y_d",
-    # --- フィルタ状態とデータ由来(Position モードのみ) ---
-    "data_valid", "control_active", "mocap_dropout", "is_outlier", "used_prediction",
-    "confidence", "consecutive_outliers", "data_source",
-    "filter_threshold", "tracking_valid",
-    # --- リジッドボディ / フレーム診断 ---
-    "rb_error", "rb_marker_count",
-    "frame_number", "marker_count", "frame_dt_ms", "mocap_age_ms",
-    # --- 機体テレメトリ(最新 TLM_STATE のスナップショット) ---
-    "tlm_age_ms", "tlm_seq_echo", "tlm_elapsed_ms",
-    "tlm_state", "tlm_state_name", "tlm_flags", "tlm_reason", "tlm_reason_name",
+    # --- 送信指令(PC→機体)(10) ---
+    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid",
+    "roll_ref_rad", "pitch_ref_rad", "alt_ref_m",
+    "cmd_yaw_ref_rad", "yaw_ctrl_on",
+    "roll_bias_deg", "pitch_bias_deg",
+    # --- 機体実測: 姿勢・角速度・加速度(TLM_STATE)(10) ---
+    "tlm_age_ms",
     "tlm_roll_rad", "tlm_pitch_rad", "tlm_yaw_rad",
     "tlm_p_rad_s", "tlm_q_rad_s", "tlm_r_rad_s",
-    "tlm_roll_ref_rad", "tlm_pitch_ref_rad", "tlm_alt_ref_m",
-    "tlm_altitude_tof_m", "tlm_altitude_est_m",
+    "tlm_ax_g", "tlm_ay_g", "tlm_az_g",
+    # --- 機体計算指令(TLM_STATE + TLM_CTRL)(8) ---
+    "tlm_roll_ref_rad", "tlm_pitch_ref_rad", "tlm_yaw_ref_rad",
+    "tlm_ctrl_age_ms", "tlm_ctrl_flags",
+    "tlm_roll_rate_ref_rad_s", "tlm_pitch_rate_ref_rad_s",
+    "tlm_yaw_rate_ref_rad_s",
+    # --- 姿勢PID成分(TLM_CTRL: 角度ループ9+角速度ループ9)(18) ---
+    "tlm_pid_roll_ang_p", "tlm_pid_roll_ang_i", "tlm_pid_roll_ang_d",
+    "tlm_pid_pitch_ang_p", "tlm_pid_pitch_ang_i", "tlm_pid_pitch_ang_d",
+    "tlm_pid_yaw_ang_p", "tlm_pid_yaw_ang_i", "tlm_pid_yaw_ang_d",
+    "tlm_pid_roll_rate_p", "tlm_pid_roll_rate_i", "tlm_pid_roll_rate_d",
+    "tlm_pid_pitch_rate_p", "tlm_pid_pitch_rate_i", "tlm_pid_pitch_rate_d",
+    "tlm_pid_yaw_rate_p", "tlm_pid_yaw_rate_i", "tlm_pid_yaw_rate_d",
+    # --- 高度系(TLM_STATE)(5) ---
+    "tlm_alt_ref_m", "tlm_altitude_tof_m", "tlm_altitude_est_m",
     "tlm_alt_velocity_m_s", "tlm_z_dot_ref_m_s",
-    "tlm_voltage_v",
-    "tlm_duty_fr", "tlm_duty_fl", "tlm_duty_rr", "tlm_duty_rl",
-    "tlm_ax_g", "tlm_ay_g", "tlm_az_g", "tlm_loop_dt_us",
-    # --- v2 追加 17 列(末尾追加のみ。順序は docs/LOG_STRUCTURE.md v2 契約) ---
-    # ヨー指令(送信した CMD_SETPOINT のヨー目標)
-    "cmd_yaw_ref_rad", "cmd_yaw_ref_deg", "yaw_ctrl_on",
-    # 機体テレメトリ(TLM_STATE v2 末尾拡張)
-    "tlm_yaw_est_rad", "tlm_yaw_gyro_int_rad", "tlm_yaw_ref_rad",
+    # --- ヨー推定・FF診断(TLM_STATE)(10) ---
+    "tlm_yaw_est_rad", "tlm_yaw_gyro_int_rad",
     "tlm_current_a", "tlm_db_hat_x_ut", "tlm_db_hat_y_ut",
     "tlm_bm_x_ut", "tlm_bm_y_ut",
     "tlm_nis", "tlm_ffg", "tlm_ff_status",
-    # MoCap ヨー(Position モードのみ)と軌道状態
-    "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
-    # --- v3 追加 6 列(機上XY制御 CMD_POS_ERR。末尾追加のみ) ---
-    # xy_cmd_mode: "pc"(CMD_SETPOINT)/"onboard"(CMD_POS_ERR)の判別
-    # cmd_err_*: 送信した位置誤差(クランプ後) / cmd_xy_valid: flags bit2
-    # cmd_mocap_yaw_deg: 送信した MoCap 実測ヨー(onboard のみ)
-    # mocap_heading_deg: MoCap 実測の制御座標系ヨー(pc/onboard 両モード)
-    "xy_cmd_mode",
-    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid", "cmd_mocap_yaw_deg",
-    "mocap_heading_deg",
+    # --- モータ・電源(TLM_STATE)(5) ---
+    "tlm_duty_fr", "tlm_duty_fl", "tlm_duty_rr", "tlm_duty_rl",
+    "tlm_voltage_v",
+    # --- 機体状態・システム(TLM_STATE)(6) ---
+    "tlm_state", "tlm_flags", "tlm_reason", "tlm_seq_echo",
+    "tlm_elapsed_ms", "tlm_loop_dt_us",
+    # --- MoCap 実測ヨー・軌道(4) ---
+    "mocap_yaw_deg", "mocap_heading_deg", "traj_mode", "traj_phase_rad",
+    # --- フィルタ状態(Position/Multi のみ)(10) ---
+    "data_valid", "control_active", "mocap_dropout", "is_outlier",
+    "used_prediction",
+    "confidence", "consecutive_outliers", "data_source",
+    "filter_threshold", "tracking_valid",
+    # --- リジッドボディ / フレーム診断(5) ---
+    "rb_error", "rb_marker_count", "frame_number", "frame_dt_ms",
+    "mocap_age_ms",
 )
 
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数
 
 MS_PER_S = 1000.0
+
+# TLM_CTRL の PID 成分列の軸/項の並び(§2 契約: roll,pitch,yaw × p,i,d)
+_PID_AXES = ("roll", "pitch", "yaw")
+_PID_TERMS = ("p", "i", "d")
 
 # PositionController の meta からそのままキー名一致で転記する診断列
 # (session._build_log_row と multi の機体別ログで共通)
@@ -90,25 +98,11 @@ META_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "data_valid", "control_active", "mocap_dropout",
     "is_outlier", "used_prediction", "confidence",
     "consecutive_outliers", "data_source", "filter_threshold",
-    "tracking_valid", "rb_error", "frame_number", "marker_count",
+    "tracking_valid", "rb_error", "frame_number",
     "frame_dt_ms", "mocap_age_ms",
     "mocap_yaw_deg", "mocap_heading_deg",
     "traj_mode", "traj_phase_rad",
 )
-
-
-def _state_name(state: int) -> str:
-    try:
-        return proto.FlightState(state).name
-    except ValueError:
-        return f"UNKNOWN({state})"
-
-
-def _reason_name(reason: int) -> str:
-    try:
-        return proto.Reason(reason).name
-    except ValueError:
-        return f"UNKNOWN({reason})"
 
 
 def meta_to_row(meta: dict) -> dict:
@@ -120,11 +114,6 @@ def meta_to_row(meta: dict) -> dict:
     raw = meta.get("raw_pos")
     if raw is not None:
         row["raw_pos_x"], row["raw_pos_y"], row["raw_pos_z"] = raw
-    pid_components = meta.get("pid_components")
-    if pid_components is not None:
-        for axis in ("x", "y"):
-            for term in ("p", "i", "d"):
-                row[f"pid_{axis}_{term}"] = pid_components[axis][term]
     for key in META_PASSTHROUGH_KEYS:
         if key in meta:
             row[key] = meta[key]
@@ -140,10 +129,8 @@ def tlm_state_to_row(tlm: proto.TlmState, age_s: float) -> dict:
         "tlm_seq_echo": tlm.seq_echo,
         "tlm_elapsed_ms": tlm.elapsed_ms,
         "tlm_state": tlm.state,
-        "tlm_state_name": _state_name(tlm.state),
         "tlm_flags": tlm.flags,
         "tlm_reason": tlm.reason,
-        "tlm_reason_name": _reason_name(tlm.reason),
         "tlm_roll_rad": tlm.roll,
         "tlm_pitch_rad": tlm.pitch,
         "tlm_yaw_rad": tlm.yaw,
@@ -179,6 +166,26 @@ def tlm_state_to_row(tlm: proto.TlmState, age_s: float) -> dict:
         "tlm_ffg": tlm.ffg,
         "tlm_ff_status": tlm.ff_status,
     }
+
+
+def tlm_ctrl_to_row(ctrl: proto.TlmCtrl, age_s: float) -> dict:
+    """最新 TLM_CTRL のスナップショット → tlm_ctrl_* / tlm_pid_* 列。
+
+    25Hz(制御行 50Hz の半分)のため、連続する2行が同じスナップショットを
+    共有し得る(tlm_ctrl_age_ms で判別可能)。
+    """
+    row = {
+        "tlm_ctrl_age_ms": age_s * MS_PER_S,
+        "tlm_ctrl_flags": ctrl.flags,
+        "tlm_roll_rate_ref_rad_s": ctrl.roll_rate_ref,
+        "tlm_pitch_rate_ref_rad_s": ctrl.pitch_rate_ref,
+        "tlm_yaw_rate_ref_rad_s": ctrl.yaw_rate_ref,
+    }
+    for a, axis in enumerate(_PID_AXES):
+        for t, term in enumerate(_PID_TERMS):
+            row[f"tlm_pid_{axis}_ang_{term}"] = ctrl.pid_ang[a * 3 + t]
+            row[f"tlm_pid_{axis}_rate_{term}"] = ctrl.pid_rate[a * 3 + t]
+    return row
 
 
 def _format_cell(value) -> str:

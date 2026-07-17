@@ -10,8 +10,8 @@ multi_start / stop)と 20Hz supervisor から呼ばれる。
   (serial.send_to / register_node_handler)で行い、ESP-NOW 区間のバイト列は
   単機時と同一。node_id = 選択順 index = RLY_SET_PEERS のエントリ index。
 - 各スロットは独立した PositionController(自前の 50Hz 送信スレッド)を持ち、
-  CMD_SETPOINT はノード宛で送る(ハートビート兼用 — 機体側 200ms/500ms の
-  自律フェイルセーフが最終防衛線)。
+  CMD_POS_ERR(機上XY制御)をノード宛で送る(ハートビート兼用 — 機体側
+  200ms/500ms の自律フェイルセーフが最終防衛線)。
 - MoCap は1つの NatNet クライアントを共有し、機体プロファイルの
   rigid_body_id で MocapSource.subscribe() する。
 - PC 側フェイルセーフは単機セッションと同じ規範をスロットごとに適用する:
@@ -43,7 +43,7 @@ from typing import Callable, Optional
 import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from . import config as cfg
-from .logger import FlightLogger, meta_to_row, tlm_state_to_row
+from .logger import FlightLogger, meta_to_row, tlm_ctrl_to_row, tlm_state_to_row
 from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
 from .position import PositionController
 from .serial_link import SerialLink, SerialLinkError
@@ -120,6 +120,9 @@ class DroneSlot:
         # 最新テレメトリ(ノード帰属済み)
         self.tlm: Optional[proto.TlmState] = None
         self.tlm_t: Optional[float] = None
+        # 制御ループ診断(TLM_CTRL 25Hz。機体別ログの tlm_ctrl_* 列用)
+        self.tlm_ctrl: Optional[proto.TlmCtrl] = None
+        self.tlm_ctrl_t: Optional[float] = None
         # 機体別フライトログ(開いている間のみ非 None。開閉は
         # open_flight_logs / close_flight_logs。log_row 自体はスレッド安全)
         self.logger: Optional[FlightLogger] = None
@@ -174,18 +177,13 @@ class MultiControlManager:
         # 取り違えの最終防衛線)
         self._divergence_error_m: float = multi_cfg["divergence_error_m"]
         self._divergence_hold_s: float = multi_cfg["divergence_hold_s"]
-        # ヨー角目標の上限。PC 側 XY 位置ループ(xy_command_mode="pc")は
-        # 制御座標系固定(ワールド誤差 → roll/pitch にヨー回転補償なし)の
-        # ため、大きなヨー保持は XY 制御の実効ゲインを cos(ψ) に落とす
-        # (90°で直交・180°で正帰還)。cos30° ≈ 0.87 の範囲に制限する。
-        # xy_command_mode="onboard"(CMD_POS_ERR: 機体側でヨー回転補償)では
-        # この制約は原理上不要だが、飛行検証が済むまでクランプは維持する。
+        # ヨー角目標の上限。CMD_POS_ERR(機体側でヨー回転補償)では原理上
+        # 不要な制約だが、機上ヨー回転補償の飛行未検証のため暫定維持する。
         self._max_yaw_ctrl_deg: float = multi_cfg["max_yaw_ctrl_deg"]
 
-        # XY 指令モード(session と同じ control.json "control" 節を参照)
+        # 機上XY制御(CMD_POS_ERR)の位置誤差クランプ(session と同じ
+        # control.json "control" 節を参照)
         control_cfg = control_config.get("control", {})
-        xy_mode = control_cfg.get("xy_command_mode", "pc")
-        self._xy_onboard: bool = (xy_mode == "onboard")
         self._pos_err_clamp_m: float = control_cfg.get("pos_err_clamp_m", 2.0)
 
         # 機体別フライトログ(T3-5)。logs_dir はテストが差し替え可能
@@ -202,6 +200,8 @@ class MultiControlManager:
         # ノード付き受信ハンドラ(RLY_MUX_DOWN の内側フレーム)
         serial.register_node_handler(proto.MsgType.TLM_STATE,
                                      self._on_tlm_state)
+        serial.register_node_handler(proto.MsgType.TLM_CTRL,
+                                     self._on_tlm_ctrl)
         serial.register_node_handler(proto.MsgType.TLM_EVENT,
                                      self._on_tlm_event)
 
@@ -277,7 +277,7 @@ class MultiControlManager:
         for node_id, profile in enumerate(profiles):
             controller = PositionController(
                 self._server_config, self._control_config,
-                self._make_emit(node_id, profile), clock=self._clock)
+                self._make_emit(node_id), clock=self._clock)
             slot = DroneSlot(node_id, profile, controller)
             slots.append(slot)
         with self._lock:
@@ -352,7 +352,8 @@ class MultiControlManager:
 
         目標は SetpointShaper が最短経路 wrap+スルーレート制限して 50Hz 送信
         に反映する(単機のヨースライダと同じ経路)。飛行中の変更も可だが、
-        - 目標は ±max_yaw_ctrl_deg に制限(XY ループが制御座標系固定のため)
+        - 目標は ±max_yaw_ctrl_deg に制限(機上ヨー回転補償の飛行未検証の
+          ため暫定維持)
         - MoCap 途絶中(armed/flying)は変更を拒否(位置盲目中の回頭を防ぐ)
         """
         slot = self._slot_by_name(name)
@@ -370,8 +371,8 @@ class MultiControlManager:
             if not isinstance(yaw_deg, (int, float)) \
                     or not (-limit <= float(yaw_deg) <= limit):
                 return False, (f"ヨー目標は ±{limit:.0f}° で指定してください"
-                               f"({yaw_deg})。XY 位置制御は制御座標系固定の"
-                               "ため大きなヨー保持は位置保持を劣化させます")
+                               f"({yaw_deg})。機上ヨー回転補償の飛行検証が"
+                               "完了するまでの暫定制限です")
             slot.controller.set_yaw_setpoint(float(yaw_deg) * DEG_TO_RAD)
             with self._lock:
                 slot.yaw_target_deg = float(yaw_deg)
@@ -601,6 +602,8 @@ class MultiControlManager:
             phase = slot.phase
             tlm = slot.tlm
             tlm_t = slot.tlm_t
+            ctrl = slot.tlm_ctrl
+            ctrl_t = slot.tlm_ctrl_t
         row = {
             "mode": "multi",
             "phase": phase,
@@ -609,19 +612,18 @@ class MultiControlManager:
             "feedback_latency_ms": self._serial.node_latency_ms(slot.node_id),
             "roll_ref_rad": roll_ref,
             "pitch_ref_rad": pitch_ref,
-            "roll_ref_deg": roll_ref * RAD_TO_DEG,
-            "pitch_ref_deg": pitch_ref * RAD_TO_DEG,
             "alt_ref_m": alt_ref,
             "roll_bias_deg": slot.profile["roll_bias_deg"],
             "pitch_bias_deg": slot.profile["pitch_bias_deg"],
             # v2: ヨー指令(送信したヨー目標)
             "cmd_yaw_ref_rad": yaw_ref,
-            "cmd_yaw_ref_deg": yaw_ref * RAD_TO_DEG,
             "yaw_ctrl_on": yaw_ctrl_on,
         }
         row.update(meta_to_row(meta))
         if tlm is not None and tlm_t is not None:
             row.update(tlm_state_to_row(tlm, self._clock() - tlm_t))
+        if ctrl is not None and ctrl_t is not None:
+            row.update(tlm_ctrl_to_row(ctrl, self._clock() - ctrl_t))
         row.update(extra)
         logger.log_row(row)
 
@@ -656,6 +658,19 @@ class MultiControlManager:
             slot.tlm = tlm
             slot.tlm_t = now
         self._update_slot_phase(slot, tlm.state, tlm.flags, now)
+
+    def _on_tlm_ctrl(self, node_id: int, frame: proto.Frame) -> None:
+        """TLM_CTRL(制御ループ診断 25Hz)のスロット別保持(RXスレッド上)。"""
+        slot = self._slot_by_node(node_id)
+        if slot is None:
+            return
+        try:
+            ctrl = proto.TlmCtrl.from_payload(frame.payload)
+        except ValueError:
+            return
+        with self._lock:
+            slot.tlm_ctrl = ctrl
+            slot.tlm_ctrl_t = self._clock()
 
     def _on_tlm_event(self, node_id: int, frame: proto.Frame) -> None:
         slot = self._slot_by_node(node_id)
@@ -897,6 +912,19 @@ class MultiControlManager:
         with self._lock:
             return [s.name for s in self._slots]
 
+    def tlm_state_of(self, node_id: int) -> tuple[Optional[proto.TlmState],
+                                                  Optional[float]]:
+        """ノード別の最新 TLM_STATE と受信時刻(未選択/未受信は (None, None))。
+
+        session._tlm_state_snapshot(node_id)経由で CalibrationManager の
+        ノード宛クイック較正が参照する。
+        """
+        slot = self._slot_by_node(node_id)
+        if slot is None:
+            return None, None
+        with self._lock:
+            return slot.tlm, slot.tlm_t
+
     def flying_profiles(self) -> dict[str, dict]:
         """armed/flying スロットの選択時プロファイル(name → profile)。
 
@@ -971,15 +999,13 @@ class MultiControlManager:
     # 内部
     # ==================================================================
 
-    def _make_emit(self, node_id: int, profile: dict):
-        """スロット専用の setpoint/pos_err 送信クロージャ(50Hz スレッドから)。
+    def _make_emit(self, node_id: int):
+        """スロット専用の CMD_POS_ERR 送信クロージャ(50Hz スレッドから)。
 
         機体別ログが開いている間は、送信(成功/失敗を問わず)ごとに
-        1行を書く(単機の session._emit_setpoint / _emit_pos_err と同じ寿命)。
+        1行を書く(単機の session._emit_pos_err と同じ寿命)。
+        バイアスは送らない(機体側 XY PID の I 項が吸収する)。
         """
-        bias_roll = profile["roll_bias_deg"] * DEG_TO_RAD
-        bias_pitch = profile["pitch_bias_deg"] * DEG_TO_RAD
-
         def emit(roll_rad: float, pitch_rad: float, alt_m: float,
                  meta: dict) -> None:
             # スロット参照(deactivate 後の残余ステップでは None → 送信のみ)
@@ -987,80 +1013,51 @@ class MultiControlManager:
             logger = slot.logger if slot is not None else None
             log_open = logger is not None and logger.active
             # ヨー角制御は機体別に選択可能(set_yaw)。単機の
-            # session._emit_setpoint と同じ規約で meta から反映する
+            # session._emit_pos_err と同じ規約で meta から反映する
             # (OFF なら flags bit1=0 → 機体はレートダンピング)。
             yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
             yaw_ref = (float(meta.get("yaw_ref_rad") or 0.0)
                        if yaw_ctrl_on else 0.0)
-            if self._xy_onboard:
-                # 機上XY制御(CMD_POS_ERR): 単機の session._emit_pos_err と
-                # 同じ規約。バイアスは送らない(機体側 I 項が吸収する)。
-                # bit2=0 でも実誤差を送る(0 すり替えは D 項スパイクの原因)。
-                xy_valid = (bool(meta.get("control_active"))
-                            and bool(meta.get("data_valid"))
-                            and not bool(meta.get("mocap_dropout")))
-                clamp = self._pos_err_clamp_m
-                err_x = max(-clamp, min(clamp,
-                                        float(meta.get("error_x") or 0.0)))
-                err_y = max(-clamp, min(clamp,
-                                        float(meta.get("error_y") or 0.0)))
-                heading = meta.get("mocap_heading_rad")
-                flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
-                if yaw_ctrl_on:
-                    flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID
-                if xy_valid:
-                    flags |= proto.CmdPosErr.FLAG_XY_ERR_VALID
-                if heading is not None:
-                    flags |= proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
-                pos_err = proto.CmdPosErr(
-                    err_x=err_x, err_y=err_y, alt_ref=alt_m, yaw_ref=yaw_ref,
-                    mocap_yaw=float(heading or 0.0), flags=flags)
-                seq: Optional[int] = None
-                send_success = False
-                try:
-                    seq = self._serial.send_pos_err_to(node_id, pos_err)
-                    send_success = True
-                except SerialLinkError:
-                    pass   # 切断検知は serial の on_disconnect → supervisor
-                if log_open:
-                    # roll/pitch 指令は機体側で計算されるため 0(単機と同じ
-                    # 規約。実際の指令は tlm_roll_ref_rad 等に現れる)
-                    self._log_slot_row(
-                        slot, logger, seq=seq, send_success=send_success,
-                        roll_ref=0.0, pitch_ref=0.0, alt_ref=alt_m,
-                        yaw_ref=yaw_ref, yaw_ctrl_on=yaw_ctrl_on, meta=meta,
-                        extra={
-                            "xy_cmd_mode": "onboard",
-                            "cmd_err_x_m": err_x,
-                            "cmd_err_y_m": err_y,
-                            "cmd_xy_valid": xy_valid,
-                            "cmd_mocap_yaw_deg": (
-                                None if heading is None
-                                else heading * RAD_TO_DEG),
-                        })
-                return
-            flags = proto.CmdSetpoint.FLAG_ALT_REF_VALID
+            # 機上XY制御(CMD_POS_ERR): 単機の session._emit_pos_err と
+            # 同じ規約。bit2=0 でも実誤差を送る(0 すり替えは D 項
+            # スパイクの原因)。
+            xy_valid = (bool(meta.get("control_active"))
+                        and bool(meta.get("data_valid"))
+                        and not bool(meta.get("mocap_dropout")))
+            clamp = self._pos_err_clamp_m
+            err_x = max(-clamp, min(clamp,
+                                    float(meta.get("error_x") or 0.0)))
+            err_y = max(-clamp, min(clamp,
+                                    float(meta.get("error_y") or 0.0)))
+            heading = meta.get("mocap_heading_rad")
+            flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
             if yaw_ctrl_on:
-                flags |= proto.CmdSetpoint.FLAG_YAW_REF_VALID
-            setpoint = proto.CmdSetpoint(
-                roll_ref=roll_rad + bias_roll,
-                pitch_ref=pitch_rad + bias_pitch,
-                alt_ref=alt_m,
-                yaw_ref=yaw_ref,
-                flags=flags,
-            )
-            seq = None
+                flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID
+            if xy_valid:
+                flags |= proto.CmdPosErr.FLAG_XY_ERR_VALID
+            if heading is not None:
+                flags |= proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
+            pos_err = proto.CmdPosErr(
+                err_x=err_x, err_y=err_y, alt_ref=alt_m, yaw_ref=yaw_ref,
+                mocap_yaw=float(heading or 0.0), flags=flags)
+            seq: Optional[int] = None
             send_success = False
             try:
-                seq = self._serial.send_setpoint_to(node_id, setpoint)
+                seq = self._serial.send_pos_err_to(node_id, pos_err)
                 send_success = True
             except SerialLinkError:
-                pass   # 切断検知は serial の on_disconnect → supervisor が処理
+                pass   # 切断検知は serial の on_disconnect → supervisor
             if log_open:
+                # roll/pitch 指令は機体側で計算されるため 0(単機と同じ
+                # 規約。実際の指令は tlm_roll_ref_rad 等に現れる)
                 self._log_slot_row(
                     slot, logger, seq=seq, send_success=send_success,
-                    roll_ref=setpoint.roll_ref, pitch_ref=setpoint.pitch_ref,
-                    alt_ref=alt_m, yaw_ref=yaw_ref, yaw_ctrl_on=yaw_ctrl_on,
-                    meta=meta, extra={"xy_cmd_mode": "pc"})
+                    roll_ref=0.0, pitch_ref=0.0, alt_ref=alt_m,
+                    yaw_ref=yaw_ref, yaw_ctrl_on=yaw_ctrl_on, meta=meta,
+                    extra={
+                        "cmd_err_x_m": err_x,
+                        "cmd_err_y_m": err_y,
+                        "cmd_xy_valid": xy_valid,
+                    })
 
         return emit

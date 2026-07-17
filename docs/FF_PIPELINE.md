@@ -11,6 +11,8 @@
 (UDP `ffcal_*` JSON → シリアル `CMD_FF_*` バイナリ。ワイヤ仕様は
 [PROTOCOL.md](PROTOCOL.md) が正)とファイル配置(`pc_server/data/` 配下)、
 スイープのサンプル源(UDP JSON テレメトリ → TLM_EXP)である。
+なお上記 yaw側プロジェクトへの参照は**移植元の歴史的出所**であり、
+V2 の動作(ビルド・実行・テスト)には不要(数式の規範を示すための参照)。
 
 ---
 
@@ -35,7 +37,7 @@
 
 【③ 実験】ファームウェアがFF補正+推定(CF/EKF)をオンデバイス実行
     TLM_STATE 末尾拡張に補正後Yaw・ジャイロ積算・ΔB̂・b_m・NIS・ffg 等を載せる
-    └→ 飛行ログ(logs/*.csv 94列、LOG_STRUCTURE.md)に 50Hz で記録
+    └→ 飛行ログ(logs/flight_logs/*.csv v4・109列、LOG_STRUCTURE.md)に 50Hz で記録
         └→ flight_log_viewer でヨー4系統比較・EKF診断・サマリレポート
 ```
 
@@ -178,7 +180,8 @@ cd data_analysis && .venv/bin/python tests/test_ff_extraction.py
 ```
 
 1. **6/12照合(厳密)**: 6/12の8 stem で抽出し、
-   `graphs/feasibility_20260612/results.json` の `pooled_model.a/b`・
+   `tests/fixtures/results.json`(旧 `graphs/feasibility_20260612/results.json`。
+   `graphs/` は生成物置き場のため git 管理外)の `pooled_model.a/b`・
    `additivity.per_motor_a_prop`・`duty_to_current_quadfit`・`lut_breakpoints.points`
    と相対誤差 < 1e-6 で一致すること(同一コードパスの移植確認)。
 2. **付録A再現(新機体)**: 6/29の4本+6/30の4本で抽出し、

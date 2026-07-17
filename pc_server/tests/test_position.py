@@ -1,4 +1,9 @@
-"""position: 合成 mocap → フィルタ → XY PID → セットポイントのパイプライン。"""
+"""position: 合成 mocap → フィルタ → 位置誤差(機上XY制御)のパイプライン。
+
+XY PID は機体側 flight_control が実行するため、この層は誤差計算・有効性
+判定・軌道・整形済み alt/yaw の meta 供給までを検証する(roll/pitch の
+角度指令は常に 0 で emit される)。
+"""
 
 from __future__ import annotations
 
@@ -38,80 +43,47 @@ def settle_steps(controller, clock, n=2):
         controller.step(clock.advance(STEP_DT))
 
 
-class TestPidPipeline:
-    def test_positive_x_error_gives_positive_roll(self, server_config, control_config):
-        """目標が +x 側 → roll 指令は正(正ゲイン規約)。"""
+class TestErrorPipeline:
+    def test_error_is_target_minus_filtered_position(self, server_config,
+                                                     control_config):
+        """誤差 = 目標 − フィルタ済み位置(機体側 XY PID の入力になる)。"""
         controller, emitted, clock = make_controller(server_config, control_config)
         controller.set_control_active(True)
-        controller.set_target(0.5, 0.0, 0.3)
+        controller.set_target(0.5, -0.2, 0.3)
         feed_poses(controller, clock, [(0.0, 0.0, 0.3)] * 10)
 
         settle_steps(controller, clock)
         roll, pitch, alt, meta = emitted[-1]
         assert meta["data_valid"] is True
+        assert meta["control_active"] is True
         assert meta["error_x"] == pytest.approx(0.5, abs=0.01)
-        assert roll > 0.0
-        assert pitch == pytest.approx(0.0, abs=1e-6)
+        assert meta["error_y"] == pytest.approx(-0.2, abs=0.01)
+        # roll/pitch の角度指令は機体側で計算されるため常に 0 で emit する
+        assert roll == 0.0
+        assert pitch == 0.0
 
-    def test_positive_y_error_gives_positive_pitch(self, server_config, control_config):
-        controller, emitted, clock = make_controller(server_config, control_config)
-        controller.set_control_active(True)
-        controller.set_target(0.0, 0.5, 0.3)
-        feed_poses(controller, clock, [(0.0, 0.0, 0.3)] * 10)
-
-        settle_steps(controller, clock)
-        roll, pitch, _, meta = emitted[-1]
-        assert pitch > 0.0
-        assert roll == pytest.approx(0.0, abs=1e-6)
-
-    def test_pid_output_respects_output_limit(self, server_config, control_config):
-        """大誤差でも PID 出力は ±0.087 rad(config)に制限される。"""
-        controller, emitted, clock = make_controller(server_config, control_config)
-        controller.set_control_active(True)
-        controller.set_target(10.0, -10.0, 0.3)
-        # スルー制限の影響を除くため十分長く回す
-        for _ in range(100):
-            feed_poses(controller, clock, [(0.0, 0.0, 0.3)])
-            controller.step(clock())
-        limit = control_config["pid"]["output_limit"][1]
-        roll, pitch, _, _ = emitted[-1]
-        assert roll == pytest.approx(limit, abs=1e-9)
-        assert pitch == pytest.approx(-limit, abs=1e-9)
-
-    def test_yaw_not_used_in_control(self, server_config, control_config):
-        """pose の yaw を変えても指令は変わらない(ヨーは無制御)。"""
-        outputs = []
-        for yaw in (0.0, 1.0):
-            controller, emitted, clock = make_controller(server_config, control_config)
-            controller.set_control_active(True)
-            controller.set_target(0.5, 0.0, 0.3)
-            feed_poses(controller, clock, [(0.0, 0.0, 0.3)] * 10, yaw_rad=yaw)
-            settle_steps(controller, clock)
-            outputs.append(emitted[-1][:3])
-        assert outputs[0] == outputs[1]
-
-    def test_control_inactive_keeps_level_command(self, server_config, control_config):
-        """Start 前(control_active=False)は誤差があっても水平を維持する。"""
+    def test_control_inactive_reported_in_meta(self, server_config,
+                                               control_config):
+        """Start 前(control_active=False)は meta に反映される(bit2=0 の根拠)。"""
         controller, emitted, clock = make_controller(server_config, control_config)
         controller.set_target(0.5, 0.5, 0.3)
         feed_poses(controller, clock, [(0.0, 0.0, 0.3)] * 10)
         controller.step(clock())
-        roll, pitch, _, meta = emitted[-1]
-        assert roll == 0.0
-        assert pitch == 0.0
+        _, _, _, meta = emitted[-1]
         assert meta["control_active"] is False
+        # 誤差自体は計算され続ける(閉ループ ON/OFF と独立)
+        assert meta["error_x"] == pytest.approx(0.5, abs=0.01)
 
-    def test_invalid_tracking_zeroes_command(self, server_config, control_config):
+    def test_invalid_tracking_clears_data_valid(self, server_config,
+                                                control_config):
         controller, emitted, clock = make_controller(server_config, control_config)
         controller.set_control_active(True)
         controller.set_target(0.5, 0.0, 0.3)
         feed_poses(controller, clock, [(0.0, 0.0, 0.3)] * 10, tracking_valid=False)
         controller.step(clock())
-        roll, pitch, _, meta = emitted[-1]
+        _, _, _, meta = emitted[-1]
         assert meta["data_valid"] is False
-        assert roll == 0.0
-        assert pitch == 0.0
-        assert controller.pid.pid_x.anomaly_detected
+        assert meta["control_active"] is True
 
     def test_alt_follows_target_z(self, server_config, control_config):
         controller, emitted, clock = make_controller(server_config, control_config)
@@ -133,10 +105,12 @@ class TestPidPipeline:
         meta = emitted[-1][3]
         for key in ("mode", "data_valid", "control_active", "mocap_dropout",
                     "error_x", "error_y", "target_x", "target_y", "target_z",
-                    "pid_components", "data_source", "filtered_pos", "raw_pos",
+                    "data_source", "filtered_pos", "raw_pos",
                     "confidence", "is_outlier", "frame_number"):
             assert key in meta, key
         assert meta["data_source"] == "rigid_body"
+        # 旧 PC 側 XY PID の語彙は v4 で削除済み
+        assert "pid_components" not in meta
 
 
 class TestMocapSource:

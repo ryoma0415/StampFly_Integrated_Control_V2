@@ -68,7 +68,7 @@ geomagnetic_profiles.json (city-hall positions) so that the previously
 verified values of the existing/selected profiles are preserved bit-for-bit.
 
 Usage:  python3 make_geomag_profiles.py
-Writes: ../geomagnetic_profiles.json (relative to this script).
+Writes: ../config/geomagnetic_profiles.json (relative to this script).
 Standard library only.
 """
 
@@ -78,7 +78,8 @@ import json
 from pathlib import Path
 
 EPOCH = 2020.0
-OUTPUT = Path(__file__).resolve().parent.parent / "geomagnetic_profiles.json"
+OUTPUT = (Path(__file__).resolve().parent.parent / "config"
+          / "geomagnetic_profiles.json")
 
 SOURCE = (
     "Geospatial Information Authority of Japan geomagnetic 2020.0 approximate "

@@ -175,8 +175,15 @@ class TestAccel6Flow:
 class TestQuickCal:
     def test_attitude_and_yaw_zero(self, cal_session):
         session, transport, clock, responder, tmp_path = cal_session
-        session.experiment.on_tlm_exp(
-            make_tlm_exp(roll=0.02, pitch=-0.03, yaw=0.5), 1)
+        # Attitude 0: 姿勢ソースは TLM_STATE の roll/pitch(Madgwick AHRS。
+        # TLM_EXP 非依存になったため全制御モードで動作する)
+        responder.auto_tlm_state = True
+        responder.roll_rad = 0.02
+        responder.pitch_rad = -0.03
+        transport.push(proto.MsgType.TLM_STATE,
+                       responder.make_tlm_state().to_payload())
+        assert wait_until(
+            lambda: session._tlm_state_snapshot()[0] is not None)
         assert session.calibration.attitude_zero()["ok"]
         sent = proto.CmdAttmountSet.from_payload(
             transport.frames_of_type(proto.MsgType.CMD_ATTMOUNT_SET)[0].payload)
@@ -188,12 +195,12 @@ class TestQuickCal:
         # 「機体の現在オフセット + 現在の推定ヨー」の逆算値を送る
         responder.cal_data.yawzero_offset_rad = 0.25
         responder.cal_data.valid_flags |= proto.TlmCalData.VALID_YAWZERO
-        responder.auto_tlm_state = True
         responder.yaw_est_rad = 0.5
         transport.push(proto.MsgType.TLM_STATE,
                        responder.make_tlm_state().to_payload())
         assert wait_until(
-            lambda: session._tlm_state_snapshot()[0] is not None)
+            lambda: (session._tlm_state_snapshot()[0] or proto.TlmState()
+                     ).yaw_est_rad == pytest.approx(0.5))
         result = session.calibration.yaw_zero()
         assert result["ok"], result
         sent = proto.CmdYawzeroSet.from_payload(
@@ -208,6 +215,14 @@ class TestQuickCal:
         assert result["ok"], result
         assert not (responder.cal_data.valid_flags
                     & proto.TlmCalData.VALID_YAWZERO)
+
+    def test_attitude_zero_requires_fresh_tlm_state(self, cal_session):
+        session, transport, clock, responder, tmp_path = cal_session
+        # TLM_STATE 未受信 → 拒否(コマンドは送らない)
+        result = session.calibration.attitude_zero()
+        assert not result["ok"]
+        assert "新鮮" in result["message"]
+        assert not transport.frames_of_type(proto.MsgType.CMD_ATTMOUNT_SET)
 
     def test_yaw_zero_guards(self, cal_session):
         """Yaw 0 の前提: TLM_STATE 鮮度・磁気鮮度を検証する。"""
@@ -231,6 +246,73 @@ class TestQuickCal:
         assert "新鮮" in result["message"]
         # ガードで弾かれた場合はコマンドを一切送らない
         assert not transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)
+
+
+class TestQuickCalAllModes:
+    """quickcal(session 窓口)の全モード対応とモード/飛行中ガード。"""
+
+    def _connected(self, session_factory, server_config):
+        server_config["failsafe"]["command_ack_timeout_s"] = 0.1
+        responder = FakeDroneResponder()
+        session, transport, clock = session_factory(responder=responder)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        return session, transport, clock, responder
+
+    def _push_fresh_tlm(self, session, transport, responder):
+        transport.push(proto.MsgType.TLM_STATE,
+                       responder.make_tlm_state().to_payload())
+        assert wait_until(
+            lambda: session._tlm_state_snapshot()[0] is not None)
+
+    def test_works_in_posture_mode(self, session_factory, server_config):
+        """既定の Posture モード(Experiment 外)でも quickcal が動作する。"""
+        session, transport, clock, responder = self._connected(
+            session_factory, server_config)
+        responder.roll_rad = 0.05
+        responder.pitch_rad = 0.01
+        self._push_fresh_tlm(session, transport, responder)
+        result = session.quickcal("attitude_zero")
+        assert result["ok"], result
+        sent = proto.CmdAttmountSet.from_payload(
+            transport.frames_of_type(
+                proto.MsgType.CMD_ATTMOUNT_SET)[0].payload)
+        assert sent.roll_rad == pytest.approx(0.05)
+        # 単機モードでは drone キーは無視される
+        result = session.quickcal("attitude_clear", drone="whatever")
+        assert result["ok"], result
+
+    def test_yaw_zero_in_posture_mode(self, session_factory, server_config):
+        session, transport, clock, responder = self._connected(
+            session_factory, server_config)
+        responder.auto_tlm_state = True
+        responder.yaw_est_rad = 0.3
+        responder.cal_data.yawzero_offset_rad = 0.1
+        self._push_fresh_tlm(session, transport, responder)
+        result = session.quickcal("yaw_zero")
+        assert result["ok"], result
+        sent = proto.CmdYawzeroSet.from_payload(
+            transport.frames_of_type(
+                proto.MsgType.CMD_YAWZERO_SET)[0].payload)
+        assert sent.offset_rad == pytest.approx(0.1 + 0.3)
+
+    def test_rejected_while_armed_or_flying(self, session_factory,
+                                            server_config):
+        """単機は phase が armed/flying の間 quickcal を拒否する。"""
+        session, transport, clock, responder = self._connected(
+            session_factory, server_config)
+        self._push_fresh_tlm(session, transport, responder)
+        assert session.start()   # posture モード: armed へ
+        result = session.quickcal("attitude_zero")
+        assert result["ok"] is False
+        assert "飛行中" in result["message"]
+        assert not transport.frames_of_type(proto.MsgType.CMD_ATTMOUNT_SET)
+
+    def test_unknown_action_rejected(self, session_factory, server_config):
+        session, transport, clock, responder = self._connected(
+            session_factory, server_config)
+        result = session.quickcal("bogus")
+        assert result["ok"] is False
 
 
 class TestYawZeroSequence:
@@ -363,6 +445,37 @@ class TestYawZeroSequence:
         # 拒否時はキャリブ系コマンドを一切送らない
         assert not transport.frames_of_type(proto.MsgType.CMD_YAWZERO_SET)
         assert not transport.frames_of_type(proto.MsgType.CMD_FF_MODE)
+
+    def test_attitude_zero_rejects_recording_sweep_and_motor(self, cal_session):
+        """attitude_zero / clear も計測・スイープ・モーター回転中は拒否する
+        (クイック較正カード共通の拒否条件。README §5.7 の契約)。"""
+        session, transport, clock, responder, tmp_path = cal_session
+        self.prime(session, transport, responder)
+        # 計測(ExpRecorder)実行中 → 拒否
+        session.experiment.recorder.logs_dir = tmp_path / "explogs"
+        assert session.experiment.recorder.start()["ok"]
+        result = session.calibration.attitude_zero()
+        assert not result["ok"]
+        assert "計測" in result["message"]
+        session.experiment.recorder.stop()
+        # スイープ実行中 → 拒否(クリアも同じガード)
+        with session.experiment.sweep.lock:
+            session.experiment.sweep.running = True
+        result = session.calibration.attitude_zero_clear()
+        assert not result["ok"]
+        assert "スイープ" in result["message"]
+        with session.experiment.sweep.lock:
+            session.experiment.sweep.running = False
+        # モーター回転中 → 拒否
+        with session.experiment.lock:
+            session.experiment.motor_running = True
+        result = session.calibration.attitude_zero()
+        assert not result["ok"]
+        assert "モーター" in result["message"]
+        with session.experiment.lock:
+            session.experiment.motor_running = False
+        # 拒否時は CMD_ATTMOUNT_SET を一切送らない
+        assert not transport.frames_of_type(proto.MsgType.CMD_ATTMOUNT_SET)
 
     def test_ff_off_path_skips_mode_commands(self, cal_session):
         session, transport, clock, responder, tmp_path = cal_session

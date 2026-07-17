@@ -1,10 +1,13 @@
-"""V2/V3 フライトログ CSV(50Hz・100列)の読み込みと派生量の計算。
+"""V2 フライトログ CSV(50Hz・v4 109列)の読み込みと派生量の計算。
 
 - 破損した末尾(電源断などで途切れた行)は旧 Drone_Log_Viewer と同様に
   切り捨てて読む。
 - 列の検証は「警告して続行」とする(pc_server と並行開発のため、列の過不足で
   即エラーにはしない。必須列 elapsed_time が無い場合のみエラー)。
 - 角度系の派生列(deg 変換・アンラップ・対真値誤差)をここで一括計算する。
+  v4 で CSV から廃止された roll_ref_deg / pitch_ref_deg / cmd_yaw_ref_deg は
+  「CSV に列があればそれを使用、無ければ *_rad から派生生成」とし、
+  旧ログ v1〜v3 との互換を保つ。
 """
 
 from __future__ import annotations
@@ -19,9 +22,10 @@ import pandas as pd
 
 from .constants import (
     LOG_RATE_HZ,
+    N_COLUMNS,
     TEXT_COLUMNS,
     TLM_FLAG_FLYING,
-    V2_COLUMNS,
+    V4_COLUMNS,
     YAW_SOURCES,
 )
 
@@ -193,6 +197,16 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         if rad_col in df.columns:
             derived[deg_col] = np.degrees(df[rad_col].to_numpy(dtype=float))
 
+    # 送信指令の deg 列(v4 で CSV から廃止。旧ログ v1〜v3 に列があれば
+    # そのまま使い、無ければ rad 列から派生生成する)
+    for rad_col, deg_col in (
+        ("roll_ref_rad", "roll_ref_deg"),
+        ("pitch_ref_rad", "pitch_ref_deg"),
+        ("cmd_yaw_ref_rad", "cmd_yaw_ref_deg"),
+    ):
+        if deg_col not in df.columns and rad_col in df.columns:
+            derived[deg_col] = np.degrees(df[rad_col].to_numpy(dtype=float))
+
     # ヨー4系統: deg 列とアンラップ列を作る
     yaw_deg: dict[str, np.ndarray] = {}
     for key, column, _label, _color, is_deg in YAW_SOURCES:
@@ -219,8 +233,11 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
             derived[f"yaw_err_{key}_deg"] = wrap_deg(yaw_deg[key] - ref)
 
     # ヨー指令追従誤差(cmd_yaw_ref と アクティブ推定ヨーの差、ヨー制御 ON 行のみ)
-    if "cmd_yaw_ref_deg" in df.columns and "ekf" in yaw_deg and "yaw_ctrl_on" in df.columns:
+    if "cmd_yaw_ref_deg" in df.columns:
         cmd = df["cmd_yaw_ref_deg"].to_numpy(dtype=float)
+    else:
+        cmd = derived.get("cmd_yaw_ref_deg")
+    if cmd is not None and "ekf" in yaw_deg and "yaw_ctrl_on" in df.columns:
         on = df["yaw_ctrl_on"].to_numpy(dtype=float)
         err = np.asarray(wrap_deg(yaw_deg["ekf"] - cmd), dtype=float)
         err[~(np.isfinite(on) & (on > 0))] = np.nan
@@ -243,12 +260,12 @@ def load_log(csv_path: str | Path) -> FlightLog:
     if "elapsed_time" not in df.columns:
         raise ValueError(f"必須列 elapsed_time がありません: {csv_path}")
 
-    # 列の検証(過不足は警告のみ。100列契約は docs/LOG_STRUCTURE.md v3 を参照)
-    missing = [c for c in V2_COLUMNS if c not in df.columns]
-    extra = [c for c in df.columns if c not in V2_COLUMNS]
+    # 列の検証(過不足は警告のみ。109列契約は docs/LOG_STRUCTURE.md v4 を参照)
+    missing = [c for c in V4_COLUMNS if c not in df.columns]
+    extra = [c for c in df.columns if c not in V4_COLUMNS]
     if missing:
         warnings.append(
-            f"契約(100列)に対して欠けている列が {len(missing)} 個あります: "
+            f"契約({N_COLUMNS}列)に対して欠けている列が {len(missing)} 個あります: "
             + ", ".join(missing[:8]) + ("…" if len(missing) > 8 else "")
         )
     if extra:

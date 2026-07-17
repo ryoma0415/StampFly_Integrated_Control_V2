@@ -1,8 +1,9 @@
 """静止画グラフ一式(PNG)の生成。
 
 旧 Drone_Log_Viewer(For_Research)の FlightLogFigureGenerator を
-V2 の 94 列構成で再構築したもの。列が存在しない/全欠損のグラフは
-自動でスキップする(Posture ログでは位置系グラフが出ない等)。
+V2 の 109 列構成(v4)で再構築したもの。列が存在しない/全欠損のグラフは
+自動でスキップする(Posture ログでは位置系グラフが出ない、旧ログでは
+TLM_CTRL 系グラフが出ない等)。
 """
 
 from __future__ import annotations
@@ -24,12 +25,19 @@ from .constants import (  # noqa: E402
     FIG_DPI,
     GRID_ALPHA,
     GRID_COLOR,
+    LOG_RATE_HZ,
     LOOP_DT_NOMINAL_US,
     LOW_VOLTAGE_THRESHOLD_V,
     TEXT_COLOR,
+    TLM_CTRL_FLAG_FLYING,
+    TLM_CTRL_FLAG_YAW_CTRL,
 )
 from .loader import FlightLog  # noqa: E402
 from .style import styled_legend, new_fig, save_fig  # noqa: E402
+
+# tlm_ctrl_flags による無効区間の網掛けスタイル
+INVALID_SPAN_COLOR = "#94a3b8"
+INVALID_SPAN_ALPHA = 0.15
 
 
 def _style_time_colorbar(fig, ax, norm, cmap, **kwargs):
@@ -173,7 +181,7 @@ def _fig_position_tracking(log: FlightLog, out_dir: Path) -> Path | None:
 
 
 def _fig_pid(log: FlightLog, out_dir: Path) -> Path | None:
-    """05: XY PID 成分。Position モードのみ。"""
+    """05: XY PID 成分。旧ログ v1〜v3 のみ(v4 で PC 側 XY PID 列は廃止)。"""
     if not (log.has("pid_x_p") or log.has("pid_y_p")):
         return None
     t = log.t
@@ -277,17 +285,22 @@ def _fig_latency(log: FlightLog, out_dir: Path) -> Path | None:
 
 
 def _fig_mocap_diag(log: FlightLog, out_dir: Path) -> Path | None:
-    """09: MoCap 診断(マーカー数・フレーム間隔・鮮度)。Position モードのみ。"""
-    if not (log.has("marker_count") or log.has("mocap_age_ms")):
+    """09: MoCap 診断(マーカー数・フレーム間隔・鮮度)。Position モードのみ。
+
+    マーカー数は rb_marker_count(リジッドボディ構成マーカー数)を優先し、
+    無ければ旧ログ v1〜v3 の marker_count(v4 で廃止)を使う。
+    """
+    marker_col = "rb_marker_count" if log.has("rb_marker_count") else "marker_count"
+    if not (log.has(marker_col) or log.has("mocap_age_ms")):
         return None
     t = log.t
     df = log.df
     fig, axes = new_fig(2, 1, figsize=(12.0, 8.0), sharex=True)
 
     ax = axes[0]
-    if log.has("marker_count"):
-        ax.fill_between(t, 0, df["marker_count"], color=COLORS["marker"], alpha=0.4)
-        ax.plot(t, df["marker_count"], color=COLORS["marker"], linewidth=0.8,
+    if log.has(marker_col):
+        ax.fill_between(t, 0, df[marker_col], color=COLORS["marker"], alpha=0.4)
+        ax.plot(t, df[marker_col], color=COLORS["marker"], linewidth=0.8,
                 label="有効マーカー数")
     ax.set_title("MoCap 診断", fontsize=14)
     ax.set_ylabel("マーカー数", fontsize=10)
@@ -433,6 +446,180 @@ def _fig_cmd_echo(log: FlightLog, out_dir: Path) -> Path | None:
     return save_fig(fig, out_dir, "17_cmd_echo.png")
 
 
+# ---------------------------------------------------------------------------
+# TLM_CTRL(v4)由来の図(18-20)
+# ---------------------------------------------------------------------------
+
+def _ctrl_invalid_mask(log: FlightLog,
+                       require_yaw_ctrl: bool = False) -> np.ndarray | None:
+    """tlm_ctrl_flags から無効区間(非飛行、必要ならヨー制御OFF)のマスクを返す。
+
+    PID リセット中(非飛行・ヨー制御OFF)は成分が 0 になるため、
+    flags で有効区間を判別する(§1 TLM_CTRL 仕様)。
+    tlm_ctrl_flags が無い(旧ログ)場合は None。
+    """
+    if not log.has("tlm_ctrl_flags"):
+        return None
+    flags = log.df["tlm_ctrl_flags"].to_numpy(dtype=float)
+    finite = np.isfinite(flags)
+    bits = np.zeros(len(flags), dtype=int)
+    bits[finite] = flags[finite].astype(int)
+    invalid = (bits & TLM_CTRL_FLAG_FLYING) == 0
+    if require_yaw_ctrl:
+        invalid |= (bits & TLM_CTRL_FLAG_YAW_CTRL) == 0
+    invalid |= ~finite
+    return invalid
+
+
+def _shade_invalid_spans(ax, t: np.ndarray, invalid: np.ndarray | None,
+                         label: str) -> None:
+    """無効区間(invalid=True の連続区間)を薄い網掛けで表示する。
+
+    区間の右端は次サンプル境界まで延長する(1行だけの区間が幅ゼロの
+    axvspan になって見えなくなるのを防ぐ)。
+    """
+    if invalid is None or not invalid.any():
+        return
+    edges = np.flatnonzero(
+        np.diff(np.concatenate(([0], invalid.astype(int), [0]))))
+    first = True
+    for start, end in zip(edges[0::2], edges[1::2]):
+        x1 = t[end] if end < len(t) else t[-1] + 1.0 / LOG_RATE_HZ
+        ax.axvspan(t[start], x1, color=INVALID_SPAN_COLOR,
+                   alpha=INVALID_SPAN_ALPHA, zorder=0,
+                   label=label if first else None)
+        first = False
+
+
+def _fig_pid_ang(log: FlightLog, out_dir: Path) -> Path | None:
+    """18: 角度ループ PID 成分 3軸(P+I+D=指令角速度)。TLM_CTRL(v4)のみ。
+
+    yaw の成分はクランプ前の値のため、合計(クランプ前)とクランプ後の
+    指令角速度(tlm_yaw_rate_ref_rad_s)の差でクランプ発動が分かる。
+    tlm_ctrl_flags による無効区間(非飛行・ヨー制御OFF)は網掛けで示す。
+    """
+    axes_spec = (
+        ("Roll", "tlm_pid_roll_ang", "tlm_roll_rate_ref_rad_s", False),
+        ("Pitch", "tlm_pid_pitch_ang", "tlm_pitch_rate_ref_rad_s", False),
+        ("Yaw", "tlm_pid_yaw_ang", "tlm_yaw_rate_ref_rad_s", True),
+    )
+    if not any(log.has(f"{prefix}_p") for _, prefix, _, _ in axes_spec):
+        return None
+    t = log.t
+    df = log.df
+    fig, axes = new_fig(3, 1, figsize=(12.0, 10.0), sharex=True)
+
+    for ax, (axis_label, prefix, ref_col, is_yaw) in zip(axes, axes_spec):
+        total: np.ndarray | None = None
+        for comp, label in (("p", "P"), ("i", "I"), ("d", "D")):
+            col = f"{prefix}_{comp}"
+            if not log.has(col):
+                continue
+            values = np.degrees(df[col].to_numpy(dtype=float))
+            total = values if total is None else total + values
+            ax.plot(t, values, color=COLORS[comp], linewidth=0.9, alpha=0.85,
+                    label=label)
+        if total is not None:
+            ax.plot(t, total, color=COLORS["pid_sum"], linewidth=1.1, alpha=0.9,
+                    label="合計(クランプ前)" if is_yaw else "合計(=指令角速度)")
+        if is_yaw and log.has(ref_col):
+            ax.plot(t, np.degrees(df[ref_col].to_numpy(dtype=float)),
+                    color="#666666", linewidth=1.0, linestyle="--", alpha=0.9,
+                    label="指令角速度(クランプ後)")
+        _shade_invalid_spans(
+            ax, t, _ctrl_invalid_mask(log, require_yaw_ctrl=is_yaw),
+            "無効区間(非飛行・ヨー制御OFF)" if is_yaw else "無効区間(非飛行)")
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_ylabel(f"{axis_label} [deg/s]", fontsize=10)
+        styled_legend(ax)
+
+    axes[0].set_title("角度ループ PID 成分(P+I+D=指令角速度)", fontsize=14)
+    axes[-1].set_xlabel("時間 [s]", fontsize=11)
+    return save_fig(fig, out_dir, "18_pid_ang_components.png")
+
+
+def _fig_pid_rate(log: FlightLog, out_dir: Path) -> Path | None:
+    """19: 角速度ループ PID 成分 3軸。TLM_CTRL(v4)のみ。
+
+    合計はそのループの出力(モーターミキサーへのトルク指令、正規化値)。
+    tlm_ctrl_flags による無効区間(非飛行)は網掛けで示す。
+    """
+    prefixes = (
+        ("Roll", "tlm_pid_roll_rate"),
+        ("Pitch", "tlm_pid_pitch_rate"),
+        ("Yaw", "tlm_pid_yaw_rate"),
+    )
+    if not any(log.has(f"{prefix}_p") for _, prefix in prefixes):
+        return None
+    t = log.t
+    df = log.df
+    invalid = _ctrl_invalid_mask(log)
+    fig, axes = new_fig(3, 1, figsize=(12.0, 10.0), sharex=True)
+
+    for ax, (axis_label, prefix) in zip(axes, prefixes):
+        total: np.ndarray | None = None
+        for comp, label in (("p", "P"), ("i", "I"), ("d", "D")):
+            col = f"{prefix}_{comp}"
+            if not log.has(col):
+                continue
+            values = df[col].to_numpy(dtype=float)
+            total = values if total is None else total + values
+            ax.plot(t, values, color=COLORS[comp], linewidth=0.9, alpha=0.85,
+                    label=label)
+        if total is not None:
+            ax.plot(t, total, color=COLORS["pid_sum"], linewidth=1.1, alpha=0.9,
+                    label="合計(ループ出力)")
+        _shade_invalid_spans(ax, t, invalid, "無効区間(非飛行)")
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_ylabel(f"{axis_label} 出力", fontsize=10)
+        styled_legend(ax)
+
+    axes[0].set_title("角速度ループ PID 成分", fontsize=14)
+    axes[-1].set_xlabel("時間 [s]", fontsize=11)
+    return save_fig(fig, out_dir, "19_pid_rate_components.png")
+
+
+def _fig_rate_tracking(log: FlightLog, out_dir: Path) -> Path | None:
+    """20: 指令角速度 vs 実測角速度の追従。TLM_CTRL(v4)のみ。deg/s 表示。
+
+    tlm_*_rate_ref_rad_s(角度ループ出力)と tlm_p/q/r_rad_s(ジャイロ実測)
+    を重畳し、角速度ループの追従を確認する。無効区間は網掛けで示す。
+    """
+    pairs = (
+        ("Roll", "tlm_roll_rate_ref_rad_s", "tlm_p_rad_s",
+         COLORS["meas_roll"], False),
+        ("Pitch", "tlm_pitch_rate_ref_rad_s", "tlm_q_rad_s",
+         COLORS["meas_pitch"], False),
+        ("Yaw", "tlm_yaw_rate_ref_rad_s", "tlm_r_rad_s",
+         COLORS["meas_yaw"], True),
+    )
+    if not any(log.has(ref_col) for _, ref_col, _, _, _ in pairs):
+        return None
+    t = log.t
+    df = log.df
+    fig, axes = new_fig(3, 1, figsize=(12.0, 10.0), sharex=True)
+
+    for ax, (axis_label, ref_col, meas_col, meas_color, is_yaw) in zip(axes, pairs):
+        if log.has(ref_col):
+            ax.plot(t, np.degrees(df[ref_col].to_numpy(dtype=float)),
+                    color="#666666", linewidth=1.0, alpha=0.85,
+                    label=f"{axis_label} 指令角速度")
+        if log.has(meas_col):
+            ax.plot(t, np.degrees(df[meas_col].to_numpy(dtype=float)),
+                    color=meas_color, linewidth=0.9, alpha=0.9,
+                    label=f"{axis_label} 実測角速度(ジャイロ)")
+        _shade_invalid_spans(
+            ax, t, _ctrl_invalid_mask(log, require_yaw_ctrl=is_yaw),
+            "無効区間(非飛行・ヨー制御OFF)" if is_yaw else "無効区間(非飛行)")
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_ylabel(f"{axis_label} [deg/s]", fontsize=10)
+        styled_legend(ax)
+
+    axes[0].set_title("角速度追従(指令 vs 実測)", fontsize=14)
+    axes[-1].set_xlabel("時間 [s]", fontsize=11)
+    return save_fig(fig, out_dir, "20_rate_tracking.png")
+
+
 def generate_static_figures(log: FlightLog, out_dir: str | Path) -> list[Path]:
     """静止画グラフ一式を out_dir に生成し、生成できたパスの一覧を返す。"""
     out_dir = Path(out_dir)
@@ -450,6 +637,9 @@ def generate_static_figures(log: FlightLog, out_dir: str | Path) -> list[Path]:
         _fig_xyz_3d,
         _fig_xy_time,
         _fig_cmd_echo,
+        _fig_pid_ang,
+        _fig_pid_rate,
+        _fig_rate_tracking,
     )
     saved: list[Path] = []
     for gen in generators:

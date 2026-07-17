@@ -144,8 +144,10 @@
 
       <canvas id="xyCanvas" width="360" height="360"></canvas>
 
+      <!-- 機上XY制御: roll/pitch 指令は機体側 XY PID が計算するため、
+           TLM_STATE の roll_ref/pitch_ref エコー(機体計算指令)を表示する -->
       <div class="cmd-block">
-        <span class="mlabel">指令角</span>
+        <span class="mlabel">機体計算指令</span>
         <span class="mono">Roll <span id="cmdRoll">+0.0&deg;</span></span>
         <span class="mono">Pitch <span id="cmdPitch">+0.0&deg;</span></span>
       </div>
@@ -361,17 +363,6 @@
         </div>
 
         <div class="exp-card">
-          <h3>クイック較正</h3>
-          <div class="preset-row wrap">
-            <button class="btn btn-small" data-quickcal-action="attitude_zero">Attitude 0</button>
-            <button class="btn btn-small" data-quickcal-action="attitude_clear">Attitude Clear</button>
-            <button class="btn btn-small" data-quickcal-action="yaw_zero" title="FF を一時停止してヨーゼロを設定し、FFモード復元+アンカー再取得まで自動実行します">Yaw 0</button>
-            <button class="btn btn-small" data-quickcal-action="yaw_clear" title="FF を一時停止してヨーゼロを解除し、FFモード復元+アンカー再取得まで自動実行します">Yaw Clear</button>
-          </div>
-          <div class="exp-msg" id="quickcalMsg">現在姿勢/ヨーをゼロ基準として機体に設定します</div>
-        </div>
-
-        <div class="exp-card">
           <h3>地磁気プロファイル</h3>
           <div class="ff-quick-row">
             <select id="geomagSelect"></select>
@@ -509,6 +500,22 @@
         <input type="checkbox" id="logToggle">ログ保存
       </label>
       <span class="mono logfile" id="logFile">-</span>
+    </div>
+
+    <!-- クイック較正(全モード共通。地上でのみ実行可) -->
+    <div class="mon-group" id="quickcalGroup">
+      <h3>クイック較正</h3>
+      <div class="ff-quick-row hidden" id="quickcalDroneRow">
+        <span class="mlabel">対象機体</span>
+        <select id="quickcalDrone" title="複数機モードの対象機体(選択適用済みの機体から選ぶ)"></select>
+      </div>
+      <div class="preset-row wrap">
+        <button class="btn btn-small" data-quickcal-action="attitude_zero">Attitude 0</button>
+        <button class="btn btn-small" data-quickcal-action="attitude_clear">Attitude Clear</button>
+        <button class="btn btn-small" data-quickcal-action="yaw_zero" title="FF を一時停止してヨーゼロを設定し、FFモード復元+アンカー再取得まで自動実行します">Yaw 0</button>
+        <button class="btn btn-small" data-quickcal-action="yaw_clear" title="FF を一時停止してヨーゼロを解除し、FFモード復元+アンカー再取得まで自動実行します">Yaw Clear</button>
+      </div>
+      <div class="exp-msg" id="quickcalMsg">現在姿勢/ヨーをゼロ基準として機体に設定します(全モード・地上でのみ)</div>
     </div>
 
     <div class="mon-group console-group">

@@ -16,10 +16,10 @@
 逃がし、スレッド→async の橋渡しは queue.Queue を 20Hz でポーリングして行う
 (コーディング規約: ブロッキング I/O を async ループに持ち込まない)。
 
-起動: cd pc_server && python3 -m uvicorn app:app --host 127.0.0.1 --port 8000
-cd /Users/ryoma_nishimura/Code-Projects/StampFly-Project-Develop/Developments/StampFly_MoCap_System_v2/StampFly_Integrated_Control_V2/pc_server
-source .venv/bin/activate
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
+起動(リポジトリ直下から):
+  cd pc_server
+  source .venv/bin/activate
+  python -m uvicorn app:app --host 127.0.0.1 --port 8000
 """
 
 from __future__ import annotations
@@ -270,18 +270,16 @@ async def api_accel6(body: dict) -> dict:
 
 @app.post("/api/quickcal")
 async def api_quickcal(body: dict) -> dict:
-    """Attitude 0 / Yaw 0 / Yaw Clear(yaw側コマンド行の移植)。"""
-    action = body.get("action")
-    handlers = {
-        "attitude_zero": session.calibration.attitude_zero,
-        "attitude_clear": session.calibration.attitude_zero_clear,
-        "yaw_zero": session.calibration.yaw_zero,
-        "yaw_clear": session.calibration.yaw_zero_clear,
-    }
-    handler = handlers.get(action)
-    if handler is None:
-        return _UNKNOWN_ACTION
-    return await asyncio.to_thread(handler)
+    """Attitude 0 / Yaw 0 / Yaw Clear(全モード対応)。
+
+    任意キー "drone": <機体名> で複数機モードの対象機体を指定する
+    (ffprofile の "drone" 方式に倣う。Multi モード中は必須、単機では無視)。
+    モード/ノード解決と飛行中ガードは session.quickcal が行う。
+    """
+    drone = body.get("drone")
+    return await asyncio.to_thread(
+        session.quickcal, str(body.get("action", "")),
+        None if drone is None else str(drone))
 
 
 @app.get("/api/geomag")

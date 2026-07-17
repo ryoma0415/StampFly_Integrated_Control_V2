@@ -20,7 +20,7 @@ namespace relay_config {
 // --- UART(PC⇔リレー。データリンク専用 — 生テキスト出力は全面禁止) ---
 constexpr unsigned long UART_BAUD = RELAY_UART_BAUD;  // PROTOCOL.md: 既定 460800 8N1
 constexpr size_t UART_DRIVER_RX_BUFFER = 1024;     // ドライバ受信バッファ(ループ遅延への余裕)
-constexpr size_t UART_TX_QUEUE_LEN = 128;          // TXキュー深さ(下り最大≈105frame/s(4機) → 約1.2秒分)
+constexpr size_t UART_TX_QUEUE_LEN = 128;          // TXキュー深さ(下り最大≈205frame/s(4機、TLM_STATE+TLM_CTRL) → 約0.6秒分)
 constexpr uint32_t UART_WRITER_TASK_STACK = 4096;  // バイト単位(ESP-IDFのxTaskCreate準拠)
 constexpr uint32_t UART_WRITER_TASK_PRIORITY = 2;  // loopTask(=1) より高くしてTX滞留を防ぐ
 constexpr int UART_WRITER_TASK_CORE = 1;           // APP_CPU(WiFiタスクは PRO_CPU=0)

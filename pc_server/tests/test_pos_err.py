@@ -1,9 +1,12 @@
-"""機上XY制御モード(CMD_POS_ERR / xy_command_mode="onboard")のテスト。
+"""機上XY制御(CMD_POS_ERR)のテスト。
 
-- _emit_setpoint の分岐: Position モード+onboard で CMD_POS_ERR を送る
+Position モードの XY 指令は CMD_POS_ERR に一本化されている(v2.2 で
+旧 PC 側 XY PID 経路を削除。CMD_SETPOINT は Posture モード専用)。
+
+- _emit_setpoint の分岐: Position モードは常に CMD_POS_ERR を送る
 - フラグ規約: bit2(XY有効)= 閉ループ有効 かつ データ有効 かつ 非途絶
 - 誤差クランプ(pos_err_clamp_m)
-- Posture モード / xy_command_mode="pc"(既定)では従来どおり CMD_SETPOINT
+- Posture モードでは従来どおり CMD_SETPOINT(バイアス加算つき)
 - MoCap 制御座標系ヨー(heading_rad)の算出
 """
 
@@ -14,7 +17,6 @@ from math import atan2, cos, pi, sin
 import pytest
 import stampfly_protocol as proto
 
-from conftest import TEST_AIRFRAMES
 from core.mocap import CoordinateTransformer, quaternion_rotate_x_axis
 
 from fakes import wait_until
@@ -52,10 +54,6 @@ def _connect_quiet(session, transport):
 
 
 class TestEmitPosErr:
-    @pytest.fixture(autouse=True)
-    def _onboard(self, control_config):
-        control_config["control"]["xy_command_mode"] = "onboard"
-
     def test_position_meta_emits_cmd_pos_err(self, session_factory):
         session, transport, _clock = session_factory()
         _connect_quiet(session, transport)
@@ -163,13 +161,14 @@ class TestEmitPosErr:
         assert wait_until(_streamed)
 
 
-class TestPcModeDefault:
-    def test_default_pc_mode_emits_cmd_setpoint_with_bias(
-            self, session_factory):
+class TestPostureBias:
+    def test_posture_emits_cmd_setpoint_with_bias(self, session_factory):
+        """Posture の CMD_SETPOINT にはバイアスが加算される(従来どおり)。"""
         session, transport, _clock = session_factory()
         _connect_quiet(session, transport)
 
-        session._emit_setpoint(0.01, 0.02, 0.5, _position_meta())
+        session._emit_setpoint(0.01, 0.02, 0.5, {
+            "mode": "posture", "yaw_ref_rad": 0.0, "yaw_ctrl_on": False})
 
         assert not _sent_pos_errs(transport)
         sps = [proto.CmdSetpoint.from_payload(f.payload)
@@ -179,12 +178,6 @@ class TestPcModeDefault:
         # バイアス(TEST_AIRFRAMES[0]: roll 2.0deg / pitch -1.5deg)が加算される
         assert sps[0].roll_ref == pytest.approx(0.01 + 2.0 * pi / 180.0)
         assert sps[0].pitch_ref == pytest.approx(0.02 - 1.5 * pi / 180.0)
-
-    def test_invalid_mode_falls_back_to_pc(self, session_factory,
-                                           control_config):
-        control_config["control"]["xy_command_mode"] = "bogus"
-        session, transport, _clock = session_factory()
-        assert session._xy_command_mode == "pc"
 
 
 class TestMocapHeading:

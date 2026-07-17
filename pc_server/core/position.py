@@ -1,26 +1,28 @@
-"""Position モード: mocap → フィルタ → XY PID → セットポイント → 50Hz 送信。
+"""Position モード: mocap → フィルタ → 位置誤差 → CMD_POS_ERR 50Hz 送信。
 
-データフロー(legacy hovering_controller の構造を踏襲):
+データフロー(機上XY制御。XY PID は機体側 flight_control が実行する):
 - NatNet コールバック(on_mocap_pose, NatNetスレッド)で PositionFilter →
-  有効性判定 → XY PID を更新し、最新指令(roll/pitch)をキャッシュする。
-- 50Hz 送信スレッドはキャッシュ指令を SetpointShaper(クランプ+スルーレート
-  制限)に通して emit する。目標位置は UI から随時更新。
+  有効性判定 → 最新の位置誤差(目標 − フィルタ済み位置)をキャッシュする。
+- 50Hz 送信スレッドは誤差と整形済み alt/yaw を meta に載せて emit する
+  (session 層が CMD_POS_ERR に組み立てて送信・ログする)。roll/pitch の
+  角度指令は機体側 XY PID が計算するため、この層では生成・整形しない。
 - v2 軌道モード: hover(固定目標)/ circle(円軌道)。円軌道は 50Hz 送信
-  ループ内で目標 (x, y) を時間更新し既存 XY PID に渡す(旧 Previous_Version の
-  circling_controller.py の軌道生成を参考。ゲイン・符号は流用しない)。
-  開始時は現在位置から円周最近傍点に位相を合わせ、既存のフィルタ+PID+
-  シェイパーで滑らかに合流する。
+  ループ内で目標 (x, y) を時間更新する(旧 Previous_Version の
+  circling_controller.py の軌道生成を参考)。開始時は現在位置から円周
+  最近傍点に位相を合わせ、滑らかに合流する。
 - v2 ヨー指令: UI のヨー角スライダ(±180°)+「進行方向を向く」オプション
   (円軌道中かつヨー角制御 ON のとき yaw_ref を接線方向に追従)。
-- MoCap の yaw_rad はログ列 mocap_yaw_deg として meta に載せる(制御には未使用)。
+- MoCap の yaw_rad はログ列 mocap_yaw_deg として meta に載せ、制御座標系
+  ヨー(heading_rad)は CMD_POS_ERR の mocap_yaw 欄(機上ヨー回転補償)に使う。
 
 フェイルセーフ(PROTOCOL.md):
-- MoCap 途絶 > mocap_dropout_level_s(300ms)→ roll/pitch を水平(0)に固定し
-  て送信を継続(alt_ref は維持)。>2s の CMD_STOP は session 層の監視が行う。
+- MoCap 途絶 > mocap_dropout_level_s(300ms)→ data_valid を落として送信を
+  継続(CMD_POS_ERR flags bit2=0 → 機体側が水平指令+PID減衰。alt_ref は維持)。
+  >2s の CMD_STOP は session 層の監視が行う。
 - データ無効の持続(受信はあるが data_valid=0 が続く: トラッキング喪失・
-  外れ値・低信頼度)→ roll/pitch は水平のまま(on_mocap_pose が強制)。
-  警告・自動 CMD_STOP は session 層の監視(data_invalid_warn_s /
-  data_invalid_stop_s)が行う。基準は data_invalid_age_s。
+  外れ値・低信頼度)→ 同じく bit2=0。警告・自動 CMD_STOP は session 層の
+  監視(data_invalid_warn_s / data_invalid_stop_s)が行う。
+  基準は data_invalid_age_s。
 
 単位は core 内部規約(rad / m)。座標は制御座標系(mocap.py で変換済み)。
 """
@@ -34,13 +36,10 @@ from typing import Callable, Optional
 
 from .filter import PositionFilter
 from .mocap import DEG_TO_RAD, RAD_TO_DEG
-from .pid import XYPIDController
 from .posture import (
     SENDER_JOIN_TIMEOUT_S, TWO_PI, SetpointShaper, run_paced_loop, wrap_pi,
 )
 
-# 異常解除に要する信頼度(legacy hovering_controller と同値)
-ANOMALY_CLEAR_CONFIDENCE = 0.5
 MS_PER_S = 1000.0
 
 # 軌道モード(ログ列 traj_mode の値。LOG_STRUCTURE v2 契約)
@@ -49,10 +48,11 @@ TRAJ_MODE_CIRCLE = 1
 
 
 class PositionController:
-    """OptiTrack 位置フィードバックで XY を閉ループ制御するコントローラ。
+    """OptiTrack 位置フィードバックの誤差計算+軌道+50Hz 送信コントローラ。
 
     emit(roll_rad, pitch_rad, alt_m, meta) は session 層が供給し、
-    バイアス加算・CMD_SETPOINT 送信・CSV ログを担う。
+    CMD_POS_ERR の組み立て・送信・CSV ログを担う(XY PID は機体側)。
+    roll/pitch 引数は互換のため残るが常に 0 を渡す。
     """
 
     MODE_NAME = "position"
@@ -71,7 +71,6 @@ class PositionController:
         self._clock = clock
 
         self.position_filter = PositionFilter.from_config(control_config["filter"])
-        self.pid = XYPIDController.from_config(control_config["pid"])
         self._confidence_zero_threshold: float = (
             control_config["control"]["confidence_zero_threshold"])
         self._frame_hold_s: float = control_config["control"]["frame_hold_ms"] / MS_PER_S
@@ -84,11 +83,9 @@ class PositionController:
         self._traj_period_max: float = traj_cfg["period_max_s"]
         self._traj_center_abs_max: float = traj_cfg["center_abs_max_m"]
         self._lock = threading.Lock()
-        # pid / position_filter は NatNet スレッド・50Hz 送信スレッド・
+        # position_filter は NatNet スレッド・50Hz 送信スレッド・
         # UI(executor)/supervisor スレッドから触られる共有状態のため、
         # 専用ロックで保護する(規約: スレッド共有状態は lock で保護)。
-        # ロック順序は self._lock → self._pid_lock の一方向のみ(逆順禁止)。
-        self._pid_lock = threading.Lock()
         self._filter_lock = threading.Lock()
         self._target = (target_default["x"], target_default["y"], target_default["z"])
 
@@ -97,7 +94,6 @@ class PositionController:
         self._last_pose_t: Optional[float] = None
         self._last_frame_dt: Optional[float] = None
         self._last_filter_result: Optional[dict] = None
-        self._last_cmd = (0.0, 0.0)                    # PID 出力 (roll, pitch) [rad]
         self._last_errors = (0.0, 0.0)
         self._last_data_valid = False
         # データ無効が連続し始めた時刻(持続的データ無効の監視基準。
@@ -126,7 +122,8 @@ class PositionController:
 
         # XY 閉ループの有効フラグ(legacy の control_active に相当)。
         # Start 受理後のみ session 層が True にする。False の間もフィルタは
-        # 回し続けるが、PID は更新せず指令は水平(0)を維持する。
+        # 回し続けるが、CMD_POS_ERR の bit2(XY_ERR_VALID)は立たない
+        # (機体側は水平指令+PID減衰)。
         self._control_active = False
 
         self._thread: Optional[threading.Thread] = None
@@ -277,14 +274,9 @@ class PositionController:
         }
 
     def set_control_active(self, active: bool) -> None:
-        """XY 閉ループの有効/無効を切り替える(有効化時に PID をリセット)。"""
+        """XY 閉ループの有効/無効を切り替える(CMD_POS_ERR bit2 に反映)。"""
         with self._lock:
-            if active and not self._control_active:
-                with self._pid_lock:
-                    self.pid.reset()
             self._control_active = active
-            if not active:
-                self._last_cmd = (0.0, 0.0)
 
     @property
     def control_active(self) -> bool:
@@ -296,7 +288,7 @@ class PositionController:
     # ------------------------------------------------------------------
 
     def on_mocap_pose(self, pose: dict) -> None:
-        """新規 mocap フレームでフィルタと PID を更新し、指令をキャッシュする。"""
+        """新規 mocap フレームでフィルタを更新し、位置誤差をキャッシュする。"""
         t = pose["t_mono"]
         position = (pose["x"], pose["y"], pose["z"])
 
@@ -307,7 +299,6 @@ class PositionController:
             self._last_pose_t = t
             self._last_frame_dt = frame_dt
             target_x, target_y, _ = self._target
-            control_active = self._control_active
 
         # フィルタは NatNet スレッドと reset_control(UI/executor)が共有する
         with self._filter_lock:
@@ -323,7 +314,6 @@ class PositionController:
             )
 
         confidence = filter_result["confidence"]
-        consecutive_outliers = filter_result["consecutive_outliers"]
         is_data_valid = (
             confidence >= self._confidence_zero_threshold
             and not filter_result["is_outlier"]
@@ -339,33 +329,12 @@ class PositionController:
         error_x = target_x - fx
         error_y = target_y - fy
 
-        if control_active:
-            # set_anomaly_state → calculate を1ロック区間で行い、50Hz 送信
-            # スレッド(step の途絶処理)との交互実行で異常フラグと I 項が
-            # 食い違わないようにする
-            with self._pid_lock:
-                if not is_data_valid:
-                    self.pid.set_anomaly_state(True)
-                elif (consecutive_outliers == 0
-                        and confidence > ANOMALY_CLEAR_CONFIDENCE):
-                    self.pid.set_anomaly_state(False)
-                roll_cmd, pitch_cmd = self.pid.calculate(
-                    error_x, error_y, t, is_data_valid)
-            if not is_data_valid:
-                roll_cmd = 0.0
-                pitch_cmd = 0.0
-        else:
-            # 閉ループ無効時はフィルタのみ更新し、指令は水平を維持
-            roll_cmd = 0.0
-            pitch_cmd = 0.0
-
         with self._lock:
             if generation != self._filter_generation:
                 # 処理中に reset_filter/reset_control が走った。旧世代
                 # フィルタの結果でリセット後のキャッシュを汚さない
                 return
             self._last_filter_result = filter_result
-            self._last_cmd = (roll_cmd, pitch_cmd)
             self._last_errors = (error_x, error_y)
             self._last_data_valid = is_data_valid
             if is_data_valid:
@@ -411,19 +380,16 @@ class PositionController:
         return self._thread is not None and self._thread.is_alive()
 
     def reset_control(self) -> None:
-        """フィルタ・PID・整形状態をリセットする(セッション開始時)。"""
+        """フィルタ・整形状態をリセットする(セッション開始時)。"""
         with self._filter_lock:
             self.position_filter.reset()
             self._filter_generation += 1
-        with self._pid_lock:
-            self.pid.reset()
         self._shaper.reset()
         with self._lock:
             self._last_pose = None
             self._last_pose_t = None
             self._last_frame_dt = None
             self._last_filter_result = None
-            self._last_cmd = (0.0, 0.0)
             self._last_errors = (0.0, 0.0)
             self._last_data_valid = False
             self._invalid_since = None
@@ -447,7 +413,6 @@ class PositionController:
             self._filter_generation += 1
         with self._lock:
             self._last_filter_result = None
-            self._last_cmd = (0.0, 0.0)
             self._last_errors = (0.0, 0.0)
             self._last_data_valid = False
             self._invalid_since = None
@@ -457,7 +422,7 @@ class PositionController:
 
     def step(self, now: float) -> None:
         """1周期ぶんの軌道更新+途絶判定+整形+送信(テストから直接呼べる)。"""
-        # --- 軌道更新(circle 中は目標 (x, y, z) を時間更新して PID に渡す) ---
+        # --- 軌道更新(circle 中は目標 (x, y, z) を時間更新する) ---
         traj_phase: Optional[float] = None
         yaw_tangent: Optional[float] = None
         with self._lock:
@@ -495,7 +460,6 @@ class PositionController:
                 if traj["face_tangent"]:
                     # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°
                     yaw_tangent = wrap_pi(phase + sign * (pi / 2.0))
-            roll_cmd, pitch_cmd = self._last_cmd
             error_x, error_y = self._last_errors
             data_valid = self._last_data_valid
             filter_result = self._last_filter_result
@@ -507,29 +471,25 @@ class PositionController:
             yaw_ctrl_on = self._yaw_ctrl_on
 
         if dropped:
-            # MoCap 途絶 >300ms: roll/pitch を水平へ固定(alt_ref は維持)
-            roll_cmd = 0.0
-            pitch_cmd = 0.0
+            # MoCap 途絶 >300ms: data_valid を落とす(CMD_POS_ERR bit2=0 →
+            # 機体側が水平指令+PID減衰。alt_ref は維持)
             data_valid = False
-            if control_active:
-                with self._pid_lock:
-                    self.pid.set_anomaly_state(True)
 
-        roll, pitch, alt = self._shaper.shape(roll_cmd, pitch_cmd, target[2], now)
+        # roll/pitch の角度指令は機体側 XY PID が計算するため整形しない
+        # (定数 0 を通し、alt のクランプ+スルーレート制限のみ適用する)
+        _, _, alt = self._shaper.shape(0.0, 0.0, target[2], now)
         # ヨー: 「進行方向を向く」ON かつヨー角制御 ON のときのみ接線追従、
         # それ以外は UI スライダ目標。MoCap 途絶中は軌道位相が凍結される
         # ため接線ヨー目標も直近値で止まり、整形済みヨーを保持したまま
-        # 送り続ける(CMD_SETPOINT 自体の途絶時は機体側が推定ヨーを
+        # 送り続ける(CMD_POS_ERR 自体の途絶時は機体側が推定ヨーを
         # ラッチする契約)。
         if yaw_tangent is not None and yaw_ctrl_on:
             yaw_target = yaw_tangent
         yaw = self._shaper.shape_yaw(yaw_target, now)
         with self._lock:
-            self._last_output = (roll, pitch, alt)
+            self._last_output = (0.0, 0.0, alt)
             self._last_yaw_output = yaw
 
-        with self._pid_lock:
-            pid_components = self.pid.get_all_components()
         meta = {
             "mode": self.MODE_NAME,
             "data_valid": data_valid,
@@ -541,7 +501,6 @@ class PositionController:
             "target_x": target[0],
             "target_y": target[1],
             "target_z": target[2],
-            "pid_components": pid_components,
             "frame_dt_ms": None if frame_dt is None else frame_dt * MS_PER_S,
             "yaw_ref_rad": yaw,
             "yaw_ctrl_on": yaw_ctrl_on,
@@ -570,7 +529,7 @@ class PositionController:
             meta["confidence"] = filter_result["confidence"]
             meta["consecutive_outliers"] = filter_result["consecutive_outliers"]
             meta["filter_threshold"] = filter_result["threshold"]
-        self._emit(roll, pitch, alt, meta)
+        self._emit(0.0, 0.0, alt, meta)
 
     # ------------------------------------------------------------------
     # session 層向けスナップショット

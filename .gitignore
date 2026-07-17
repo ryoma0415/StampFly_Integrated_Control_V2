@@ -30,6 +30,8 @@ pc_server/data/yaw_eval_results/*
 !pc_server/data/yaw_eval_results/.gitkeep
 flight_log_viewer/output/*
 !flight_log_viewer/output/.gitkeep
+data_analysis/graphs/*
+!data_analysis/graphs/.gitkeep
 
 # エディタ
 .vscode/

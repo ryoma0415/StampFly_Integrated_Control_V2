@@ -543,7 +543,8 @@ class CalibrationManager:
                  mag3d_path: Path = cfg.MAG3D_CALIBRATION_PATH,
                  geomag_path: Path = cfg.GEOMAG_PROFILES_PATH,
                  tlm_state_provider: Optional[Callable[
-                     [], tuple[Any, Optional[float]]]] = None) -> None:
+                     [Optional[int]], tuple[Any, Optional[float]]]] = None
+                 ) -> None:
         exp_cfg = server_config["experiment"]
         self._cal_get_timeout_s: float = exp_cfg["cal_get_timeout_s"]
         self._accel6_capture_s: float = exp_cfg["accel6_capture_s"]
@@ -553,7 +554,9 @@ class CalibrationManager:
         self.hub = hub
         self.notify = notify
         # 最新 TLM_STATE のスナップショット (tlm, age_s) を返すプロバイダ
-        # (session 層が配線する。yaw_zero の逆算が yaw_est_rad を使う)
+        # (session 層が配線する。yaw_zero の逆算が yaw_est_rad を、
+        # attitude_zero が roll/pitch を使う)。node_id 指定で複数機モードの
+        # ノード別スナップショットを返す(session._tlm_state_snapshot)。
         self._tlm_state_provider = tlm_state_provider
         self.calprofile_dir = Path(calprofile_dir)
         self.mag3d_path = Path(mag3d_path)
@@ -615,9 +618,14 @@ class CalibrationManager:
             time.sleep(CAL_DATA_POLL_S)
         return None
 
-    def _send_ack(self, msg_type: int, payload: bytes) -> tuple[bool, str]:
+    def _send_ack(self, msg_type: int, payload: bytes,
+                  node_id: Optional[int] = None) -> tuple[bool, str]:
+        """コマンド送信+TLM_ACK 待ち。node_id 指定時はノード宛(MUX_UP 経由)。"""
         try:
-            ack = self.link.send_with_ack(msg_type, payload)
+            if node_id is None:
+                ack = self.link.send_with_ack(msg_type, payload)
+            else:
+                ack = self.link.send_with_ack_to(node_id, msg_type, payload)
         except SerialLinkError as exc:
             return False, f"送信失敗: {exc}"
         return ack_ok(ack), ack_detail(ack)
@@ -769,28 +777,38 @@ class CalibrationManager:
 
     # ---- Attitude 0 / Yaw 0 / Yaw Clear ----
 
-    def attitude_zero(self) -> dict:
-        """現在姿勢(TLM_EXP の Madgwick roll/pitch)をマウントオフセットに設定。"""
-        sample, age = self.hub.latest_sample()
-        if sample is None or age is None or age > self.hub.exp_fresh_s:
+    def attitude_zero(self, node_id: Optional[int] = None) -> dict:
+        """現在姿勢(TLM_STATE の Madgwick roll/pitch)をマウントオフセットに設定。
+
+        姿勢ソースは TLM_STATE(TLM_EXP と同じ Madgwick AHRS 由来)のため、
+        全制御モードで動作する。node_id 指定時は複数機モードのノード宛。
+        """
+        reason = self._ground_activity_guard("マウントオフセットを設定")
+        if reason is not None:
+            return {"ok": False, "message": reason}
+        tlm = self._fresh_tlm_state(node_id)
+        if tlm is None:
             return {"ok": False,
-                    "message": "実験テレメトリ(TLM_EXP)が新鮮ではありません"}
+                    "message": "テレメトリ(TLM_STATE)が新鮮ではありません"}
         payload = proto.CmdAttmountSet(valid=1,
-                                       roll_rad=sample["roll_rad"],
-                                       pitch_rad=sample["pitch_rad"])
+                                       roll_rad=tlm.roll,
+                                       pitch_rad=tlm.pitch)
         ok, detail = self._send_ack(proto.MsgType.CMD_ATTMOUNT_SET,
-                                    payload.to_payload())
+                                    payload.to_payload(), node_id=node_id)
         return {"ok": ok, "message": ("マウントオフセットを設定しました" if ok
                                       else f"CMD_ATTMOUNT_SET 失敗: {detail}")}
 
-    def attitude_zero_clear(self) -> dict:
+    def attitude_zero_clear(self, node_id: Optional[int] = None) -> dict:
+        reason = self._ground_activity_guard("マウントオフセットをクリア")
+        if reason is not None:
+            return {"ok": False, "message": reason}
         payload = proto.CmdAttmountSet(valid=0, roll_rad=0.0, pitch_rad=0.0)
         ok, detail = self._send_ack(proto.MsgType.CMD_ATTMOUNT_SET,
-                                    payload.to_payload())
+                                    payload.to_payload(), node_id=node_id)
         return {"ok": ok, "message": ("マウントオフセットをクリアしました" if ok
                                       else f"CMD_ATTMOUNT_SET 失敗: {detail}")}
 
-    def yaw_zero(self) -> dict:
+    def yaw_zero(self, node_id: Optional[int] = None) -> dict:
         """現在の推定ヨーが 0 になるヨーゼロオフセットを逆算して設定する
         (ワンクリック自動シーケンス)。
 
@@ -808,41 +826,68 @@ class CalibrationManager:
         サーバ側で FF を一時 off(est_mode 維持)→ TLM_STATE で反映確認 →
         リファレンスCF の yaw_est から逆算・設定 → FF 復元 → アンカー再取得
         (EKF を新基準に整列)まで自動オーケストレーションする。
-        """
-        return self._yaw_zero_sequence(clear=False)
 
-    def yaw_zero_clear(self) -> dict:
+        node_id 指定時は複数機モードのノード宛に同じ順序で実行する。
+        """
+        return self._yaw_zero_sequence(clear=False, node_id=node_id)
+
+    def yaw_zero_clear(self, node_id: Optional[int] = None) -> dict:
         """ヨーゼロをクリアする(yaw_zero と同じ自動シーケンスのクリア版)。"""
-        return self._yaw_zero_sequence(clear=True)
+        return self._yaw_zero_sequence(clear=True, node_id=node_id)
 
     # ---- ヨーゼロ自動シーケンスの内部ヘルパ ----
 
-    def _fresh_tlm_state(self) -> Optional[proto.TlmState]:
+    def _fresh_tlm_state(self, node_id: Optional[int] = None
+                         ) -> Optional[proto.TlmState]:
         """新鮮な TLM_STATE スナップショット(なければ None)。"""
         if self._tlm_state_provider is None:
             return None
-        tlm, age = self._tlm_state_provider()
+        tlm, age = self._tlm_state_provider(node_id)
         if tlm is None or age is None or age > self._telemetry_fresh_s:
             return None
         return tlm
 
     def _wait_tlm_state(self, predicate: Callable[[proto.TlmState], bool],
-                        timeout_s: float) -> Optional[proto.TlmState]:
+                        timeout_s: float,
+                        node_id: Optional[int] = None
+                        ) -> Optional[proto.TlmState]:
         """新鮮な TLM_STATE が条件を満たすまでポーリングする。"""
         deadline = time.monotonic() + timeout_s
         while True:
-            tlm = self._fresh_tlm_state()
+            tlm = self._fresh_tlm_state(node_id)
             if tlm is not None and predicate(tlm):
                 return tlm
             if time.monotonic() >= deadline:
                 return None
             time.sleep(YAWZERO_POLL_S)
 
-    def _yaw_zero_guards(self, clear: bool) -> Optional[str]:
+    def _ground_activity_guard(self, operation: str) -> Optional[str]:
+        """クイック較正共通の地上アクティビティガード。
+
+        計測・スイープ・モーター回転中はキャリブ値が汚れる(振動・傾き変動・
+        推定器状態の変化)ため拒否する。拒否理由(日本語)か None を返す。
+        experiment モード外ではいずれも自然に False となり素通しする。
+        """
+        if self.hub.sweep.is_running() or self.hub.sequence.is_running():
+            return f"スイープ/シーケンス実行中は{operation}できません"
+        if self.hub.recorder.is_recording():
+            return (f"実験計測(Experiment ログ)実行中は{operation}できません"
+                    "(推定器状態が変わり計測データが汚れます)")
+        if self.hub.motor_status().get("running"):
+            return f"モーター回転中は{operation}できません(先に停止してください)"
+        sample, age = self.hub.latest_sample()
+        if (sample is not None and age is not None
+                and age <= self.hub.exp_fresh_s
+                and sample.get("motors_running")):
+            return f"モーター回転中は{operation}できません(先に停止してください)"
+        return None
+
+    def _yaw_zero_guards(self, clear: bool,
+                         node_id: Optional[int] = None) -> Optional[str]:
         """ヨーゼロ操作の事前ガード。拒否理由(日本語)か None を返す。"""
         if self._tlm_state_provider is None:
             return "TLM_STATE が参照できないためヨーゼロを操作できません"
-        tlm = self._fresh_tlm_state()
+        tlm = self._fresh_tlm_state(node_id)
         if tlm is None:
             return "テレメトリ(TLM_STATE)が新鮮ではありません"
         if not clear and not (tlm.ff_status & proto.TlmState.FF_STATUS_MAG_FRESH):
@@ -850,33 +895,24 @@ class CalibrationManager:
                     "(磁気センサの状態を確認してください)")
         # 推定器状態を変えるため、計測・スイープ・モーター回転中は拒否する
         # (FF off 中の CF はモーター磁気外乱で狂い、アンカーも busy になる)
-        if self.hub.sweep.is_running() or self.hub.sequence.is_running():
-            return "スイープ/シーケンス実行中はヨーゼロを操作できません"
-        if self.hub.recorder.is_recording():
-            return ("実験計測(Experiment ログ)実行中はヨーゼロを操作できません"
-                    "(推定器状態が変わり計測データが汚れます)")
-        if self.hub.motor_status().get("running"):
-            return "モーター回転中はヨーゼロを操作できません(先に停止してください)"
-        sample, age = self.hub.latest_sample()
-        if (sample is not None and age is not None
-                and age <= self.hub.exp_fresh_s
-                and sample.get("motors_running")):
-            return "モーター回転中はヨーゼロを操作できません(先に停止してください)"
-        return None
+        return self._ground_activity_guard("ヨーゼロを操作")
 
-    def _send_ff_mode(self, ff_mode: int, est_mode: int) -> tuple[bool, str]:
+    def _send_ff_mode(self, ff_mode: int, est_mode: int,
+                      node_id: Optional[int] = None) -> tuple[bool, str]:
         return self._send_ack(
             proto.MsgType.CMD_FF_MODE,
-            proto.CmdFfMode(ff_mode=ff_mode, est_mode=est_mode).to_payload())
+            proto.CmdFfMode(ff_mode=ff_mode, est_mode=est_mode).to_payload(),
+            node_id=node_id)
 
-    def _anchor_after_yawzero(self, steps: list[str],
-                              warnings: list[str]) -> None:
+    def _anchor_after_yawzero(self, steps: list[str], warnings: list[str],
+                              node_id: Optional[int] = None) -> None:
         """CMD_FF_ANCHOR を busy リトライ付きで送る(最終失敗は警告のみ)。"""
         busy_name = ACK_STATUS_NAMES[proto.TlmAck.STATUS_BUSY]
         for attempt in range(YAWZERO_ANCHOR_RETRIES):
             if attempt:
                 time.sleep(YAWZERO_ANCHOR_RETRY_S)
-            ok, detail = self._send_ack(proto.MsgType.CMD_FF_ANCHOR, b"")
+            ok, detail = self._send_ack(proto.MsgType.CMD_FF_ANCHOR, b"",
+                                        node_id=node_id)
             if ok:
                 steps.append("アンカー再取得")
                 return
@@ -886,7 +922,8 @@ class CalibrationManager:
         warnings.append("アンカー再取得は保留です"
                         "(busy: 次のモーター始動時に自動再取得されます)")
 
-    def _yaw_zero_sequence(self, *, clear: bool) -> dict:
+    def _yaw_zero_sequence(self, *, clear: bool,
+                           node_id: Optional[int] = None) -> dict:
         """ヨーゼロ設定/クリアの自動シーケンス本体。
 
         FF 有効中でも UI ワンクリックで完結するよう、サーバ側で
@@ -898,9 +935,10 @@ class CalibrationManager:
         6. ff_mode≠0 だったら CMD_FF_MODE で復元(失敗は警告+手動復元案内)
         7. CMD_FF_ANCHOR を busy リトライ付きで送信(最終 busy は警告)
         を実行する。途中失敗時は FF モードの復元を試みてから失敗を返す。
+        node_id 指定時は全手順をノード宛(MUX_UP/DOWN 経由)で実行する。
         """
         op = "ヨーゼロクリア" if clear else "ヨーゼロ設定"
-        reason = self._yaw_zero_guards(clear)
+        reason = self._yaw_zero_guards(clear, node_id)
         if reason:
             return {"ok": False, "message": reason}
         # スイープ/シーケンスとの相互排他+プロファイル操作との直列化
@@ -911,7 +949,7 @@ class CalibrationManager:
         steps: list[str] = []
         warnings: list[str] = []
         try:
-            cal = self.fetch_cal_data()
+            cal = self.fetch_cal_data(node_id=node_id)
             if cal is None:
                 return {"ok": False,
                         "message": "機体からキャリブレーションデータを取得"
@@ -923,7 +961,7 @@ class CalibrationManager:
                 if ff_mode_orig != 0:
                     # FF 一時 off(est_mode は維持。機体側で KF 再シード)
                     ff_restore_pending = True
-                    ok, detail = self._send_ff_mode(0, est_mode_orig)
+                    ok, detail = self._send_ff_mode(0, est_mode_orig, node_id)
                     if not ok:
                         raise _YawZeroAbort(f"CMD_FF_MODE(off) 失敗: {detail}")
                     steps.append("FF一時off")
@@ -931,14 +969,15 @@ class CalibrationManager:
                     if self._wait_tlm_state(
                             lambda t: (t.ff_status
                                        & proto.TlmState.FF_STATUS_FF_MODE_MASK)
-                            == 0, YAWZERO_MODE_TIMEOUT_S) is None:
+                            == 0, YAWZERO_MODE_TIMEOUT_S,
+                            node_id) is None:
                         raise _YawZeroAbort(
                             "FF off の反映を TLM_STATE で確認できませんでした")
                     steps.append("FF off反映確認")
                 if clear:
                     payload = proto.CmdYawzeroSet(valid=0, offset_rad=0.0)
                 else:
-                    tlm = self._fresh_tlm_state()
+                    tlm = self._fresh_tlm_state(node_id)
                     if tlm is None:
                         raise _YawZeroAbort(
                             "テレメトリ(TLM_STATE)が新鮮ではありません")
@@ -947,7 +986,8 @@ class CalibrationManager:
                     payload = proto.CmdYawzeroSet(valid=1,
                                                   offset_rad=offset_new)
                 ok, detail = self._send_ack(proto.MsgType.CMD_YAWZERO_SET,
-                                            payload.to_payload())
+                                            payload.to_payload(),
+                                            node_id=node_id)
                 if not ok:
                     raise _YawZeroAbort(f"CMD_YAWZERO_SET 失敗: {detail}")
                 steps.append("ヨーゼロクリア" if clear
@@ -958,7 +998,8 @@ class CalibrationManager:
                     if self._wait_tlm_state(
                             lambda t: abs(t.yaw_est_rad)
                             < YAWZERO_ALIGN_TOL_RAD,
-                            YAWZERO_ALIGN_TIMEOUT_S) is not None:
+                            YAWZERO_ALIGN_TIMEOUT_S,
+                            node_id) is not None:
                         steps.append("CF整列確認")
                     else:
                         warnings.append("CF の新基準整列(|yaw|<8°)を確認"
@@ -968,7 +1009,7 @@ class CalibrationManager:
                     # FF モード復元(失敗しても継続するが必ず明記する)
                     ff_restore_pending = False
                     ok, detail = self._send_ff_mode(ff_mode_orig,
-                                                    est_mode_orig)
+                                                    est_mode_orig, node_id)
                     if ok:
                         steps.append(f"FF復元(ff={ff_mode_orig}, "
                                      f"est={est_mode_orig})")
@@ -977,13 +1018,13 @@ class CalibrationManager:
                             f"FFモードの復元に失敗しました({detail})。"
                             "FFモードがoffのままです。手動で復元してください")
                 # アンカー再取得(EKF の基準を新ヨーゼロに整列)
-                self._anchor_after_yawzero(steps, warnings)
+                self._anchor_after_yawzero(steps, warnings, node_id)
             except _YawZeroAbort as exc:
                 message = str(exc)
                 if ff_restore_pending:
                     # 途中失敗でも FF モードは必ず復元を試みる
                     ok, detail = self._send_ff_mode(ff_mode_orig,
-                                                    est_mode_orig)
+                                                    est_mode_orig, node_id)
                     if ok:
                         message += "(FFモードは復元しました)"
                     else:

@@ -88,6 +88,7 @@ enum class MsgType : uint8_t {
   TLM_ACK = 0x32,          // 0x14–0x23, 0x25 コマンドへの応答(6B)
   TLM_EXP = 0x33,          // 実験テレメトリ(86B、MOTOR_TEST 中のみ 25Hz)
   TLM_CAL_DATA = 0x34,     // キャリブ一括データ(112B、CMD_CAL_GET 応答)
+  TLM_CTRL = 0x35,         // 制御ループ診断テレメトリ(89B、25Hz 常時)
   // ログ(リレー/ドローン -> PC)
   LOG_TEXT = 0x40,      // 人間向けテキスト(1〜181B)
   // リレー宛/発: 0x50–0x5F
@@ -1249,6 +1250,63 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmCalData* out) {
   return true;
 }
 
+// 0x35 TLM_CTRL(89B)— 制御ループ診断テレメトリ。25Hz(400Hzループの16分周、
+// TLM_STATE と 4tick 位相をずらす)で全飛行状態(MOTOR_TEST 中も含む)常時送出。
+// PID 成分は PID::update() の合成式 m_kp*(err + m_integral + m_differential) の
+// 3分解(P=kp*err、I=kp*m_integral、D=kp*m_differential。P+I+D=そのPIDの出力)。
+// yaw の角度ループ成分はクランプ前の値を記録する(yaw_rate_ref はクランプ後
+// → 差でクランプ発動が分かる)。PID リセット中(非飛行時や、ヨー制御OFF時の
+// psi_pid 毎tickリセット等)は成分が 0 になるため、flags で有効区間を判別する。
+struct TlmCtrl {
+  static constexpr MsgType TYPE = MsgType::TLM_CTRL;
+  static constexpr size_t PAYLOAD_SIZE =
+      4 +      // elapsed_ms
+      4 * 3 +  // roll_rate_ref, pitch_rate_ref, yaw_rate_ref
+      4 * 9 +  // pid_ang[9]
+      4 * 9 +  // pid_rate[9]
+      1;       // flags
+  static constexpr uint8_t FLAG_XY_ONBOARD_ACTIVE = 0x01;  // bit0: CMD_POS_ERR 経路で機上XY指令生成中
+  static constexpr uint8_t FLAG_YAW_CTRL_ACTIVE = 0x02;    // bit1
+  static constexpr uint8_t FLAG_FLYING = 0x04;             // bit2
+
+  uint32_t elapsed_ms = 0;      // 起動からの経過 [ms](TLM_STATE と同一クロック)
+  float roll_rate_ref = 0.0f;   // rad/s(角度ループ出力=ロール指令角速度)
+  float pitch_rate_ref = 0.0f;  // rad/s(同ピッチ)
+  float yaw_rate_ref = 0.0f;    // rad/s(psi_pid 出力。±yaw_rate_limit_rad_s クランプ後)
+  float pid_ang[9] = {0.0f, 0.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f};   // 角度ループPID成分(roll_p,i,d, pitch_p,i,d, yaw_p,i,d)
+  float pid_rate[9] = {0.0f, 0.0f, 0.0f,
+                       0.0f, 0.0f, 0.0f,
+                       0.0f, 0.0f, 0.0f};  // 角速度ループPID成分(同順。roll=p_pid, pitch=q_pid, yaw=r_pid)
+  uint8_t flags = 0;            // FLAG_*
+};
+static_assert(TlmCtrl::PAYLOAD_SIZE == 89, "PROTOCOL.md: TLM_CTRL payload = 89B");
+
+inline bool serialize(const TlmCtrl& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < TlmCtrl::PAYLOAD_SIZE) return false;
+  wr_u32(out + 0, m.elapsed_ms);
+  wr_f32(out + 4, m.roll_rate_ref);
+  wr_f32(out + 8, m.pitch_rate_ref);
+  wr_f32(out + 12, m.yaw_rate_ref);
+  for (size_t i = 0; i < 9; ++i) wr_f32(out + 16 + 4 * i, m.pid_ang[i]);
+  for (size_t i = 0; i < 9; ++i) wr_f32(out + 52 + 4 * i, m.pid_rate[i]);
+  wr_u8(out + 88, m.flags);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, TlmCtrl* out) {
+  if (in == nullptr || out == nullptr || len != TlmCtrl::PAYLOAD_SIZE) return false;
+  out->elapsed_ms = rd_u32(in + 0);
+  out->roll_rate_ref = rd_f32(in + 4);
+  out->pitch_rate_ref = rd_f32(in + 8);
+  out->yaw_rate_ref = rd_f32(in + 12);
+  for (size_t i = 0; i < 9; ++i) out->pid_ang[i] = rd_f32(in + 16 + 4 * i);
+  for (size_t i = 0; i < 9; ++i) out->pid_rate[i] = rd_f32(in + 52 + 4 * i);
+  out->flags = rd_u8(in + 88);
+  return true;
+}
+
 // 0x40 LOG_TEXT(1〜181B)— 人間向けテキスト。データUARTへの生テキスト直書きの代替。
 // text はビュー(deserialize 時は入力バッファ内を指す。コピーしない)。
 struct LogText {
@@ -1600,6 +1658,8 @@ inline int expected_payload_size(uint8_t type) {
       return static_cast<int>(TlmExp::PAYLOAD_SIZE);
     case MsgType::TLM_CAL_DATA:
       return static_cast<int>(TlmCalData::PAYLOAD_SIZE);
+    case MsgType::TLM_CTRL:
+      return static_cast<int>(TlmCtrl::PAYLOAD_SIZE);
     case MsgType::LOG_TEXT:
       return -1;
     case MsgType::RLY_SET_TARGET:

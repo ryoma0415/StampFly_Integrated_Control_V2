@@ -395,6 +395,36 @@ def build_vectors() -> dict:
         "tlm_cal_data_full", "TLM_CAL_DATA", sp.MsgType.TLM_CAL_DATA, 202,
         cal_fields, cal_payload))
 
+    # --- 制御診断拡張(0x35 TLM_CTRL: 全フィールド既知値の89B)---
+    ctrl_fields = {
+        "elapsed_ms": 246810,
+        "roll_rate_ref": 0.85,
+        "pitch_rate_ref": -0.65,
+        "yaw_rate_ref": 0.5236,
+        "pid_ang": [0.55, 0.2, 0.1,
+                    -0.42, -0.15, -0.08,
+                    0.3, 0.18, 0.04],
+        "pid_rate": [0.021, 0.008, 0.003,
+                     -0.017, -0.006, -0.002,
+                     0.011, 0.004, 0.001],
+        "flags": (sp.TlmCtrl.FLAG_XY_ONBOARD_ACTIVE |
+                  sp.TlmCtrl.FLAG_YAW_CTRL_ACTIVE |
+                  sp.TlmCtrl.FLAG_FLYING),
+    }
+    ctrl = sp.TlmCtrl(
+        elapsed_ms=ctrl_fields["elapsed_ms"],
+        roll_rate_ref=ctrl_fields["roll_rate_ref"],
+        pitch_rate_ref=ctrl_fields["pitch_rate_ref"],
+        yaw_rate_ref=ctrl_fields["yaw_rate_ref"],
+        pid_ang=tuple(ctrl_fields["pid_ang"]),
+        pid_rate=tuple(ctrl_fields["pid_rate"]),
+        flags=ctrl_fields["flags"])
+    ctrl_payload = ctrl.to_payload()
+    assert len(ctrl_payload) == 89
+    frames.append(frame_vector(
+        "tlm_ctrl_full", "TLM_CTRL", sp.MsgType.TLM_CTRL, 203,
+        ctrl_fields, ctrl_payload))
+
     by_name = {f["name"]: f for f in frames}
 
     def logical_of(name: str) -> bytes:

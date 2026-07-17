@@ -82,6 +82,7 @@ class MsgType(IntEnum):
     TLM_ACK = 0x32
     TLM_EXP = 0x33
     TLM_CAL_DATA = 0x34
+    TLM_CTRL = 0x35
     # ログ(リレー/ドローン -> PC)
     LOG_TEXT = 0x40
     # リレー宛/発: 0x50–0x5F
@@ -319,6 +320,7 @@ _TLM_STATE_FMT = "<IIBBB21fH9fBB"
 _TLM_ACK_FMT = "<BIB"
 _TLM_EXP_FMT = "<I20fBB"
 _TLM_CAL_DATA_FMT = "<B26fBIBB"
+_TLM_CTRL_FMT = "<I21fB"
 _RLY_SET_TARGET_FMT = "<6sB"
 _RLY_TARGET_ACK_FMT = "<B6sB"
 _RLY_STATS_FMT = "<IIIIII"
@@ -348,6 +350,7 @@ assert struct.calcsize(_TLM_STATE_FMT) == 135
 assert struct.calcsize(_TLM_ACK_FMT) == 6
 assert struct.calcsize(_TLM_EXP_FMT) == 86
 assert struct.calcsize(_TLM_CAL_DATA_FMT) == 112
+assert struct.calcsize(_TLM_CTRL_FMT) == 89
 assert struct.calcsize(_RLY_SET_TARGET_FMT) == 7
 assert struct.calcsize(_RLY_TARGET_ACK_FMT) == 8
 assert struct.calcsize(_RLY_STATS_FMT) == 24
@@ -987,6 +990,57 @@ class TlmCalData:
 
 
 @dataclass
+class TlmCtrl:
+    """0x35 TLM_CTRL(89B)— 制御ループ診断テレメトリ。25Hz(400Hzループの
+    16分周、TLM_STATE と 4tick 位相をずらす)で全飛行状態(MOTOR_TEST 中も
+    含む)常時送出。
+
+    PID 成分は PID::update() の合成式 m_kp*(err + m_integral + m_differential)
+    の3分解(P=kp*err、I=kp*m_integral、D=kp*m_differential。P+I+D=そのPIDの
+    出力)。yaw の角度ループ成分はクランプ前の値を記録する(yaw_rate_ref は
+    クランプ後 → 差でクランプ発動が分かる)。PID リセット中(非飛行時や、
+    ヨー制御OFF時の psi_pid 毎tickリセット等)は成分が 0 になるため、flags で
+    有効区間を判別する。
+    """
+    elapsed_ms: int = 0           # 起動からの経過 [ms](TLM_STATE と同一クロック)
+    roll_rate_ref: float = 0.0    # rad/s(角度ループ出力=ロール指令角速度)
+    pitch_rate_ref: float = 0.0   # rad/s(同ピッチ)
+    yaw_rate_ref: float = 0.0     # rad/s(psi_pid 出力。±yaw_rate_limit_rad_s クランプ後)
+    pid_ang: tuple = (0.0,) * 9   # 角度ループPID成分(roll_p,i,d, pitch_p,i,d, yaw_p,i,d)
+    pid_rate: tuple = (0.0,) * 9  # 角速度ループPID成分(同順。roll=p_pid, pitch=q_pid, yaw=r_pid)
+    flags: int = 0                # FLAG_*
+
+    TYPE = MsgType.TLM_CTRL
+    PAYLOAD_SIZE = 89
+    FLAG_XY_ONBOARD_ACTIVE = 0x01  # bit0: CMD_POS_ERR 経路で機上XY指令生成中
+    FLAG_YAW_CTRL_ACTIVE = 0x02    # bit1
+    FLAG_FLYING = 0x04             # bit2
+
+    def to_payload(self) -> bytes:
+        if len(self.pid_ang) != 9 or len(self.pid_rate) != 9:
+            raise ValueError("TLM_CTRL: pid_ang / pid_rate は各 9 要素")
+        return struct.pack(
+            _TLM_CTRL_FMT,
+            self.elapsed_ms,
+            self.roll_rate_ref, self.pitch_rate_ref, self.yaw_rate_ref,
+            *self.pid_ang, *self.pid_rate,
+            self.flags)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "TlmCtrl":
+        _check_len("TLM_CTRL", data, cls.PAYLOAD_SIZE)
+        vals = struct.unpack(_TLM_CTRL_FMT, data)
+        return cls(
+            elapsed_ms=vals[0],
+            roll_rate_ref=vals[1],
+            pitch_rate_ref=vals[2],
+            yaw_rate_ref=vals[3],
+            pid_ang=tuple(vals[4:13]),
+            pid_rate=tuple(vals[13:22]),
+            flags=vals[22])
+
+
+@dataclass
 class LogText:
     """0x40 LOG_TEXT(1〜181B)— 人間向けメッセージ。生テキスト直書きの代替。"""
     origin: int = 0          # 0=relay, 1=drone
@@ -1305,6 +1359,7 @@ PAYLOAD_CLASSES = {
     MsgType.TLM_ACK: TlmAck,
     MsgType.TLM_EXP: TlmExp,
     MsgType.TLM_CAL_DATA: TlmCalData,
+    MsgType.TLM_CTRL: TlmCtrl,
     MsgType.LOG_TEXT: LogText,
     MsgType.RLY_SET_TARGET: RlySetTarget,
     MsgType.RLY_TARGET_ACK: RlyTargetAck,
@@ -1346,6 +1401,7 @@ EXPECTED_PAYLOAD_SIZE: dict[MsgType, Optional[int]] = {
     MsgType.TLM_ACK: TlmAck.PAYLOAD_SIZE,
     MsgType.TLM_EXP: TlmExp.PAYLOAD_SIZE,
     MsgType.TLM_CAL_DATA: TlmCalData.PAYLOAD_SIZE,
+    MsgType.TLM_CTRL: TlmCtrl.PAYLOAD_SIZE,
     MsgType.LOG_TEXT: None,
     MsgType.RLY_SET_TARGET: RlySetTarget.PAYLOAD_SIZE,
     MsgType.RLY_TARGET_ACK: RlyTargetAck.PAYLOAD_SIZE,

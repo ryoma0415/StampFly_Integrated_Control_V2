@@ -13,7 +13,7 @@ from core.logger import FlightLogger
 from core.session import MODE_POSITION, MODE_POSTURE, PHASE_CONNECTED
 
 from conftest import halt_supervisor
-from fakes import make_pose, wait_until
+from fakes import make_pose, make_tlm_ctrl, wait_until
 
 
 class TestConnectAndAirframe:
@@ -457,3 +457,64 @@ class TestLoggingIntegration:
         session.disconnect()                   # teardown 経路
         assert not session.logger.active
         assert session._logging_enabled is False
+
+    def test_tlm_ctrl_columns_written(self, tmp_path, session_factory):
+        """最新 TLM_CTRL(制御ループ診断)のスナップショットが行に転記される。"""
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+
+        ctrl = make_tlm_ctrl(roll_rate_ref=0.10, pitch_rate_ref=-0.20,
+                             yaw_rate_ref=0.05,
+                             flags=(proto.TlmCtrl.FLAG_YAW_CTRL_ACTIVE
+                                    | proto.TlmCtrl.FLAG_FLYING))
+        transport.push(proto.MsgType.TLM_CTRL, ctrl.to_payload())
+        assert wait_until(lambda: session._tlm_ctrl is not None)
+
+        session.set_logging(True)
+        assert session.start()
+        log_file = session.logger.file_path
+        session.posture.step(clock())
+        session.set_logging(False)
+
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        header = lines[0].split(",")
+        assert len(header) == 109              # v4 契約
+        row = lines[1].split(",")
+
+        def cell(name: str) -> str:
+            return row[header.index(name)]
+
+        assert float(cell("tlm_roll_rate_ref_rad_s")) == pytest.approx(0.10)
+        assert float(cell("tlm_pitch_rate_ref_rad_s")) == pytest.approx(-0.20)
+        assert float(cell("tlm_yaw_rate_ref_rad_s")) == pytest.approx(0.05)
+        assert int(cell("tlm_ctrl_flags")) == int(
+            proto.TlmCtrl.FLAG_YAW_CTRL_ACTIVE | proto.TlmCtrl.FLAG_FLYING)
+        assert cell("tlm_ctrl_age_ms") != ""
+        # PID 成分の転記順(roll_p が先頭、yaw_rate_d が末尾)
+        assert float(cell("tlm_pid_roll_ang_p")) == pytest.approx(ctrl.pid_ang[0])
+        assert float(cell("tlm_pid_yaw_ang_d")) == pytest.approx(ctrl.pid_ang[8])
+        assert float(cell("tlm_pid_roll_rate_p")) == pytest.approx(ctrl.pid_rate[0])
+        assert float(cell("tlm_pid_yaw_rate_d")) == pytest.approx(ctrl.pid_rate[8])
+
+    def test_tlm_ctrl_absent_leaves_columns_empty(self, tmp_path,
+                                                  session_factory):
+        """TLM_CTRL 未受信の間は tlm_ctrl_* 列が空欄になる(旧ファーム互換)。"""
+        session, transport, clock = session_factory()
+        session.logger = FlightLogger(logs_dir=tmp_path, flush_every_rows=1)
+        session.connect("FAKE")
+        halt_supervisor(session)
+        session.posture.stop()
+        session.set_logging(True)
+        assert session.start()
+        log_file = session.logger.file_path
+        session.posture.step(clock())
+        session.set_logging(False)
+
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        header = lines[0].split(",")
+        row = lines[1].split(",")
+        assert row[header.index("tlm_ctrl_age_ms")] == ""
+        assert row[header.index("tlm_pid_roll_ang_p")] == ""

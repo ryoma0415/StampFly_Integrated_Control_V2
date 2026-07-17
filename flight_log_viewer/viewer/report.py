@@ -33,7 +33,7 @@ _FIGURE_CAPTIONS: dict[str, str] = {
     "02_attitude.png": "姿勢: 指令 vs 実測",
     "03_altitude.png": "高度と昇降速度",
     "04_position_tracking.png": "位置追従(目標 vs 実測)",
-    "05_pid_components.png": "XY PID 成分",
+    "05_pid_components.png": "XY PID 成分(旧ログ v1〜v3 のみ)",
     "06_duty.png": "モーター duty",
     "07_power.png": "電源(電圧 / 電流)",
     "08_latency_loop_dt.png": "通信レイテンシ / 制御周期",
@@ -45,6 +45,9 @@ _FIGURE_CAPTIONS: dict[str, str] = {
     "15_xyz_3d.png": "3D 飛行軌跡(時間カラー)",
     "16_xy_time.png": "XY 軌跡(時間カラー)",
     "17_cmd_echo.png": "指令エコー: 送信指令 vs 機体適用",
+    "18_pid_ang_components.png": "角度ループ PID 成分(P+I+D=指令角速度)",
+    "19_pid_rate_components.png": "角速度ループ PID 成分",
+    "20_rate_tracking.png": "角速度追従(指令 vs 実測)",
     "M01_multi_xy.png": "複数機 XY 軌跡(共有)",
 }
 

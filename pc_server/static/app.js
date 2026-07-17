@@ -1,6 +1,6 @@
 "use strict";
 /*
- * StampFly 統合管制 UI(v2: Posture / Position / Experiment の3タブ)
+ * StampFly 統合管制 UI(v2: Posture / Position / Multi / Experiment の4タブ)
  *
  * 契約: docs/ARCHITECTURE.md「pc_server API(UI⇔サーバ契約)」に厳密に従う。
  *  - UI⇔WebSocket の単位は deg / m(rad変換はサーバ側 session 層の責務)
@@ -153,6 +153,7 @@ const els = {
   accel6Captured: $("accel6Captured"), accel6Msg: $("accel6Msg"),
   accel6Accel: $("accel6Accel"), accel6Norm: $("accel6Norm"),
   quickcalMsg: $("quickcalMsg"),
+  quickcalDroneRow: $("quickcalDroneRow"), quickcalDrone: $("quickcalDrone"),
   geomagSelect: $("geomagSelect"), btnGeomagApply: $("btnGeomagApply"),
   geomagInfo: $("geomagInfo"), geomagMsg: $("geomagMsg"),
   calprofName: $("calprofName"), btnCalprofSave: $("btnCalprofSave"),
@@ -689,11 +690,10 @@ function renderSession() {
   }
   els.logFile.textContent = s.log_file || "-";
 
-  // Position: 指令roll/pitch表示(サーバが計算した適用中setpoint)
-  if (s.setpoint) {
-    els.cmdRoll.textContent = fmtDeg(s.setpoint.roll_deg);
-    els.cmdPitch.textContent = fmtDeg(s.setpoint.pitch_deg);
-  }
+  // Position: 機体計算指令(機上XY制御 — 機体側 XY PID が計算した
+  // roll_ref/pitch_ref の TLM_STATE エコー)を表示する
+  els.cmdRoll.textContent = fmtDeg(pick(lastDrone, "roll_ref"));
+  els.cmdPitch.textContent = fmtDeg(pick(lastDrone, "pitch_ref"));
 
   // ヨー角制御トグルのサーバecho同期(ユーザー操作直後は抑制)
   if (now() - yawCtrlSentAt > UI.ECHO_SUPPRESS_MS) {
@@ -1322,6 +1322,20 @@ function renderMulti() {
     !(wsOpen && multi && multi.active && drones.length >= 2 && !anyActive);
   els.btnMultiApply.disabled =
     !(wsOpen && lastSession && lastSession.serial_connected && !anyActive);
+
+  // クイック較正カードの対象機体セレクタ(Multi モード中のみ表示。
+  // 選択肢は「選択適用」済みの機体 = サーバ側スロット)。
+  // WS 20Hz で呼ばれるため、機体一覧が不変なら再構築しない
+  // (開いているドロップダウンと選択値を壊さない。updateMultiFfSelects と同方式)
+  els.quickcalDroneRow.classList.toggle("hidden", uiMode !== "multi");
+  if (uiMode === "multi") {
+    const opts = drones.map((d) => ({ value: d.name, label: d.name }));
+    const sig = JSON.stringify(opts);
+    if (els.quickcalDrone.dataset.optsSig !== sig) {
+      els.quickcalDrone.dataset.optsSig = sig;
+      rebuildSelect(els.quickcalDrone, opts);
+    }
+  }
 }
 
 function drawMultiPlot() {
@@ -1497,6 +1511,8 @@ function applyMode(mode, sendToServer) {
     modeSentAt = now();
     sendCommand("set_mode", { mode });
   }
+  // クイック較正カードの対象機体セレクタは Multi モード中のみ表示
+  els.quickcalDroneRow.classList.toggle("hidden", mode !== "multi");
   if (mode === "position") drawPlot();
   if (mode === "multi") {
     renderMultiAirframeList();
@@ -2232,15 +2248,26 @@ function wireEvents() {
     }));
   }
 
-  // クイック較正(Attitude 0 / Yaw 0 / Clear)
+  // クイック較正(Attitude 0 / Yaw 0 / Clear。全モード共通カード)
   // ヨーゼロは FF 停止→設定→FF 復元→アンカー再取得の多段シーケンスで数秒かかるため、
-  // 実行中は 4 ボタンまとめて無効化する(同時操作・二度押し防止)
+  // 実行中は 4 ボタンまとめて無効化する(同時操作・二度押し防止)。
+  // Multi モード中は対象機体セレクタの機体名を "drone" として送る(サーバ側で必須検証)
   const quickcalBtns = document.querySelectorAll("[data-quickcal-action]");
   for (const btn of quickcalBtns) {
     btn.addEventListener("click", async () => {
+      const body = { action: btn.dataset.quickcalAction };
+      if (uiMode === "multi") {
+        const drone = els.quickcalDrone.value;
+        if (!drone) {
+          els.quickcalMsg.textContent =
+            "対象機体がありません(複数機タブで「選択適用」してから実行してください)";
+          return;
+        }
+        body.drone = drone;
+      }
       for (const b of quickcalBtns) b.disabled = true;
       try {
-        const resp = await apiPost("/api/quickcal", { action: btn.dataset.quickcalAction });
+        const resp = await apiPost("/api/quickcal", body);
         if (resp && resp.message) {
           els.quickcalMsg.textContent = resp.message;
           appendConsole("ui", resp.message);

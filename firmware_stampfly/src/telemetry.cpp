@@ -1,5 +1,5 @@
 // ===========================================================================
-// telemetry.cpp — TLM_STATE / TLM_EVENT 生成 実装
+// telemetry.cpp — TLM_STATE / TLM_EVENT / TLM_CTRL 生成 実装
 // ===========================================================================
 #include "telemetry.hpp"
 
@@ -17,6 +17,7 @@ namespace {
 
 uint16_t state_divider_counter = 0;  // TLM_STATE 分周カウンタ
 uint16_t exp_divider_counter = 0;    // TLM_EXP 分周カウンタ(TLM_STATE と 8tick 位相ずらし)
+uint16_t ctrl_divider_counter = 0;   // TLM_CTRL 分周カウンタ(TLM_STATE と 4tick 位相ずらし)
 uint32_t last_event_tx_ms = 0;       // 直近のTLM_EVENT送信時刻
 bool event_valid = false;            // 一度でも遷移イベントが発生したか
 uint8_t event_state = 0;             // 直近イベントの内容(2Hz再送に使う)
@@ -129,6 +130,35 @@ void send_state_frame(void) {
     comm_send_payload(stampfly::MsgType::TLM_STATE, payload, sizeof(payload));
 }
 
+// TLM_CTRL(制御ループ診断 89B)。25Hz・全飛行状態で常時送出(MOTOR_TEST 中も
+// 含む。契約 §TLM_CTRL)。PID 成分は 400Hz ループが flight_control_state.diag へ
+// 毎tick転記したスナップショット。yaw_rate_ref はクランプ後、pid_ang の yaw
+// 成分はクランプ前 → 差でクランプ発動が分かる。
+void send_ctrl_frame(void) {
+    const auto& fc = flight_control_state;
+    stampfly::TlmCtrl m;
+
+    m.elapsed_ms = millis();  // TLM_STATE と同一クロック(行突合用)
+    m.roll_rate_ref = fc.output.Roll_rate_reference;
+    m.pitch_rate_ref = fc.output.Pitch_rate_reference;
+    m.yaw_rate_ref = fc.output.Yaw_rate_reference;
+    for (size_t i = 0; i < 9; i++) m.pid_ang[i] = fc.diag.pid_ang[i];
+    for (size_t i = 0; i < 9; i++) m.pid_rate[i] = fc.diag.pid_rate[i];
+
+    uint8_t flags = 0;
+    if (fc.diag.xy_onboard_active) flags |= stampfly::TlmCtrl::FLAG_XY_ONBOARD_ACTIVE;
+    if (fc.output.Yaw_ctrl_active) flags |= stampfly::TlmCtrl::FLAG_YAW_CTRL_ACTIVE;
+    // flying の定義は TLM_STATE flags bit2 と同一(build_status_flags を単一の根拠にする)
+    if (build_status_flags() & stampfly::TlmState::FLAG_FLYING) {
+        flags |= stampfly::TlmCtrl::FLAG_FLYING;
+    }
+    m.flags = flags;
+
+    uint8_t payload[stampfly::TlmCtrl::PAYLOAD_SIZE];
+    if (!stampfly::serialize(m, payload, sizeof(payload))) return;
+    comm_send_payload(stampfly::MsgType::TLM_CTRL, payload, sizeof(payload));
+}
+
 // TLM_EXP(実験テレメトリ 86B)。MOTOR_TEST 状態でのみ 25Hz 送出。
 // 磁気生値/較正後値・電流・温度など FF 較正実験(スイープ)のサンプル源。
 void send_exp_frame(void) {
@@ -192,6 +222,16 @@ void telemetry_update(void) {
     if (state_divider_counter >= FLIGHT_CONFIG.telemetry_state_divider) {
         state_divider_counter = 0;
         send_state_frame();
+    }
+
+    // TLM_CTRL 25Hz(全状態で常時)。TLM_STATE と 4tick 位相をずらして
+    // 同一tickでの2フレーム送出(送信バースト)を避ける(TLM_EXP の 8tick とも重ならない)。
+    ctrl_divider_counter++;
+    if (ctrl_divider_counter >= FLIGHT_CONFIG.telemetry_state_divider) {
+        ctrl_divider_counter = 0;
+    }
+    if (ctrl_divider_counter == FLIGHT_CONFIG.telemetry_ctrl_phase_ticks) {
+        send_ctrl_frame();
     }
 
     // TLM_EXP 25Hz(MOTOR_TEST 状態のみ)。TLM_STATE と 8tick 位相をずらして

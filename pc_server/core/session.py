@@ -53,10 +53,6 @@ PHASE_CONNECTED = "connected"
 PHASE_ARMED = "armed"
 PHASE_FLYING = "flying"
 
-# XY 指令モード(control.json "control"."xy_command_mode")
-XY_CMD_MODE_PC = "pc"            # PC 側 PID → CMD_SETPOINT(従来)
-XY_CMD_MODE_ONBOARD = "onboard"  # 位置誤差 → CMD_POS_ERR(機体側でヨー回転補償+PID)
-
 # 飛行中とみなす FlightState(LANDING 中も「flying」フェーズとして扱う)
 _IN_FLIGHT_STATES = frozenset({
     proto.FlightState.TAKEOFF, proto.FlightState.HOVER, proto.FlightState.LANDING,
@@ -181,16 +177,10 @@ class SessionManager:
         # UI への即時メッセージ(event / log)。app.py が drain する。
         self.events: queue.Queue = queue.Queue()
 
-        # XY 指令モード(control.json "control" 節):
-        # - "pc":      従来どおり PC 側 PID の roll/pitch 角度指令(CMD_SETPOINT)
-        # - "onboard": 位置誤差を送り機体側でヨー回転補償+XY PID(CMD_POS_ERR)
+        # 機上XY制御(CMD_POS_ERR)の位置誤差クランプ(control.json "control" 節)。
+        # Position/Multi の XY 指令は CMD_POS_ERR に一本化されている
+        # (旧 PC 側 XY PID 経路は v2.2 で削除。CMD_SETPOINT は Posture 専用)
         control_cfg = self.control_config.get("control", {})
-        xy_mode = control_cfg.get("xy_command_mode", XY_CMD_MODE_PC)
-        if xy_mode not in (XY_CMD_MODE_PC, XY_CMD_MODE_ONBOARD):
-            self.warn(f"control.json xy_command_mode が不正です: {xy_mode!r}"
-                      f"('{XY_CMD_MODE_PC}' として扱います)")
-            xy_mode = XY_CMD_MODE_PC
-        self._xy_command_mode: str = xy_mode
         self._pos_err_clamp_m: float = control_cfg.get("pos_err_clamp_m", 2.0)
 
         # 構成要素
@@ -231,6 +221,7 @@ class SessionManager:
 
         # 受信ディスパッチ登録(ハンドラは RX スレッド上: ブロッキング禁止)
         self.serial.register_handler(proto.MsgType.TLM_STATE, self._on_tlm_state)
+        self.serial.register_handler(proto.MsgType.TLM_CTRL, self._on_tlm_ctrl)
         self.serial.register_handler(proto.MsgType.TLM_EVENT, self._on_tlm_event)
         self.serial.register_handler(proto.MsgType.LOG_TEXT, self._on_log_text)
         self.serial.register_handler(proto.MsgType.RLY_STATS, self._on_rly_stats)
@@ -283,6 +274,8 @@ class SessionManager:
         # 最新テレメトリ
         self._tlm_state: Optional[proto.TlmState] = None
         self._tlm_state_t: Optional[float] = None
+        self._tlm_ctrl: Optional[proto.TlmCtrl] = None   # 制御ループ診断(25Hz)
+        self._tlm_ctrl_t: Optional[float] = None
         self._rly_stats: Optional[proto.RlyStats] = None
         self._rly_stats_t: Optional[float] = None   # 受信時刻(鮮度判定用)
 
@@ -327,6 +320,8 @@ class SessionManager:
             self._stop_pending = None
             self._tlm_state = None
             self._tlm_state_t = None
+            self._tlm_ctrl = None
+            self._tlm_ctrl_t = None
             self._rly_stats = None
             self._rly_stats_t = None
             self._connected_at = self._clock()
@@ -1058,6 +1053,63 @@ class SessionManager:
             return {"ok": False, "message": reason}
         return self.ffprofile.anchor(node_id=info["node_id"])
 
+    # ------------------------------------------------------------------
+    # クイック較正(全モード対応。Multi は対象機体を指定)
+    # ------------------------------------------------------------------
+
+    def _quickcal_target(self, drone) -> tuple[Optional[int], Optional[str]]:
+        """quickcal の対象解決+飛行中ガード。(node_id, 拒否理由) を返す。
+
+        単機モード: drone は無視し、phase が armed/flying なら拒否。
+        Multi モード: drone(機体名)必須。_multi_ff_slot と同じ規範で
+        **いずれかの機体が飛行中なら全面拒否**する(yaw_zero シーケンスは
+        _command_lock を数秒〜10秒保持し得るため、飛行中に stop() の再送監視が
+        ロック待ちでブロックされる事故を防ぐ)。
+        """
+        with self._lock:
+            mode = self._mode
+            phase = self._phase
+        if mode == MODE_MULTI:
+            if not drone:
+                return None, ("複数機モード中は対象機体(drone)を"
+                              "指定してください")
+            if self.multi.any_armed_or_flying():
+                return None, ("飛行中の機体があるためクイック較正できません"
+                              "(全機着陸後にやり直してください)")
+            info = self.multi.slot_info(str(drone))
+            if info is None:
+                return None, f"機体「{drone}」は選択されていません"
+            return info["node_id"], None
+        # 単機モード: drone は無視(ffprofile の "drone" 方式に合わせた契約)
+        if phase in (PHASE_ARMED, PHASE_FLYING):
+            return None, ("飛行中はクイック較正できません"
+                          "(着陸後にやり直してください)")
+        return None, None
+
+    @_ui_command
+    def quickcal(self, action: str, drone=None) -> dict:
+        """クイック較正(Attitude 0 / Attitude Clear / Yaw 0 / Yaw Clear)。
+
+        全制御モード(Posture/Position/Multi/Experiment)で使用可能。
+        Multi モード中は drone(選択適用済みの機体名)でノード宛に送る。
+        既存ガード(モーター回転中・スイープ/シーケンス/計測中・磁気鮮度)は
+        CalibrationManager 側で維持される(experiment 外では自然に no-op)。
+        """
+        handlers = {
+            "attitude_zero": self.calibration.attitude_zero,
+            "attitude_clear": self.calibration.attitude_zero_clear,
+            "yaw_zero": self.calibration.yaw_zero,
+            "yaw_clear": self.calibration.yaw_zero_clear,
+        }
+        handler = handlers.get(action)
+        if handler is None:
+            return {"ok": False, "message": "不明な action です"}
+        node_id, reason = self._quickcal_target(drone)
+        if reason is not None:
+            self.warn(f"クイック較正不可: {reason}")
+            return {"ok": False, "message": reason}
+        return handler(node_id=node_id)
+
     def mocap_bodies(self) -> dict:
         """現在観測中の全リジッドボディ一覧(紐付け確認 UI 用)。
 
@@ -1332,16 +1384,15 @@ class SessionManager:
         ON のとき flags bit1(FLAG_YAW_REF_VALID)を立てて 17B で送信する。
         OFF のときは yaw_ref=0 / bit1=0(機体は V1 と同一のレートダンピング)。
 
-        v2.1: Position モードかつ xy_command_mode="onboard" のときは
-        roll/pitch 角度指令の代わりに位置誤差(CMD_POS_ERR)を送る
-        (_emit_pos_err)。Posture モードは常に CMD_SETPOINT。
+        v2.2: Position モードは常に位置誤差(CMD_POS_ERR)を送る
+        (_emit_pos_err。機体側でヨー回転補償+XY PID)。
+        CMD_SETPOINT は Posture モード専用。
         """
         with self._lock:
             bias_roll = self._bias_roll_rad
             bias_pitch = self._bias_pitch_rad
             phase = self._phase
-        if (meta.get("mode") == "position"
-                and self._xy_command_mode == XY_CMD_MODE_ONBOARD):
+        if meta.get("mode") == "position":
             self._emit_pos_err(alt_m, meta, phase)
             return
         yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
@@ -1366,20 +1417,19 @@ class SessionManager:
 
         if self.logger.active:
             row = self._build_log_row(setpoint, seq, send_success, phase, meta)
-            row["xy_cmd_mode"] = XY_CMD_MODE_PC
             self.logger.log_row(row)
 
     def _emit_pos_err(self, alt_m: float, meta: dict, phase: str) -> None:
-        """機上XY制御モード: CMD_POS_ERR(位置誤差ストリーム)を送信してログする。
+        """機上XY制御: CMD_POS_ERR(位置誤差ストリーム)を送信してログする。
 
         roll/pitch 指令は機体側 XY PID が計算するため送らない(トリム
         バイアスも送らない — 定常オフセットは機体側 I 項が吸収する)。
         bit2(XY_ERR_VALID)は「閉ループ有効 かつ データ有効 かつ MoCap
         非途絶」。無効時も**実誤差(クランプ後)をそのまま送る**: 機体側が
         bit2=0 で水平指令+PID減衰を行い、PID の誤差履歴(prev_error)は
-        現実を追い続ける(PC 側計算 position.py と同じ規約。誤差を 0 に
-        すり替えると復帰1サンプル目に D 項スパイクを作る)。alt_ref /
-        yaw_ref の整形は既存の SetpointShaper 出力(呼び出し元)を使う。
+        現実を追い続ける(誤差を 0 にすり替えると復帰1サンプル目に
+        D 項スパイクを作る)。alt_ref / yaw_ref の整形は既存の
+        SetpointShaper 出力(呼び出し元)を使う。
         """
         yaw_ctrl_on = bool(meta.get("yaw_ctrl_on"))
         yaw_ref = float(meta.get("yaw_ref_rad") or 0.0) if yaw_ctrl_on else 0.0
@@ -1409,19 +1459,16 @@ class SessionManager:
             pass   # 切断検知は _on_serial_disconnect → supervisor が処理
 
         if self.logger.active:
-            # 共有列(alt/yaw 等)はゼロ姿勢の CmdSetpoint 形で埋め、
-            # xy_cmd_mode 列で判別する(roll/pitch 指令は機体側で計算され、
-            # tlm_roll_ref_rad / tlm_pitch_ref_rad 列に現れる)。
+            # 共有列(alt/yaw 等)はゼロ姿勢の CmdSetpoint 形で埋める
+            # (roll/pitch 指令は機体側で計算され、tlm_roll_ref_rad /
+            # tlm_pitch_ref_rad 列に現れる)。
             row = self._build_log_row(
                 proto.CmdSetpoint(roll_ref=0.0, pitch_ref=0.0, alt_ref=alt_m,
                                   yaw_ref=yaw_ref, flags=flags & 0x03),
                 seq, send_success, phase, meta)
-            row["xy_cmd_mode"] = XY_CMD_MODE_ONBOARD
             row["cmd_err_x_m"] = err_x
             row["cmd_err_y_m"] = err_y
             row["cmd_xy_valid"] = xy_valid
-            row["cmd_mocap_yaw_deg"] = (None if heading is None
-                                        else heading * RAD_TO_DEG)
             self.logger.log_row(row)
 
     def _build_log_row(self, setpoint: proto.CmdSetpoint, seq: Optional[int],
@@ -1434,14 +1481,11 @@ class SessionManager:
             "feedback_latency_ms": self.serial.latency_ms,
             "roll_ref_rad": setpoint.roll_ref,
             "pitch_ref_rad": setpoint.pitch_ref,
-            "roll_ref_deg": setpoint.roll_ref * RAD_TO_DEG,
-            "pitch_ref_deg": setpoint.pitch_ref * RAD_TO_DEG,
             "alt_ref_m": setpoint.alt_ref,
             "roll_bias_deg": self._bias_roll_rad * RAD_TO_DEG,
             "pitch_bias_deg": self._bias_pitch_rad * RAD_TO_DEG,
-            # v2: ヨー指令(送信した CMD_SETPOINT のヨー目標)
+            # v2: ヨー指令(送信したヨー目標)
             "cmd_yaw_ref_rad": setpoint.yaw_ref,
-            "cmd_yaw_ref_deg": setpoint.yaw_ref * RAD_TO_DEG,
             "yaw_ctrl_on": bool(setpoint.flags
                                 & proto.CmdSetpoint.FLAG_YAW_REF_VALID),
         }
@@ -1449,24 +1493,36 @@ class SessionManager:
         # Position モードの診断列(meta 由来。logger の共通ヘルパで転記)
         row.update(logger_mod.meta_to_row(meta))
 
-        # 最新テレメトリのスナップショット
+        # 最新テレメトリのスナップショット(TLM_STATE / TLM_CTRL とも 25Hz)
         with self._lock:
             tlm = self._tlm_state
             tlm_t = self._tlm_state_t
+            ctrl = self._tlm_ctrl
+            ctrl_t = self._tlm_ctrl_t
         if tlm is not None and tlm_t is not None:
             row.update(logger_mod.tlm_state_to_row(tlm, self._clock() - tlm_t))
+        if ctrl is not None and ctrl_t is not None:
+            row.update(logger_mod.tlm_ctrl_to_row(ctrl, self._clock() - ctrl_t))
         return row
 
     # ==================================================================
     # 内部: 受信ハンドラ(RXスレッド上: 状態更新とキュー投入のみ)
     # ==================================================================
 
-    def _tlm_state_snapshot(self) -> tuple[Optional[proto.TlmState],
-                                           Optional[float]]:
-        """最新 TLM_STATE と受信からの経過秒(CalibrationManager が参照)。"""
-        with self._lock:
-            tlm = self._tlm_state
-            tlm_t = self._tlm_state_t
+    def _tlm_state_snapshot(self, node_id: Optional[int] = None
+                            ) -> tuple[Optional[proto.TlmState],
+                                       Optional[float]]:
+        """最新 TLM_STATE と受信からの経過秒(CalibrationManager が参照)。
+
+        node_id 指定時は複数機モードの当該スロットのスナップショットを返す
+        (quickcal のノード宛対応。未選択/未受信は (None, None))。
+        """
+        if node_id is None:
+            with self._lock:
+                tlm = self._tlm_state
+                tlm_t = self._tlm_state_t
+        else:
+            tlm, tlm_t = self.multi.tlm_state_of(node_id)
         age = None if tlm_t is None else (self._clock() - tlm_t)
         return tlm, age
 
@@ -1479,6 +1535,16 @@ class SessionManager:
             self._tlm_state = tlm
             self._tlm_state_t = self._clock()
         self._update_phase_from_drone(tlm.state, tlm.flags)
+
+    def _on_tlm_ctrl(self, frame: proto.Frame) -> None:
+        """TLM_CTRL(制御ループ診断 25Hz)の最新値保持(RXスレッド上)。"""
+        try:
+            ctrl = proto.TlmCtrl.from_payload(frame.payload)
+        except ValueError:
+            return
+        with self._lock:
+            self._tlm_ctrl = ctrl
+            self._tlm_ctrl_t = self._clock()
 
     def _on_tlm_event(self, frame: proto.Frame) -> None:
         try:
@@ -1960,7 +2026,6 @@ class SessionManager:
         session = {
             "mode": mode,
             "phase": phase,
-            "xy_cmd_mode": self._xy_command_mode,
             "serial_connected": self.serial.is_connected,
             "airframe": airframe["name"] if airframe else None,
             "relay_target_ok": relay_target_ok,

@@ -112,11 +112,24 @@ struct CommandTrackingState {
     bool pos_err_fresh_sample = false;  // 未処理の新サンプルがあるか(XY PID が消費)
 };
 
+// v2: 制御ループ診断(TLM_CTRL 用)。400Hzループが毎tick PID アクセサから
+// 転記し、telemetry が 25Hz で読む(指令角速度と yaw_ctrl_active は output、
+// flying は mode から読む)。PID リセット中は各成分が 0(契約 §TLM_CTRL)。
+struct ControlDiagState {
+    // 角度ループPID成分: roll_p,i,d, pitch_p,i,d, yaw_p,i,d(yaw はクランプ前)
+    float pid_ang[9] = {};
+    // 角速度ループPID成分: 同順(roll=p_pid, pitch=q_pid, yaw=r_pid)
+    float pid_rate[9] = {};
+    // CMD_POS_ERR 経路で機上XY指令生成中(TLM_CTRL flags bit0)
+    uint8_t xy_onboard_active = 0;
+};
+
 struct FlightControlState {
     FlightTimingState timing;
     FlightModeState mode;
     ControlOutputState output;
     CommandTrackingState command;
+    ControlDiagState diag;
 };
 
 // センサ状態(流用層 sensor.cpp が書き込む。原典 flight_state.hpp と同一)

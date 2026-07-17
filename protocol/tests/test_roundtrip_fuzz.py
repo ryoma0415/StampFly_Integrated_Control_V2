@@ -16,7 +16,7 @@ import pytest
 import stampfly_protocol as sp
 
 SEED = 0x5F4641  # 固定シード(再現性)
-CASES_PER_TYPE = 60         # 32型 x 60 = 1920 ケース(>500)
+CASES_PER_TYPE = 60         # 33型 x 60 = 1980 ケース(>500)
 STREAM_CASES = 50
 
 # LOG_TEXT は UTF-8(PROTOCOL.md)。1B(ASCII)/2B/3B(日本語)/4B(非BMP)の
@@ -190,6 +190,15 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             ff_crc32=rng.randrange(2**32),
             ff_mode=rng.randrange(3),
             est_mode=rng.randrange(2))
+    if msg_type == sp.MsgType.TLM_CTRL:
+        return sp.TlmCtrl(
+            elapsed_ms=rng.randrange(2**32),
+            roll_rate_ref=f32(rng.uniform(-10, 10)),
+            pitch_rate_ref=f32(rng.uniform(-10, 10)),
+            yaw_rate_ref=f32(rng.uniform(-3.2, 3.2)),
+            pid_ang=tuple(f32(rng.uniform(-10, 10)) for _ in range(9)),
+            pid_rate=tuple(f32(rng.uniform(-2, 2)) for _ in range(9)),
+            flags=rng.randrange(8))
     if msg_type == sp.MsgType.LOG_TEXT:
         # UTF-8 バイト数の上限(budget)内で文字単位に詰める(文字は分断しない)
         budget = rng.randrange(sp.MAX_LOG_TEXT_SIZE + 1)

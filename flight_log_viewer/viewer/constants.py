@@ -1,74 +1,77 @@
 """V2 フライトログの列定義・ビット定義・描画スタイル定数。
 
-列定義は docs/LOG_STRUCTURE.md(v2・94列)= pc_server/core/logger.py の
+列定義は docs/LOG_STRUCTURE.md(v4・109列)= pc_server/core/logger.py の
 COLUMNS と 1 対 1 で対応させること。ffg のビット定義は yaw 側
 (Yaw_Calibration_and_Estimation firmware/src/yaw_estimator_kf.hpp)を、
-ff_status のビット定義はプロトコル v2(TLM_STATE 末尾拡張)を踏襲する。
+ff_status のビット定義はプロトコル v2(TLM_STATE 末尾拡張)を、
+tlm_ctrl_flags のビット定義は TLM_CTRL(プロトコル 0x35)を踏襲する。
 """
 
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# 列定義(94列 = V1 の 77列 + v2 追加 17列。順序も logger.py と同一)
+# 列定義(v4・109列。順序も logger.py と同一)
+# v3(100列)からの変更: deg 重複列・PC 側 XY PID 列・xy_cmd_mode 等 14 列を
+# 削除し、TLM_CTRL 由来の指令角速度+姿勢 PID 成分 23 列を追加、論理順に再編。
 # ---------------------------------------------------------------------------
 
-# V1 から継承した 77 列
-BASE_COLUMNS: tuple[str, ...] = (
-    # --- セッション / タイミング ---
+V4_COLUMNS: tuple[str, ...] = (
+    # --- セッション / タイミング(7) ---
     "timestamp", "elapsed_time", "mode", "phase",
     "command_sequence", "send_success", "feedback_latency_ms",
-    # --- 指令(送信した CMD_SETPOINT、バイアス加算後) ---
-    "roll_ref_rad", "pitch_ref_rad", "roll_ref_deg", "pitch_ref_deg", "alt_ref_m",
-    "roll_bias_deg", "pitch_bias_deg",
-    # --- 位置と誤差(Position モードのみ。制御座標系 m) ---
+    # --- 目標と位置(制御座標系 m。Position/Multi のみ)(11) ---
+    "target_x", "target_y", "target_z",
     "pos_x", "pos_y", "pos_z",
     "raw_pos_x", "raw_pos_y", "raw_pos_z",
     "error_x", "error_y",
-    "target_x", "target_y", "target_z",
-    # --- PID 成分(Position モードのみ) ---
-    "pid_x_p", "pid_x_i", "pid_x_d",
-    "pid_y_p", "pid_y_i", "pid_y_d",
-    # --- フィルタ状態とデータ由来(Position モードのみ) ---
+    # --- 送信指令(PC→機体)(10) ---
+    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid",
+    "roll_ref_rad", "pitch_ref_rad", "alt_ref_m",
+    "cmd_yaw_ref_rad", "yaw_ctrl_on",
+    "roll_bias_deg", "pitch_bias_deg",
+    # --- 機体実測: 姿勢・角速度・加速度(TLM_STATE)(10) ---
+    "tlm_age_ms",
+    "tlm_roll_rad", "tlm_pitch_rad", "tlm_yaw_rad",
+    "tlm_p_rad_s", "tlm_q_rad_s", "tlm_r_rad_s",
+    "tlm_ax_g", "tlm_ay_g", "tlm_az_g",
+    # --- 機体計算指令(TLM_STATE + TLM_CTRL)(8) ---
+    "tlm_roll_ref_rad", "tlm_pitch_ref_rad", "tlm_yaw_ref_rad",
+    "tlm_ctrl_age_ms", "tlm_ctrl_flags",
+    "tlm_roll_rate_ref_rad_s", "tlm_pitch_rate_ref_rad_s", "tlm_yaw_rate_ref_rad_s",
+    # --- 姿勢PID成分(TLM_CTRL: 角度ループ9+角速度ループ9)(18) ---
+    "tlm_pid_roll_ang_p", "tlm_pid_roll_ang_i", "tlm_pid_roll_ang_d",
+    "tlm_pid_pitch_ang_p", "tlm_pid_pitch_ang_i", "tlm_pid_pitch_ang_d",
+    "tlm_pid_yaw_ang_p", "tlm_pid_yaw_ang_i", "tlm_pid_yaw_ang_d",
+    "tlm_pid_roll_rate_p", "tlm_pid_roll_rate_i", "tlm_pid_roll_rate_d",
+    "tlm_pid_pitch_rate_p", "tlm_pid_pitch_rate_i", "tlm_pid_pitch_rate_d",
+    "tlm_pid_yaw_rate_p", "tlm_pid_yaw_rate_i", "tlm_pid_yaw_rate_d",
+    # --- 高度系(TLM_STATE)(5) ---
+    "tlm_alt_ref_m", "tlm_altitude_tof_m", "tlm_altitude_est_m",
+    "tlm_alt_velocity_m_s", "tlm_z_dot_ref_m_s",
+    # --- ヨー推定・FF診断(TLM_STATE)(10) ---
+    "tlm_yaw_est_rad", "tlm_yaw_gyro_int_rad",
+    "tlm_current_a", "tlm_db_hat_x_ut", "tlm_db_hat_y_ut", "tlm_bm_x_ut", "tlm_bm_y_ut",
+    "tlm_nis", "tlm_ffg", "tlm_ff_status",
+    # --- モータ・電源(TLM_STATE)(5) ---
+    "tlm_duty_fr", "tlm_duty_fl", "tlm_duty_rr", "tlm_duty_rl", "tlm_voltage_v",
+    # --- 機体状態・システム(TLM_STATE)(6) ---
+    "tlm_state", "tlm_flags", "tlm_reason", "tlm_seq_echo", "tlm_elapsed_ms",
+    "tlm_loop_dt_us",
+    # --- MoCap 実測ヨー・軌道(4) ---
+    "mocap_yaw_deg", "mocap_heading_deg", "traj_mode", "traj_phase_rad",
+    # --- フィルタ状態(Position/Multi のみ)(10) ---
     "data_valid", "control_active", "mocap_dropout", "is_outlier", "used_prediction",
     "confidence", "consecutive_outliers", "data_source",
     "filter_threshold", "tracking_valid",
-    # --- リジッドボディ / フレーム診断 ---
-    "rb_error", "rb_marker_count",
-    "frame_number", "marker_count", "frame_dt_ms", "mocap_age_ms",
-    # --- 機体テレメトリ(最新 TLM_STATE のスナップショット) ---
-    "tlm_age_ms", "tlm_seq_echo", "tlm_elapsed_ms",
-    "tlm_state", "tlm_state_name", "tlm_flags", "tlm_reason", "tlm_reason_name",
-    "tlm_roll_rad", "tlm_pitch_rad", "tlm_yaw_rad",
-    "tlm_p_rad_s", "tlm_q_rad_s", "tlm_r_rad_s",
-    "tlm_roll_ref_rad", "tlm_pitch_ref_rad", "tlm_alt_ref_m",
-    "tlm_altitude_tof_m", "tlm_altitude_est_m",
-    "tlm_alt_velocity_m_s", "tlm_z_dot_ref_m_s",
-    "tlm_voltage_v",
-    "tlm_duty_fr", "tlm_duty_fl", "tlm_duty_rr", "tlm_duty_rl",
-    "tlm_ax_g", "tlm_ay_g", "tlm_az_g", "tlm_loop_dt_us",
+    # --- リジッドボディ / フレーム診断(5) ---
+    "rb_error", "rb_marker_count", "frame_number", "frame_dt_ms", "mocap_age_ms",
 )
-
-# v2 で末尾に追加された 17 列(実装契約 §3.5 の順序どおり)
-V2_EXTRA_COLUMNS: tuple[str, ...] = (
-    "cmd_yaw_ref_rad", "cmd_yaw_ref_deg", "yaw_ctrl_on",
-    "tlm_yaw_est_rad", "tlm_yaw_gyro_int_rad", "tlm_yaw_ref_rad",
-    "tlm_current_a", "tlm_db_hat_x_ut", "tlm_db_hat_y_ut", "tlm_bm_x_ut", "tlm_bm_y_ut",
-    "tlm_nis", "tlm_ffg", "tlm_ff_status",
-    "mocap_yaw_deg", "traj_mode", "traj_phase_rad",
-)
-
-# v3 で末尾に追加された 6 列(機上XY制御 CMD_POS_ERR 診断)
-V3_EXTRA_COLUMNS: tuple[str, ...] = (
-    "xy_cmd_mode",
-    "cmd_err_x_m", "cmd_err_y_m", "cmd_xy_valid", "cmd_mocap_yaw_deg",
-    "mocap_heading_deg",
-)
-
-V2_COLUMNS: tuple[str, ...] = BASE_COLUMNS + V2_EXTRA_COLUMNS + V3_EXTRA_COLUMNS
-N_COLUMNS = len(V2_COLUMNS)
-assert N_COLUMNS == 100, f"列数が契約(100列)と不一致: {N_COLUMNS}"
+N_COLUMNS = len(V4_COLUMNS)
+assert N_COLUMNS == 109, f"列数が契約(109列)と不一致: {N_COLUMNS}"
 
 # 数値変換しない(文字列のままにする)列
+# (tlm_state_name / tlm_reason_name / xy_cmd_mode は v4 で廃止された列だが、
+#  旧ログ v1〜v3 の読み込み互換のため文字列扱いを維持する)
 TEXT_COLUMNS: frozenset[str] = frozenset(
     {"timestamp", "mode", "phase", "tlm_state_name", "tlm_reason_name",
      "data_source", "xy_cmd_mode"}
@@ -85,6 +88,11 @@ LOG_RATE_HZ = 50.0
 TLM_FLAG_LOW_VOLTAGE = 1 << 0   # 低電圧
 TLM_FLAG_SETPOINT_FRESH = 1 << 1  # セットポイント新鮮
 TLM_FLAG_FLYING = 1 << 2        # 飛行中
+
+# tlm_ctrl_flags(TLM_CTRL flags)のビット
+TLM_CTRL_FLAG_XY_ONBOARD = 1 << 0  # 機上XY指令生成中(CMD_POS_ERR 経路)
+TLM_CTRL_FLAG_YAW_CTRL = 1 << 1    # ヨー角制御アクティブ
+TLM_CTRL_FLAG_FLYING = 1 << 2      # 飛行中
 
 # tlm_ffg(EKF ゲート状態ビット。yaw 側 yaw_estimator_kf.hpp と一致)
 # (表示名, 説明, 描画色) を bit0 から順に並べる
@@ -159,6 +167,9 @@ COLORS: dict[str, str] = {
     "cmd_pitch": "#0d9488",
     "meas_roll": "#ca8a04",
     "meas_pitch": "#9B59B6",
+    "meas_yaw": "#2563eb",
+    # PID 成分合計(=指令角速度)
+    "pid_sum": "#111111",
     # ヨー4系統
     "yaw_madgwick": "#ca8a04",   # Madgwick(tlm_yaw_rad)
     "yaw_ekf": "#e74c3c",        # EKF(tlm_yaw_est_rad)

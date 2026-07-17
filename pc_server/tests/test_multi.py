@@ -119,10 +119,11 @@ class TestMultiSelect:
         assert [d["name"] for d in snap["drones"]] == ["drone 1", "drone 2"]
         assert [d["node_id"] for d in snap["drones"]] == [0, 1]
         assert all(d["phase"] == "idle" for d in snap["drones"])
-        # 選択直後から各機宛の CMD_SETPOINT(ハートビート)が MUX で流れる
+        # 選択直後から各機宛の CMD_POS_ERR(機上XY制御。ハートビート兼用)が
+        # MUX で流れる
         assert wait_until(
-            lambda: relay.uplinks(0, proto.MsgType.CMD_SETPOINT)
-            and relay.uplinks(1, proto.MsgType.CMD_SETPOINT))
+            lambda: relay.uplinks(0, proto.MsgType.CMD_POS_ERR)
+            and relay.uplinks(1, proto.MsgType.CMD_POS_ERR))
 
     def test_select_rejects_bad_inputs(self, multi_session):
         session, transport, clock, relay = multi_session
@@ -579,9 +580,9 @@ class TestMultiYawAndFf:
 
         def yaw_flag_seen(node):
             return any(
-                proto.CmdSetpoint.from_payload(f.payload).flags
-                & proto.CmdSetpoint.FLAG_YAW_REF_VALID
-                for f in relay.uplinks(node, proto.MsgType.CMD_SETPOINT))
+                proto.CmdPosErr.from_payload(f.payload).flags
+                & proto.CmdPosErr.FLAG_YAW_REF_VALID
+                for f in relay.uplinks(node, proto.MsgType.CMD_POS_ERR))
 
         # 50Hz 送信スレッドにステップを回させる(クロックを進めて実時間待ち)
         for _ in range(20):
@@ -612,7 +613,8 @@ class TestMultiYawAndFf:
         select_two(session)
         assert session.multi_yaw("drone 9", enabled=True) is False
         assert session.multi_yaw("drone 1", yaw_deg=270.0) is False
-        # ±max_yaw_ctrl_deg(既定30°)超は拒否(XYループが制御座標系固定のため)
+        # ±max_yaw_ctrl_deg(既定30°)超は拒否
+        # (機上ヨー回転補償の飛行未検証のため暫定維持のクランプ)
         assert session.multi_yaw("drone 1", yaw_deg=45.0) is False
         assert session.multi_yaw("drone 1", yaw_deg=-30.0) is True
 
@@ -660,6 +662,102 @@ class TestMultiYawAndFf:
         assert cal is not None
         assert cal.ff_mode == 2
         assert len(relay.uplinks(1, proto.MsgType.CMD_CAL_GET)) == 1
+
+    def test_quickcal_requires_drone_in_multi(self, multi_session):
+        """Multi モード中の quickcal は対象機体(drone)必須。"""
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        result = session.quickcal("attitude_zero")
+        assert result["ok"] is False
+        assert "対象機体" in result["message"]
+        # 未選択の機体名も拒否
+        result = session.quickcal("attitude_zero", drone="drone 9")
+        assert result["ok"] is False
+        assert relay.uplinks(0, proto.MsgType.CMD_ATTMOUNT_SET) == []
+
+    def test_quickcal_attitude_zero_targets_node(self, multi_session):
+        """quickcal はノード宛に送られ、姿勢ソースは当該スロットの TLM_STATE。"""
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        # node 0 の TLM_STATE(roll/pitch つき)を MUX_DOWN で注入
+        tlm = proto.TlmState(roll=0.04, pitch=-0.02)
+        inner = proto.pack_frame(proto.MsgType.TLM_STATE, 1, tlm.to_payload())
+        transport.push(proto.MsgType.RLY_MUX_DOWN, proto.mux_wrap(0, inner))
+        assert wait_until(
+            lambda: session._tlm_state_snapshot(node_id=0)[0] is not None)
+
+        result = session.quickcal("attitude_zero", drone="drone 1")
+        assert result["ok"] is True, result.get("message")
+        # CMD_ATTMOUNT_SET は node 0 のみに届く
+        frames = relay.uplinks(0, proto.MsgType.CMD_ATTMOUNT_SET)
+        assert len(frames) == 1
+        assert relay.uplinks(1, proto.MsgType.CMD_ATTMOUNT_SET) == []
+        sent = proto.CmdAttmountSet.from_payload(frames[0].payload)
+        assert sent.roll_rad == pytest.approx(0.04)
+        assert sent.pitch_rad == pytest.approx(-0.02)
+        assert (relay.drones[0].cal_data.valid_flags
+                & proto.TlmCalData.VALID_ATTMOUNT)
+
+    def test_quickcal_yaw_zero_targets_node(self, multi_session):
+        """yaw_zero 自動シーケンスもノード宛(CAL_GET→SET→ANCHOR)で完結する。"""
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        relay.drones[1].cal_data.yawzero_offset_rad = 0.25
+        # node 1 の新鮮な TLM_STATE(yaw_est=0.5、磁気新鮮)を注入
+        tlm = proto.TlmState(yaw_est_rad=0.5,
+                             ff_status=proto.TlmState.FF_STATUS_MAG_FRESH)
+        inner = proto.pack_frame(proto.MsgType.TLM_STATE, 1, tlm.to_payload())
+        transport.push(proto.MsgType.RLY_MUX_DOWN, proto.mux_wrap(1, inner))
+        assert wait_until(
+            lambda: session._tlm_state_snapshot(node_id=1)[0] is not None)
+
+        result = session.quickcal("yaw_zero", drone="drone 2")
+        assert result["ok"] is True, result.get("message")
+        frames = relay.uplinks(1, proto.MsgType.CMD_YAWZERO_SET)
+        assert len(frames) == 1
+        sent = proto.CmdYawzeroSet.from_payload(frames[0].payload)
+        assert sent.valid == 1
+        assert sent.offset_rad == pytest.approx(0.25 + 0.5)
+        # ff_mode=0 のためモード切替なし。アンカー再取得は当該ノードのみ
+        assert relay.uplinks(1, proto.MsgType.CMD_FF_MODE) == []
+        assert len(relay.uplinks(1, proto.MsgType.CMD_FF_ANCHOR)) == 1
+        assert relay.uplinks(0, proto.MsgType.CMD_YAWZERO_SET) == []
+
+    def test_quickcal_rejected_while_slot_flying(self, multi_session):
+        """対象機体スロットが armed/flying の間は quickcal を拒否する。"""
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        session.multi_target("drone 1", 0.5, 0.5, 0.4)
+        session.multi_target("drone 2", -0.5, -0.5, 0.4)
+        feed_fresh_mocap(session, clock)
+        assert session.multi_start() is True
+        result = session.quickcal("attitude_zero", drone="drone 1")
+        assert result["ok"] is False
+        assert "飛行中" in result["message"]
+        assert relay.uplinks(0, proto.MsgType.CMD_ATTMOUNT_SET) == []
+
+    def test_quickcal_rejected_while_other_drone_flying(self, multi_session):
+        """他機が armed/flying の間は着陸済み機への quickcal も全面拒否する。
+
+        yaw_zero シーケンスは _command_lock を数秒〜10秒保持し得るため、
+        飛行中に stop() の再送監視がロック待ちでブロックされる事故を防ぐ
+        (_multi_ff_slot と同じ規範)。
+        """
+        session, transport, clock, relay = multi_session
+        select_two(session)
+        session.multi_target("drone 1", 0.5, 0.5, 0.4)
+        session.multi_target("drone 2", -0.5, -0.5, 0.4)
+        feed_fresh_mocap(session, clock)
+        assert session.multi_start() is True
+        # drone 2 だけ着陸済み(idle)にする。drone 1 は armed のまま
+        with session.multi._lock:
+            for slot in session.multi._slots:
+                if slot.name == "drone 2":
+                    slot.phase = "idle"
+        result = session.quickcal("yaw_zero", drone="drone 2")
+        assert result["ok"] is False
+        assert "飛行中の機体がある" in result["message"]
+        assert relay.uplinks(1, proto.MsgType.CMD_CAL_GET) == []
 
     def test_ffprofile_applied_by_mac_state(self, multi_session, tmp_path):
         """applied_by_mac の読み書き(mode の MAC 別既定値と永続化)。"""

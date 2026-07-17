@@ -18,13 +18,16 @@ import pytest
 
 import stampfly_protocol as proto
 from core.filter import PositionFilter
-from core.position import ANOMALY_CLEAR_CONFIDENCE
 from core.session import MODE_POSITION, PHASE_ARMED, PHASE_FLYING
 
 from conftest import halt_supervisor
 from fakes import make_pose
 
 FRAME_DT = 0.01   # mocap 100Hz 相当
+
+# 「健全な信頼度」の基準値(旧 PC 側 PID の異常解除しきい値と同値。
+# PID 経路の削除後もフィルタ復帰の劣化/回復判定の基準として使い続ける)
+ANOMALY_CLEAR_CONFIDENCE = 0.5
 
 
 def make_filter(control_config) -> PositionFilter:
